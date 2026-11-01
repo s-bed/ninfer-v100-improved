@@ -2733,20 +2733,29 @@ lets every configured lane be admitted at the same time. Once its prompt is prep
 finds the largest output whose admission entitlement -- Main KV pages for the prompt and output,
 plus the MTP draft-window or DFlash backend KV pages when speculation is on -- fits one lane's share
 (`1/--max-concurrency`) of each KV pool, and clamps it to the remaining context
-(`--max-context` minus the prompt). With one lane, or a pool of at least `--max-concurrency` times
-`--max-context`, that is the whole remaining context, so long reasoning runs are not cut at an
-arbitrary count; with several lanes over a smaller pool, each limitless request stays inside its
-share and they all run concurrently. A prompt that alone overruns one lane's share can never run
-beside full-share lanes, so it keeps the whole remaining context.
+(`--max-context` minus the prompt). With the prefix cache on, a Qwen3.5-core lane also keeps pages
+of its share free for the cache's snapshot copies: one per snapshot a request may capture (the
+hybrid cache's `--cache-taps-per-request`, 8 with a Host tier; the catalog's 7 prompt candidates)
+plus one. A snapshot whose frontier falls inside a 64-token page copies that page, and a repeat of
+the prompt that resumes there keeps the copy pinned while it takes its own. Neither page is part of
+a request's entitlement, so an entitlement that fills the pool leaves a repeated prompt no such
+snapshot to resume from. With one lane, or a pool of at least `--max-concurrency` times
+`--max-context` plus those pages, the budget is the whole remaining context, so long reasoning runs
+are not cut at an arbitrary count; with one lane and `--kv-capacity` equal to `--max-context` it is
+the remaining context less those pages (576 tokens with a Host tier). With several lanes over a
+smaller pool, each limitless request stays inside its share and they all run concurrently. A prompt
+that leaves no output beside the spare pages is sized without them, and one that alone overruns one
+lane's share can never run beside full-share lanes, so it keeps the whole remaining context.
 
 A run that exhausts the budget finishes with `finish_reason:"length"`, Responses `incomplete` with
 reason `max_output_tokens`, or Anthropic `stop_reason:"max_tokens"`, or
 `stop_reason:"model_context_window_exceeded"` when the budget was the remaining context. An explicit
-request limit always wins, and `--default-max-tokens N` replaces the derived default with a fixed cap
-(still bounded by the remaining context). Chat Completions `max_tokens: -1`, llama.cpp's "no limit"
-that its WebUI sends by default, always receives the derived budget, even with
-`--default-max-tokens`. The JSONL request record reports the budget actually
-submitted as `requested_output_tokens`.
+request limit always wins, and `--default-max-tokens N` replaces the derived default with a fixed
+cap (still bounded by the remaining context). An explicit limit whose entitlement fills the pool
+runs, but publishes no snapshot inside a page and resumes from none. Chat Completions
+`max_tokens: -1`, llama.cpp's "no limit" that its WebUI sends by default, always receives the
+derived budget, even with `--default-max-tokens`. The JSONL request record reports the budget actually submitted as
+`requested_output_tokens`.
 
 Each reusable checkpoint contains KV and complete continuation state. At admission, capture, and
 finish boundaries, resource pressure may keep it on Device, move its StateImage and/or KV replicas
