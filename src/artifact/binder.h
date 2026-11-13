@@ -64,6 +64,10 @@ public:
     // The object must already have a device demand, or be a selected piece, and admit the layout
     // (a piece by its own rows), and every consumer must read QuantLayout::RowSplitPanel.
     void panel_device(ObjectHandle object);
+    // Device-only QPN code permutation of a complete, qualified native FP8 parent.
+    // Model-owned consumer analysis must exclude embeddings, heads, partial/selected
+    // pieces and every consumer whose projection reader cannot take this layout.
+    void fp8_qpn_device(ObjectHandle object);
     // Moves a device object into the arena's evictable tail. Ranked objects follow every resident
     // object; ascending rank places the highest rank at the arena end, which an eviction pool
     // borrows first. A repeated request keeps the highest rank.
@@ -108,6 +112,7 @@ private:
         std::uint64_t alignment = 256;
         std::optional<QType> transcode;
         bool panel               = false;
+        bool fp8_qpn             = false;
         std::uint32_t evict_rank = 0;
         std::uint64_t tail       = 0;
         std::optional<std::size_t> device_rank;
@@ -124,6 +129,7 @@ private:
         std::uint64_t alignment = 256;
         std::uint64_t tail      = 0;
         bool panel              = false;
+        bool fp8_qpn            = false;
     };
 
     [[nodiscard]] Selected& selected_entry(ObjectHandle object);

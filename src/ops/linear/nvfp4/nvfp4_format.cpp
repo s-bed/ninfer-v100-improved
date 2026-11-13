@@ -58,7 +58,7 @@ Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* oper
                     sizeof(float), operation),
         operation);
 
-    if (weight.qtype != QType::NVFP4 || weight.layout != QuantLayout::BlockScaleK16M128x4 ||
+    if (weight.qtype != QType::NVFP4 || (weight.layout != QuantLayout::BlockScaleK16M128x4 && weight.layout != QuantLayout::VoltaQpnPrepacked) ||
         weight.scale_dtype != DType::FP8_E4M3FN || weight.group_size != 16 || weight.group != 16 ||
         weight.ndim != 2 || weight.shape[0] != weight.n || weight.shape[1] != weight.k ||
         weight.padded_shape[0] != weight.n || weight.padded_shape[1] != weight.k ||

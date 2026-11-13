@@ -105,6 +105,8 @@ enum class QuantLayout : std::uint16_t {
     // Rows of whole ggml blocks, as a GGUF stores them.
     GgufBlocks = 5,
     RowInterleaved = 6,
+    // Device-only donor QPN permutation; 4 is already RowSplitPanel.
+    VoltaQpnPrepacked = 7,
 };
 
 // Rows per stored panel. Four 32-byte records is exactly one 128-byte line, which is all the

@@ -4,6 +4,22 @@
 llama.cpp-compatible HTTP endpoints over one resident NInfer Engine, or serves a catalog of
 artifacts as a [router](#several-models-router), one Engine per loaded model.
 
+## Custom V100 kernel policy
+
+The custom sm_70 build accepts `--v100-kernels native|ported`, defaulting to `native`.
+`ported` enables donor routes where their shape and output contracts apply; unsupported shapes
+retain native routes. It is rejected on GPUs other than sm_70. The policy is fixed until process
+restart because weight preparation and CUDA Graphs retain it. Native and ported hybrid cache
+files have distinct compatibility identities; use separate cache paths when comparing them.
+Shutdown logs count host route selections and fallbacks, including graph capture, rather than
+the number of GPU launches during graph replay.
+
+Qualified NVFP4 MLP parents and complete Qwen FP8 projection parents are permuted on the device
+during loading. Artifact and Host bytes remain native. FP8 preparation excludes embedding and
+output-head parents, shared parents with any unqualified consumer, and partial or tensor-parallel
+pieces. Packed projections retain native fallbacks; activation staging preserves the existing A16
+output contract, including BF16 range repair. The native policy performs no donor preparation.
+
 ## Start the server
 
 See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_CUDA_SYNC` setting.
@@ -366,8 +382,10 @@ escapes (including valid surrogate pairs); lone surrogates and malformed UTF-8 a
 rejected. Length bounds count decoded Unicode scalars, independent of escape spelling. Nonnegative length/item bounds
 must fit a signed 32-bit integer. `$ref` cannot have sibling constraints; `anyOf` permits
 the proven common `type`/`required` intersections described above. `const` and `enum`
-allow a matching single `type` declaration and compatible const/enum intersections,
-but no other sibling constraints. Move other assertions into the referenced schema
+allow a matching scalar `type` or nonempty array of unique JSON type names and
+compatible const/enum intersections, but no other sibling constraints. Each finite
+value must satisfy a declared type. Including `"null"` in the type array does not
+add null to an enum; null must be an explicit enum member. Move other assertions into the referenced schema
 or each union branch. Missing `additionalProperties`
 and `items` retain JSON Schema defaults unless the schema is strict (see below). Properties are emitted in schema declaration order;
 this is a valid subset of the requested schema. Whitespace between JSON elements is bounded to

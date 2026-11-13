@@ -169,6 +169,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                compiled-in values\n"
            "\n"
            "PRECISION & KERNELS\n"
+           "  --v100-kernels native|ported  native routes (default) or donor V100 kernels\n"
+           "                                on sm_70; fixed until process restart\n"
            "  --fast-prefill-kernel         prefill an int8 or rk* KV cache with the fast\n"
            "                                prompt-attention kernel (FP16 PV per 64-key\n"
            "                                tile) and round --prefill-chunk down to whole\n"
@@ -731,6 +733,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--fast-prefill-kernel") {
             options.fast_prefill_kernel = true;
+            continue;
+        }
+        if (arg == "--v100-kernels") {
+            const std::string value = require_value("--v100-kernels");
+            if (value == "native") {
+                options.v100_kernels = V100KernelPolicy::Native;
+            } else if (value == "ported") {
+                options.v100_kernels = V100KernelPolicy::Ported;
+            } else {
+                throw std::invalid_argument("--v100-kernels must be native or ported");
+            }
             continue;
         }
         if (arg == "--device-profile") {

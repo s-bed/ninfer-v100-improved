@@ -15,5 +15,7 @@ struct Fp8WeightGeometry {
 };
 
 Fp8WeightGeometry validate_fp8_weight(const Weight& weight, const char* operation);
+// Only adapted sm_70 projection readers accept the device-only packed representation.
+Fp8WeightGeometry validate_fp8_projection_weight(const Weight& weight, const char* operation);
 
 } // namespace ninfer::ops::detail

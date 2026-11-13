@@ -32,6 +32,27 @@ ServeOptions parse(std::vector<std::string> arguments) {
 
 int main() {
     int failures = 0;
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).v100_kernels ==
+                          ninfer::V100KernelPolicy::Native,
+                      "v100 kernels must default to native");
+    for (const auto* name : {"native", "ported"}) {
+        const auto selected = parse({"ninfer-serve", "model.ninfer", "--v100-kernels", name});
+        const auto expected = std::string_view(name) == "ported"
+                                  ? ninfer::V100KernelPolicy::Ported
+                                  : ninfer::V100KernelPolicy::Native;
+        failures += check(selected.v100_kernels == expected &&
+                              make_engine_options(selected).v100_kernels == expected,
+                          "v100 kernel policy did not reach EngineOptions");
+    }
+    for (const auto* name : {"", "auto", "Ported", "sm70"}) {
+        bool rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--v100-kernels", name}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted invalid v100 kernel policy");
+    }
+    failures += check(serve_usage_text("ninfer-serve").find("--v100-kernels native|ported") !=
+                          std::string::npos,
+                      "serve help omits v100 kernel policy");
     failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.draft_min_p == 0,
                       "draft confidence must be opt-in");
     for (const auto* floor : {"0", "0.3", "1"}) {

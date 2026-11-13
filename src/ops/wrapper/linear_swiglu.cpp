@@ -147,7 +147,7 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     };
     // Every width of a dense format takes an sm_70 route there.
     return detail::sm70::capacity(qtype, gate_up_rows, input_rows, min_tokens, max_tokens,
-                                  sm70_policy(policy), routes);
+                                  sm70_policy(policy), routes, detail::sm70::ProjectionPurpose::SwiGLU);
 }
 
 std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
@@ -207,11 +207,14 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         throw std::invalid_argument("linear_swiglu: unsupported weight");
     }
 
+    if(gate_up_weight.qtype==QType::FP8_E4M3FN_ROW_BF16 && gate_up_weight.layout==QuantLayout::VoltaQpnPrepacked)
+        detail::validate_fp8_projection_weight(gate_up_weight,"packed FP8 linear_swiglu");
     if (detail::sm70::covers(gate_up_weight, t)) {
         auto scope            = ws.scope();
         const auto activation = detail::sm70::prepare_for(
-            x, gate_up_weight.n, ws, stream,
-            detail::sm70::integer_takes(gate_up_weight, t, sm70_policy(policy)));
+            x, gate_up_weight.n, ws, stream, gate_up_weight.qtype,
+            detail::sm70::integer_takes(gate_up_weight, t, sm70_policy(policy)),
+            detail::sm70::ProjectionPurpose::SwiGLU,gate_up_weight.layout);
         detail::sm70::swiglu_for(activation, gate_up_weight, nullptr, out, stream);
         return;
     }

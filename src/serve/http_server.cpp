@@ -1533,8 +1533,7 @@ void HttpServer::run_engine_watch() {
                 failed = lease->service().has_failed();
             }
         } catch (...) {}
-        if (failed) {
-            engine_failed_.store(true, std::memory_order_release);
+        if (failed && engine_watch_.record_failure()) {
             operational_log_.engine_failure();
             server_.stop();
             return;
@@ -1595,6 +1594,9 @@ bool HttpServer::listen() {
 }
 
 void HttpServer::stop() {
+    // Publish intent before service.stop() can make EngineCore::has_failed true
+    // during an orderly cache save. The watch must keep a genuine earlier failure.
+    engine_watch_.begin_stop();
     stats_server_.stop();
     server_.stop();
     if (registry_ != nullptr) {

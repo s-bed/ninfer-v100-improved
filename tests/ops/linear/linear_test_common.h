@@ -76,6 +76,8 @@ struct ShapeCase {
     // The row-split weight permuted into the panel layout (artifact/permute_row_split.h), as the
     // loader leaves a Volta rank's projections; the case is skipped on other devices.
     bool panel = false;
+    // Test-only device transform selected by QType; the stored-weight oracle stays native.
+    bool v100_prepack = false;
 };
 
 using WeightGenerator = quantized_weight::PackedWeight (*)(std::int32_t, std::int32_t,

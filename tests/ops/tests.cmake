@@ -207,11 +207,11 @@ ninfer_add_op_test(ninfer_mtp_pack_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_pack.cpp"
   LIBRARIES ninfer_ops)
 
-ninfer_add_op_test(ninfer_mtp_round_test
+ninfer_add_op_test(ninfer_mtp_round_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_round.cpp"
   LIBRARIES ninfer_ops)
 
-ninfer_add_op_test(ninfer_speculative_round_test
+ninfer_add_op_test(ninfer_speculative_round_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_round.cpp"
   LIBRARIES ninfer_ops)
 
@@ -265,7 +265,7 @@ ninfer_add_op_test(ninfer_gated_delta_net_replay_record_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gated_delta_net_replay_record.cpp"
   LIBRARIES ninfer_ops)
 
-ninfer_add_op_test(ninfer_gdn_replay_fold_test
+ninfer_add_op_test(ninfer_gdn_replay_fold_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_replay_fold.cpp"
   LIBRARIES ninfer_ops)
 
@@ -310,7 +310,7 @@ set_tests_properties(ninfer_sparse_moe_candidates_op_test
 foreach(mode IN ITEMS ngram-only onehot-distribution mtp-onehot mtp-distribution ngram-negative-penalties wide-accept wide-distribution)
   string(REPLACE "-" "_" test_suffix "${mode}")
   add_test(NAME ninfer_speculative_${test_suffix}_test
-    COMMAND ninfer_tests ninfer_speculative_round_test --${mode})
+    COMMAND ninfer_speculative_round_test --${mode})
   set_tests_properties(ninfer_speculative_${test_suffix}_test
     PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240)
 endforeach()
@@ -323,7 +323,7 @@ set_tests_properties(ninfer_gdn_state_fp16_two_stage_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 
 add_test(NAME ninfer_gdn_replay_fold_wide_test
-  COMMAND ninfer_tests ninfer_gdn_replay_fold_test --wide-only)
+  COMMAND ninfer_gdn_replay_fold_test --wide-only)
 # About 300 cases with an FP64 oracle each, on the host's cores: 11 minutes on the Tesla V100 host
 # (Xeon E5-2683 v4), about 35 on a six-core host.
 set_tests_properties(ninfer_gdn_replay_fold_wide_test
@@ -390,3 +390,18 @@ ninfer_add_test(ninfer_stream_cpu_test
   LIBRARIES ninfer_ops)
 target_include_directories(ninfer_gguf_expert_cpu_test PRIVATE
   "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
+
+# Scoped FP8-only A16 qualification of actual projection/scatter and conv compositions.
+# Their default entry points retain the full original operator suites.
+ninfer_add_op_test(ninfer_v100_fp8_gdn_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj.cpp"
+  LIBRARIES ninfer_ops TEST_ARGS --v100-fp8)
+ninfer_add_op_test(ninfer_v100_fp8_attn_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj.cpp"
+  LIBRARIES ninfer_ops TEST_ARGS --v100-fp8)
+ninfer_add_op_test(ninfer_v100_fp8_snapshot_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj_conv_snapshot.cpp"
+  LIBRARIES ninfer_ops TEST_ARGS --v100-fp8)
+ninfer_add_op_test(ninfer_v100_fp8_record_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj_conv_record.cpp"
+  LIBRARIES ninfer_ops TEST_ARGS --v100-fp8)

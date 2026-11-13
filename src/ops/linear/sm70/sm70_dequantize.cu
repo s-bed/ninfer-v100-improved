@@ -1,6 +1,7 @@
 #include "ops/linear/sm70/sm70_dequantize.h"
 
 #include "core/device.h"
+#include "ops/linear/fp8/fp8_prepack_sm70.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>
@@ -206,6 +207,28 @@ __global__ void bf16_kernel(const __nv_bfloat16* __restrict__ w, std::int32_t ro
     out[i] = to_half(__bfloat162float(w[static_cast<std::int64_t>(row0) * k + i]));
 }
 
+// Packed tuples load adjacent uint4 records across the warp, then store each
+// complete natural 16-code row slice. Partial requested row ranges are guarded.
+__global__ void fp8_packed_rows(const std::uint8_t* codes,int row0,int rows,int k,__half* out) {
+    const std::int64_t tuple=std::int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    const int blocks=k/128,first_tile=row0/32;
+    const int tiles=(row0%32+rows+31)/32;
+    if(tuple>=std::int64_t(tiles)*blocks*8*32)return;
+    const int lane=int(tuple%32),slice=int((tuple/32)%8),block=int((tuple/256)%blocks);
+    const int tile=first_tile+int(tuple/(std::int64_t(blocks)*256));
+    const int row=tile*32+((lane>>2)&3)*8+(lane&3)+(lane&16?4:0);
+    if(row<row0 || row>=row0+rows)return;
+    const int col=block*128+slice*16;
+    const uint4 raw=__ldg(reinterpret_cast<const uint4*>(codes+fp8_qpn_prepacked_offset(row,col,k)));
+    const auto* bytes=reinterpret_cast<const std::uint8_t*>(&raw);
+    alignas(16) __half values[16];
+#pragma unroll
+    for(int e=0;e<16;++e){__nv_fp8_e4m3 code;code.__x=bytes[e];values[e]=to_half(float(code));}
+    auto* destination=reinterpret_cast<uint4*>(out+std::int64_t(row-row0)*k+col);
+    destination[0]=*reinterpret_cast<const uint4*>(values);
+    destination[1]=*reinterpret_cast<const uint4*>(values+8);
+}
+
 // The E4M3 codes alone (at most 448 in magnitude); the BF16 row scale is the row's RowFactor.
 __global__ void fp8_row_kernel(const std::uint8_t* __restrict__ codes, std::int32_t row0,
                                std::int32_t k, __half* __restrict__ out) {
@@ -216,6 +239,68 @@ __global__ void fp8_row_kernel(const std::uint8_t* __restrict__ codes, std::int3
     code.__x                                           = codes[row * k + c];
     out[static_cast<std::int64_t>(blockIdx.y) * k + c] = to_half(float(code));
 }
+
+__device__ __forceinline__ half2 decode_e4m3_scale_shift(std::uint8_t value) {
+    const std::uint16_t bits = static_cast<std::uint16_t>((value & 0x80u) << 8) |
+                               static_cast<std::uint16_t>((value & 0x7fu) << 7);
+    return __half2half2(__ushort_as_half(bits));
+}
+
+__device__ __forceinline__ void decode_e2m1_word_shift(std::uint32_t packed, half2 rebias,
+                                                       half2 (&out)[4]) {
+    constexpr std::uint32_t sign = 0x80008000u;
+    constexpr std::uint32_t expm = 0x0e000e00u;
+    std::uint32_t v0 = ((packed << 12) & sign) | ((packed << 9) & expm);
+    std::uint32_t v1 = ((packed << 8) & sign) | ((packed << 5) & expm);
+    std::uint32_t v2 = ((packed << 4) & sign) | ((packed << 1) & expm);
+    std::uint32_t v3 = (packed & sign) | ((packed >> 3) & expm);
+    out[0] = __hmul2(*reinterpret_cast<half2*>(&v0), rebias);
+    out[1] = __hmul2(*reinterpret_cast<half2*>(&v1), rebias);
+    out[2] = __hmul2(*reinterpret_cast<half2*>(&v2), rebias);
+    out[3] = __hmul2(*reinterpret_cast<half2*>(&v3), rebias);
+}
+
+__device__ __forceinline__ void unshuffle_e2m1_word(const half2 (&in)[4], half2 (&out)[4]) {
+    const auto* source = reinterpret_cast<const std::uint32_t*>(in);
+    auto* destination  = reinterpret_cast<std::uint32_t*>(out);
+    destination[0] = (source[0] & 0x0000ffffu) | (source[1] << 16);
+    destination[1] = (source[2] & 0x0000ffffu) | (source[3] << 16);
+    destination[2] = (source[0] >> 16) | (source[1] & 0xffff0000u);
+    destination[3] = (source[2] >> 16) | (source[3] & 0xffff0000u);
+}
+
+__global__ void dequant_nvfp4_qpn_to_fp16(const std::uint8_t* __restrict__ codes,
+                                          const std::uint8_t* __restrict__ scales, int row0, int n, int k,
+                                          float inverse_weight_divisor,
+                                          __half* __restrict__ out) {
+    const int row      = row0 + static_cast<int>(blockIdx.y);
+    const int segment  = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int segments_per_row = k / 8;
+    if (int(blockIdx.y) >= n || segment >= segments_per_row) { return; }
+
+    const int group      = segment / 2;
+    const int group_half = segment & 1;
+    const int local_row  = row & 31;
+    const int qp         = local_row / 8;
+    const int r          = local_row & 7;
+    const int lane       = (qp << 2) | (r & 3) | ((r & 4) << 2);
+    const int groups     = k / 16;
+    const std::int64_t tuple =
+        (static_cast<std::int64_t>(row / 32) * groups + group) * 32 + lane;
+    const std::uint8_t* packed = codes + tuple * 8 + group_half * 4;
+    const std::uint32_t packed_word = *reinterpret_cast<const std::uint32_t*>(packed);
+    const half2 rebias = __float2half2_rn(16384.0f);
+    const half2 divisor = __float2half2_rn(inverse_weight_divisor * 256.0f);
+    const half2 coefficient = __hmul2(decode_e4m3_scale_shift(scales[tuple]), divisor);
+    half2 values[4];
+    decode_e2m1_word_shift(packed_word, rebias, values);
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair) { values[pair] = __hmul2(values[pair], coefficient); }
+    auto* destination = reinterpret_cast<uint4*>(
+        out + static_cast<std::int64_t>(blockIdx.y) * k + segment * 8);
+    *destination = *reinterpret_cast<const uint4*>(values);
+}
+
 
 // NVFP4 (block_scale_k16_m128x4_v1): E2M1 codes row-major, E4M3FN group scales in 128-row by
 // four-group tiles of 512 bytes. Each value is code times group scale (at most 6 * 448); the
@@ -312,9 +397,11 @@ bool dequantizable(const Weight& w) {
     case QType::BF16:
         return w.layout == QuantLayout::Contiguous && w.qdata != nullptr;
     case QType::FP8_E4M3FN_ROW_BF16:
-        return w.layout == QuantLayout::RowScale && w.qdata != nullptr && w.scales != nullptr;
+        return (w.layout == QuantLayout::RowScale ||
+                (w.layout == QuantLayout::VoltaQpnPrepacked && w.n % 32 == 0 && w.k % 128 == 0)) &&
+               w.qdata != nullptr && w.scales != nullptr;
     case QType::NVFP4:
-        return w.layout == QuantLayout::BlockScaleK16M128x4 && w.qdata != nullptr &&
+        return (w.layout == QuantLayout::BlockScaleK16M128x4 || w.layout == QuantLayout::VoltaQpnPrepacked) && w.qdata != nullptr &&
                w.scales != nullptr && w.k % 64 == 0 &&
                (w.weight_divisors != nullptr || w.weight_scale_divisor > 0.0F);
     default:
@@ -348,6 +435,13 @@ void dequantize_rows(const Weight& w, std::int32_t row0, std::int32_t rows, __ha
         return;
     }
     case QType::FP8_E4M3FN_ROW_BF16: {
+        if(w.layout==QuantLayout::VoltaQpnPrepacked) {
+            const std::int64_t tuples=std::int64_t((row0%32+rows+31)/32)*(w.k/128)*8*32;
+            fp8_packed_rows<<<unsigned((tuples+255)/256),256,0,stream>>>(
+                static_cast<const std::uint8_t*>(w.qdata),row0,rows,w.k,out);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         const dim3 grid(static_cast<unsigned>((w.k + 255) / 256), static_cast<unsigned>(rows));
         fp8_row_kernel<<<grid, 256, 0, stream>>>(static_cast<const std::uint8_t*>(w.qdata), row0,
                                                  w.k, out);
@@ -355,6 +449,12 @@ void dequantize_rows(const Weight& w, std::int32_t row0, std::int32_t rows, __ha
         return;
     }
     case QType::NVFP4: {
+        if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+            const dim3 packed_grid(static_cast<unsigned>((w.k / 8 + 255) / 256), static_cast<unsigned>(rows));
+            dequant_nvfp4_qpn_to_fp16<<<packed_grid, 256, 0, stream>>>(static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales), row0, rows, w.k, 1.0F, out);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         const dim3 grid(static_cast<unsigned>((w.k / 2 + 255) / 256), static_cast<unsigned>(rows));
         nvfp4_kernel<<<grid, 256, 0, stream>>>(static_cast<const std::uint8_t*>(w.qdata),
                                                static_cast<const std::uint8_t*>(w.scales), row0,

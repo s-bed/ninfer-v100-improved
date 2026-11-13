@@ -1,6 +1,8 @@
 #pragma once
 
 #include "core/weight.h"
+#include "ops/linear/fp8/fp8_prepack_sm70.h"
+#include <cstring>
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -49,18 +51,45 @@ public:
         device.copy_from_host(host.payload.data(), host.payload.size());
     }
 
-    Weight view() const { return host.device_weight(device.p); }
+    Weight view() const {
+        auto weight=host.device_weight(device.p);
+        if (fp8_prepacked_) weight.layout=QuantLayout::VoltaQpnPrepacked;
+        return weight;
+    }
+
+    void prepack_fp8() {
+        auto weight=view();
+        ops::detail::fp8_prepack_qpn_sm70(weight, nullptr);
+        if (weight.layout!=QuantLayout::VoltaQpnPrepacked)
+            throw std::runtime_error("FP8 prepack did not set layout family");
+        packed_baseline_.resize(host.payload.size());
+        device.copy_to_host(packed_baseline_.data(),packed_baseline_.size());
+        for (int row=0;row<weight.n;++row) {
+            const int lane=((row&31)/8)*4+(row&3)+((row&4)<<2);
+            for (int col=0;col<weight.k;col+=16) {
+                const std::size_t tuple=((std::size_t(row/32)*(weight.k/128)+col/128)*8+(col%128)/16)*32+lane;
+                if (std::memcmp(packed_baseline_.data()+tuple*16,host.payload.data()+std::size_t(row)*weight.k+col,16)!=0)
+                    throw std::runtime_error("FP8 input-projection prepack inverse mismatch");
+            }
+        }
+        if (!std::equal(packed_baseline_.begin()+host.scale_plane_offset,packed_baseline_.end(),host.payload.begin()+host.scale_plane_offset))
+            throw std::runtime_error("FP8 input-projection prepack changed row scales");
+        fp8_prepacked_=true;
+    }
 
     int verify_preserved(std::string_view label) const {
         std::vector<std::uint8_t> after(host.payload.size());
         device.copy_to_host(after.data(), after.size());
-        if (after == host.payload) { return 0; }
+        if (after == (fp8_prepacked_ ? packed_baseline_ : host.payload)) { return 0; }
         std::cerr << label << ": packed weight was modified\n";
         return 1;
     }
 
     quantized_weight::PackedWeight host;
     DeviceBuffer device;
+private:
+    bool fp8_prepacked_=false;
+    std::vector<std::uint8_t> packed_baseline_;
 };
 
 class GuardedBf16Tensor {

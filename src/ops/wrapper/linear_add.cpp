@@ -238,10 +238,13 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         return;
     }
 
+    if(w.qtype==QType::FP8_E4M3FN_ROW_BF16 && w.layout==QuantLayout::VoltaQpnPrepacked)
+        detail::validate_fp8_projection_weight(w,"packed FP8 linear_add");
     if (detail::sm70::covers(w, t)) {
         auto scope            = ws.scope();
         const auto activation = detail::sm70::prepare_for(
-            x, w.n, ws, stream, detail::sm70::integer_takes(w, t, policy));
+            x, w.n, ws, stream, w.qtype, detail::sm70::integer_takes(w, t, policy),
+            detail::sm70::ProjectionPurpose::Generic,w.layout);
         const detail::sm70::Destination residual{
             static_cast<__nv_bfloat16*>(residual_out.data), w.n, 0, 0, w.n, true};
         detail::sm70::project_for(activation, w, {&residual, 1}, stream);

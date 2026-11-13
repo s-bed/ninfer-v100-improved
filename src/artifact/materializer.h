@@ -39,6 +39,10 @@ struct DevicePlacement {
     // the artifact's objects, and the bytes are `selection` of `source`.
     std::optional<ObjectHandle> source;
     std::optional<ObjectSelection> selection;
+    // Model-owned request for the qualified FP8 QPN permutation after every upload,
+    // including suspend/resume. Native file/Host bytes and geometry stay unchanged.
+    // Whole stored parents only; selected/transcoded/panel placements cannot take it.
+    bool fp8_qpn = false;
 };
 
 // Offset inside the one page-locked Host block (Residency::Pinned), or inside the mapped Host

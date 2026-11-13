@@ -20,6 +20,11 @@
 
 namespace ninfer {
 
+enum class V100KernelPolicy : std::uint8_t {
+    Native,
+    Ported,
+};
+
 struct KvCapacityPolicy {
     KvCapacityMode mode                  = KvCapacityMode::Explicit;
     std::uint32_t explicit_tokens        = 2048;
@@ -580,6 +585,8 @@ struct EngineOptions {
     // ($NINFER_DEVICE_PROFILES, else $XDG_CACHE_HOME or ~/.cache, /ninfer/device-profiles.json).
     std::string device_profile = "auto";
     std::filesystem::path device_profile_path;
+    // Custom sm_70 donor routes. Fixed for the process before materializing any weights.
+    V100KernelPolicy v100_kernels = V100KernelPolicy::Native;
     // Lowest graphics clock, in MHz, the Engine's GPUs are held at while a generation or scoring
     // call runs (core/gpu_clock_floor.h): a layer pipeline's stages otherwise wait at idle clocks.
     // Zero leaves the clocks to the driver. Holding them needs administrator rights (root on

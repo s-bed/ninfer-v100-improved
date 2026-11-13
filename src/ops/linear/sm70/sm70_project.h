@@ -40,10 +40,17 @@ inline constexpr int kMaxDestinations = 4;
 // Vision item's patches in several, which bounds its FP16 activations and FP32 product plane.
 inline constexpr std::int32_t kWideColumns = 8192;
 
+// An operator's measured route contract; equal matrix shapes need not share a route.
+// Generic callers retain their native paths. Only the public GDN and fused SwiGLU
+// wrappers opt into the separately qualified FP8 implementations.
+enum class ProjectionPurpose { Generic, GdnInput, SwiGLU };
+
 // The activations of one call in FP16 (or, for the small-T route's direct widths, as the caller's
 // BF16 plane) and the slab scratch every parent of up to `max_rows` rows shares. A wide call of
 // more than kWideColumns columns keeps its BF16 plane and converts each pass's columns into `pass`.
 struct Activation {
+    ProjectionPurpose purpose = ProjectionPurpose::Generic;
+    QuantLayout source_layout = QuantLayout::RowScale;
     const __half* data        = nullptr;
     const __nv_bfloat16* bf16 = nullptr;
     __half* pass              = nullptr;
@@ -54,6 +61,13 @@ struct Activation {
     std::int32_t tokens       = 0;
     std::int32_t max_rows     = 0;
     void* scratch             = nullptr;
+    // Natural contiguous [T][k] FP16 plane for qualified QPN routes; the
+    // native small-T data plane can use a different private arrangement.
+    const __half* qpn_f16 = nullptr;
+    const std::uint32_t* qpn_beyond = nullptr;
+    float* qpn_sums = nullptr;
+    void* cutlass_storage = nullptr;
+    std::size_t cutlass_bytes = 0;
     // The integer route's quantized form (sm70_integer.h), when the call takes it.
     const std::int8_t* codes      = nullptr;
     const float* code_scales      = nullptr;
@@ -91,17 +105,22 @@ void swiglu(const Activation& x, const Weight& gate, const Weight* up, Tensor& o
 template <class Routes>
 [[nodiscard]] std::size_t capacity(QType format, std::int32_t max_rows, std::int32_t k,
                                    std::int32_t min_tokens, std::int32_t max_tokens,
-                                   LinearPolicy policy, Routes&& routes);
+                                   LinearPolicy policy, Routes&& routes,
+                                   ProjectionPurpose purpose = ProjectionPurpose::Generic);
 
 // The activations of a call; `integer` (sm70::integer_takes for the call's weights) adds the
 // integer route's quantized form.
 [[nodiscard]] Activation prepare_for(const Tensor& x, std::int32_t max_rows,
-                                     WorkspaceArena& workspace, cudaStream_t stream,
-                                     bool integer = false);
+                                     WorkspaceArena& workspace, cudaStream_t stream, QType format,
+                                     bool integer = false,
+                                     ProjectionPurpose purpose = ProjectionPurpose::Generic,
+                                     QuantLayout source_layout = QuantLayout::RowScale);
 // The activations of a call no wider than the small-T route's direct widths, which need no
 // workspace (callers without an arena check direct_tokens first).
 [[nodiscard]] bool direct_tokens(std::int32_t tokens);
 [[nodiscard]] Activation prepare_direct(const Tensor& x);
+// Allocation-free native direct route, eight columns per call, for packed convenience APIs.
+void project_direct_chunks(const Tensor&,const Weight&,std::span<const Destination>,cudaStream_t);
 void project_for(const Activation& x, const Weight& w, std::span<const Destination> destinations,
                  cudaStream_t stream);
 void swiglu_for(const Activation& x, const Weight& gate, const Weight* up, Tensor& out,
@@ -109,13 +128,15 @@ void swiglu_for(const Activation& x, const Weight& gate, const Weight* up, Tenso
 
 [[nodiscard]] std::size_t covered_bytes(QType format, std::int32_t max_rows, std::int32_t k,
                                         std::int32_t min_tokens, std::int32_t max_tokens,
-                                        LinearPolicy policy);
+                                        LinearPolicy policy,
+                                        ProjectionPurpose purpose = ProjectionPurpose::Generic);
 
 template <class Routes>
 std::size_t capacity(QType format, std::int32_t max_rows, std::int32_t k, std::int32_t min_tokens,
-                     std::int32_t max_tokens, LinearPolicy policy, Routes&& routes) {
+                     std::int32_t max_tokens, LinearPolicy policy, Routes&& routes,
+                     ProjectionPurpose purpose) {
     if (!enabled() || !covered_format(format, k)) { return routes(min_tokens, max_tokens); }
-    return covered_bytes(format, max_rows, k, min_tokens, max_tokens, policy);
+    return covered_bytes(format, max_rows, k, min_tokens, max_tokens, policy, purpose);
 }
 
 } // namespace ninfer::ops::detail::sm70

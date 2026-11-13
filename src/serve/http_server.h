@@ -1,6 +1,7 @@
 #pragma once
 
 #include "serve/console_stats.h"
+#include "serve/engine_watch.h"
 #include "serve/generation_service.h"
 #include "serve/load_report.h"
 #include "serve/model_registry.h"
@@ -107,7 +108,7 @@ public:
     // True once the engine watch stopped listen() because the one model's Engine failed
     // Engine-wide; the process then exits non-zero so a supervisor reloads the model.
     [[nodiscard]] bool engine_failed() const noexcept {
-        return engine_failed_.load(std::memory_order_acquire);
+        return engine_watch_.has_failed();
     }
     [[nodiscard]] bool webui_enabled() const noexcept;
 
@@ -262,7 +263,7 @@ private:
     std::condition_variable watch_cv_;
     std::thread watch_thread_;
     bool watch_stopping_ = false;
-    std::atomic<bool> engine_failed_{false};
+    EngineWatchState engine_watch_;
 };
 
 } // namespace ninfer::serve

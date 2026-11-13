@@ -1,11 +1,25 @@
 # Compile policy is owned here; each semantic family explicitly contributes sources.
 add_library(ninfer_ops STATIC)
+target_sources(ninfer_ops PRIVATE common/v100_kernel_policy.cpp)
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
 target_link_libraries(ninfer_ops PUBLIC ninfer_core)
 # The opt-in cuBLAS prefill route hands its GEMM to cuBLAS; see
 # ops/linear_swiglu/q4cublas/w4_cublas_prefill.h for why that route exists.
 target_link_libraries(ninfer_ops PRIVATE CUDA::cublas)
+if(NINFER_ARCH_VOLTA)
+  if(FETCHCONTENT_SOURCE_DIR_CUTLASS)
+    set(_ninfer_cutlass_default "${FETCHCONTENT_SOURCE_DIR_CUTLASS}")
+  else()
+    set(_ninfer_cutlass_default "/models/engine/geoffwatts-ninfer-v100/archive/build-v100/_deps/cutlass-src")
+  endif()
+  set(NINFER_V100_CUTLASS_SOURCE "${_ninfer_cutlass_default}" CACHE PATH
+      "Existing pinned CUTLASS v4.4.2 source for the V100 kernel port (never downloaded)")
+  if(NOT EXISTS "${NINFER_V100_CUTLASS_SOURCE}/include/cutlass/gemm/device/gemm.h")
+    message(FATAL_ERROR "V100 port needs cached CUTLASS headers: set NINFER_V100_CUTLASS_SOURCE")
+  endif()
+  target_include_directories(ninfer_ops SYSTEM PRIVATE "${NINFER_V100_CUTLASS_SOURCE}/include")
+endif()
 
 # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from
 # producer to consumer warpgroups. RDC makes ptxas discard that contract. These

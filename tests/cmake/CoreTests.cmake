@@ -177,3 +177,18 @@ ninfer_add_test(ninfer_structured_unique_test
 ninfer_add_test(ninfer_unique_strings_masks_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_unique_strings_masks.cpp"
   LIBRARIES ninfer_text ninfer::json)
+
+# Host-only guard against accidentally requiring the V100 port on native builds or
+# parsing sm_70-only launchers in another device pass of a mixed architecture build.
+if(CUDAToolkit_INCLUDE_DIRS)
+  list(GET CUDAToolkit_INCLUDE_DIRS 0 _ninfer_cuda_guard_include)
+elseif(CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES)
+  list(GET CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES 0 _ninfer_cuda_guard_include)
+endif()
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND _ninfer_cuda_guard_include)
+  add_test(NAME ninfer_v100_arch_guard_test
+    COMMAND ${Python3_EXECUTABLE} "${PROJECT_SOURCE_DIR}/tests/test_v100_arch_guards.py"
+      --source "${PROJECT_SOURCE_DIR}" --cxx "${CMAKE_CXX_COMPILER}"
+      --cuda-include "${_ninfer_cuda_guard_include}"
+      --cutlass "${NINFER_V100_CUTLASS_SOURCE}" --cmake "${CMAKE_COMMAND}")
+endif()

@@ -2,6 +2,7 @@
 
 #include "artifact/framing.h"
 #include "artifact/permute_row_split.h"
+#include "ops/linear/fp8/fp8_prepack_sm70.h"
 #include "artifact/transcode.h"
 
 #include <algorithm>
@@ -197,6 +198,19 @@ void Binder::panel_device(ObjectHandle object) {
     demand.panel = true;
 }
 
+void Binder::fp8_qpn_device(ObjectHandle object) {
+    if (selected(object)) {
+        throw ArtifactError(object_id(object) + ": FP8 QPN requires a whole stored parent");
+    }
+    const auto& tensor=reader_.directory().tensor(object);
+    auto& demand=demands_.at(object.index);
+    if (!demand.device || demand.transcode || demand.panel ||
+        !ops::detail::fp8_qpn_prepack_eligible(reader_.geometry(object))) {
+        throw ArtifactError(tensor.id + ": FP8 QPN requires a qualified native device parent");
+    }
+    demand.fp8_qpn=true;
+}
+
 void Binder::evict_device(ObjectHandle object, std::uint32_t rank) {
     if (selected(object)) {
         throw ArtifactError(object_id(object) + ": a selected piece cannot be evictable");
@@ -342,8 +356,10 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
         const auto bytes    = device_bytes(index);
         auto& capacity      = plan.device_capacity_by_rank[rank];
         const auto offset   = align_up(capacity, demand.alignment, "device offset");
-        plan.device_objects.push_back({ObjectHandle{index}, offset, bytes, demand.alignment,
-                                       demand.transcode, rank, demand.tail, demand.panel});
+        DevicePlacement placement{ObjectHandle{index},offset,bytes,demand.alignment,
+                                  demand.transcode,rank,demand.tail,demand.panel};
+        placement.fp8_qpn=demand.fp8_qpn;
+        plan.device_objects.push_back(std::move(placement));
         capacity = checked_add(checked_add(offset, bytes, "device capacity"), demand.tail,
                                "device capacity");
     };
@@ -395,6 +411,7 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
             placement.source    = entry.source;
             placement.selection = entry.selection;
             placement.panel     = entry.panel;
+            placement.fp8_qpn   = entry.fp8_qpn;
             plan.device_objects.push_back(std::move(placement));
             capacity = checked_add(checked_add(offset, entry.geometry.bytes, "device capacity"),
                                    entry.tail, "device capacity");

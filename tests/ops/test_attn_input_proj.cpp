@@ -1,3 +1,6 @@
+#include "ops/common/v100_kernel_policy.h"
+#include "ops/linear/sm70/sm70_gemm.h"
+#include <string_view>
 #include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/weight_input.h"
@@ -522,13 +525,23 @@ int run_nvfp4_target() {
     return failures;
 }
 
-int run_fp8_target() {
+int run_fp8_target(bool v100_scoped=false) {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kRows   = 14336;
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, 349U));
 
     int failures = 0;
+    if (v100_scoped) {
+        for (bool packed : {false,true}) {
+            if (packed) parent.prepack_fp8();
+            for (int width : {1,2,3,4,5,6,8,16,32,33,64,65,128,512,513})
+                failures+=run_target_projection_case(parent,nullptr,width,ops::LinearPolicy::A16Only);
+            for (int width : {3,6,33,65,513})
+                failures+=run_target_projection_case(parent,nullptr,width,ops::LinearPolicy::A16Only,true);
+        }
+        return failures;
+    }
     for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
         const std::string tag =
             policy == ops::LinearPolicy::A16Only ? "attn_input_proj FP8 A16" : "attn_input_proj FP8 A8";
@@ -726,10 +739,11 @@ int run_weight_inputs() {
 } // namespace
 
 int main(int argc, char** argv) {
+    const bool v100_fp8=argc==2 && std::string_view(argv[1])=="--v100-fp8";
     const bool dflash2_only = argc == 2 && std::string(argv[1]) == "--dflash2-only";
     const bool inputs_only  = argc == 2 && std::string(argv[1]) == "--weight-inputs-only";
-    if (argc != 1 && !dflash2_only && !inputs_only) {
-        std::cerr << "usage: ninfer_attn_input_proj_test [--dflash2-only|--weight-inputs-only]\n";
+    if (argc != 1 && !dflash2_only && !inputs_only && !v100_fp8) {
+        std::cerr << "usage: ninfer_attn_input_proj_test [--dflash2-only|--weight-inputs-only|--v100-fp8]\n";
         return 2;
     }
     if (cuda_unavailable()) {
@@ -737,6 +751,15 @@ int main(int argc, char** argv) {
         return 77;
     }
 
+    if (v100_fp8) {
+        if (!ops::detail::sm70::enabled()) return 77;
+        ops::set_v100_kernel_policy(true);
+        const int failures=run_fp8_target(true);
+        const auto routes=ops::v100_kernel_route_counts();
+        std::cout<<"FP8 routes ported="<<routes.ported<<" fallback="<<routes.fallback<<'\n';
+        // Raw input remains native; explicitly packed scatter calls exercise the donor and wide fallback.
+        return failures || !routes.ported || !routes.fallback ? 1 : 0;
+    }
     int failures = 0;
     if (inputs_only) { return run_weight_inputs() == 0 ? 0 : 1; }
     if (!dflash2_only) {

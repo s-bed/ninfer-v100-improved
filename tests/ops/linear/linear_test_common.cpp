@@ -2,6 +2,8 @@
 #include "ops/linear/linear_test_common.h"
 
 #include "artifact/permute_row_split.h"
+#include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
+#include "ops/linear/fp8/fp8_prepack_sm70.h"
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -357,6 +359,59 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
     DeviceBuffer device_weight(host_weight.payload.size());
     device_weight.copy_from_host(host_weight.payload.data(), device_weight.bytes);
     Weight weight = host_weight.device_weight(device_weight.p);
+    if (shape.v100_prepack && weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {
+        ops::detail::fp8_prepack_qpn_sm70(weight, nullptr);
+        bool duplicate_rejected=false;
+        try { ops::detail::fp8_prepack_qpn_sm70(weight, nullptr); }
+        catch (const std::invalid_argument&) { duplicate_rejected=true; }
+        if (!duplicate_rejected) throw std::runtime_error("FP8 prepack accepted packed input");
+        std::vector<std::uint8_t> bytes(host_weight.payload.size());
+        device_weight.copy_to_host(bytes.data(),bytes.size());
+        // Independent logical-row inverse; the CPU FP64 oracle above remains native.
+        for (int row=0;row<shape.n;++row) {
+            const int lane=((row&31)/8)*4+(row&3)+((row&4)<<2);
+            for (int col=0;col<shape.k;col+=16) {
+                const std::size_t tuple=((std::size_t(row/32)*(shape.k/128)+col/128)*8+(col%128)/16)*32+lane;
+                if (std::memcmp(bytes.data()+tuple*16,host_weight.payload.data()+std::size_t(row)*shape.k+col,16)!=0)
+                    throw std::runtime_error("FP8 packed code inverse mismatch");
+            }
+        }
+        if (!std::equal(bytes.begin()+host_weight.scale_plane_offset,bytes.end(),host_weight.payload.begin()+host_weight.scale_plane_offset))
+            throw std::runtime_error("FP8 prepack changed row scales or trailing bytes");
+        // Only the input-preservation baseline changes; oracle_weight is already materialized.
+        host_weight.payload=std::move(bytes);
+    }
+    if (shape.v100_prepack && weight.qtype == QType::NVFP4) {
+        ops::detail::nvfp4_prepack_qpn_sm70(weight);
+        bool duplicate_rejected = false;
+        try { ops::detail::nvfp4_prepack_qpn_sm70(weight); }
+        catch (const std::invalid_argument&) { duplicate_rejected = true; }
+        if (!duplicate_rejected) throw std::runtime_error("QPN prepack accepted packed input");
+        std::vector<std::uint8_t> packed_bytes(host_weight.payload.size());
+        device_weight.copy_to_host(packed_bytes.data(),packed_bytes.size());
+        // Independent host inverse checks every nibble and scale, including row/lane boundaries.
+        constexpr int inverse[16] = {0,4,1,5,2,6,3,7,8,12,9,13,10,14,11,15};
+        for (int row=0; row<shape.n; ++row) {
+            const int lane = ((row & 31) / 8) * 4 + (row & 3) + ((row & 4) << 2);
+            for (int group=0; group<shape.k/16; ++group) {
+                const std::size_t tuple = (std::size_t(row/32)*(shape.k/16)+group)*32+lane;
+                const int inner=row&127;
+                const std::size_t scale = host_weight.scale_plane_offset + (std::size_t(row/128)*(shape.k/64)+group/4)*512+(inner&31)*16+(inner>>5)*4+(group&3);
+                if (packed_bytes[host_weight.scale_plane_offset+tuple] != host_weight.payload[scale])
+                    throw std::runtime_error("QPN prepack scale round trip failed");
+                for (int e=0;e<16;++e) {
+                    const int p=inverse[e];
+                    const int actual=(packed_bytes[tuple*8+p/2]>>((p&1)*4))&15;
+                    const int k=group*16+e;
+                    const int expected=(host_weight.payload[std::size_t(row)*(shape.k/2)+k/2]>>((k&1)*4))&15;
+                    if (actual != expected) throw std::runtime_error("QPN prepack nibble round trip failed");
+                }
+            }
+        }
+        if (!std::equal(packed_bytes.begin()+host_weight.weight_divisor_offset,packed_bytes.end(),host_weight.payload.begin()+host_weight.weight_divisor_offset))
+            throw std::runtime_error("QPN prepack changed divisors");
+        host_weight.payload = std::move(packed_bytes);
+    }
     if (shape.panel) {
         const std::array<std::uint64_t, 2> extent{static_cast<std::uint64_t>(shape.n),
                                                   static_cast<std::uint64_t>(shape.k)};

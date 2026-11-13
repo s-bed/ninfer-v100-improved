@@ -12,9 +12,21 @@ endfunction()
 # relocations. Compressed for size it is about 3.5x smaller; the driver expands a module when it
 # loads.
 set(NINFER_CUDA_FATBIN_OPTIONS "-Xfatbin=-compress-all")
-# The default (speed) mode barely shrinks these kernels; the size mode, from CUDA 12.8, does.
+# Keep the upstream size-oriented default. Host experiments may trade package size
+# for compression CPU time without changing device instructions or arithmetic.
+set(NINFER_CUDA_COMPRESSION_MODE "size" CACHE STRING
+    "CUDA fatbinary compression mode (speed, balance, size or none; custom modes need CUDA 12.9)")
+set_property(CACHE NINFER_CUDA_COMPRESSION_MODE PROPERTY STRINGS speed balance size none)
+if(NOT NINFER_CUDA_COMPRESSION_MODE MATCHES "^(speed|balance|size|none)$")
+  message(FATAL_ERROR "NINFER_CUDA_COMPRESSION_MODE must be speed, balance, size or none; got '${NINFER_CUDA_COMPRESSION_MODE}'")
+endif()
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.9 AND
+   NOT NINFER_CUDA_COMPRESSION_MODE STREQUAL "size")
+  message(FATAL_ERROR "Selecting a custom NINFER_CUDA_COMPRESSION_MODE requires CUDA 12.9 or newer")
+endif()
+# The size mode has been available since CUDA 12.8; retain that existing guard.
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
-  list(APPEND NINFER_CUDA_FATBIN_OPTIONS "-compress-mode=size")
+  list(APPEND NINFER_CUDA_FATBIN_OPTIONS "-compress-mode=${NINFER_CUDA_COMPRESSION_MODE}")
 endif()
 
 if(NINFER_CUDA_PRUNE_PTX)

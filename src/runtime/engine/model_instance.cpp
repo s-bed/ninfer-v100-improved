@@ -12,6 +12,7 @@
 #include "artifact/formats.h"
 #include "core/paged_kv_cache.h"
 #include "core/startup.h"
+#include "ops/common/v100_kernel_policy.h"
 #include "core/tensor_parallel.h"
 #include "models/qwen3_5/frontend/graft.h"
 #include "models/qwen3_5/load.h"
@@ -179,6 +180,7 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     out += ";interpolation=" + std::to_string(options.rope_scaling_factor) + "@" +
            std::to_string(options.rope_scaling_original_context);
     out += ";build=" + options.context_cache.hybrid.persistent_identity;
+    out += ops::v100_kernel_cache_identity(options.v100_kernels == V100KernelPolicy::Ported);
     return out;
 }
 

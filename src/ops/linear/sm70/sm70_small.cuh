@@ -1,4 +1,5 @@
 #pragma once
+#include "ops/linear/fp8/fp8_prepack_sm70.cuh"
 
 // The small-T product of an sm_70 build (sm70_small.h) on Volta's tensor cores. A warp owns a
 // 32-row tile: mma.m8n8k4 runs four 8x8x4 products at once, one per quad pair, and with every
@@ -380,6 +381,7 @@ struct Fp8Decoder {
     static constexpr float kValueScale = 256.0f; // e4m3_lanes_to_f16x2_scaled's 2^-8
     const std::uint8_t* codes          = nullptr;
     std::int32_t k                     = 0;
+    bool packed                       = false;
 
     struct Raw {
         uint4 v[4];
@@ -390,7 +392,10 @@ struct Fp8Decoder {
                                                         chunk * kSmallChunk);
         Raw raw;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) { raw.v[i] = __ldg(p + i); }
+        for (int i = 0; i < 4; ++i) {
+            raw.v[i] = packed ? __ldg(reinterpret_cast<const uint4*>(codes+
+                fp8_qpn_prepacked_offset(row,chunk*kSmallChunk+i*16,k))) : __ldg(p+i);
+        }
         return raw;
     }
 
@@ -412,6 +417,7 @@ struct Nvfp4Decoder {
     const std::uint8_t* codes         = nullptr;
     const std::uint8_t* scales        = nullptr;
     std::int32_t k                    = 0;
+    bool prepacked = false;
 
     struct Raw {
         uint4 v[2];
@@ -419,6 +425,25 @@ struct Nvfp4Decoder {
     };
 
     __device__ __forceinline__ Raw load(std::int32_t row, int chunk) const {
+        if (prepacked) {
+            Raw raw{};
+            auto* dst = reinterpret_cast<unsigned*>(raw.v);
+            constexpr int order[16] = {0,2,4,6,1,3,5,7,8,10,12,14,9,11,13,15};
+            const int lane = ((row & 31) / 8) * 4 + (row & 3) + ((row & 4) << 2);
+            for (int g = 0; g < 4; ++g) {
+                const std::int64_t tuple = ((std::int64_t(row / 32) * (k / 16) + chunk * 4 + g) * 32 + lane);
+                const auto* src = codes + tuple * 8;
+                unsigned lo = 0, hi = 0;
+                for (int j = 0; j < 16; ++j) {
+                    const unsigned nibble = (src[j / 2] >> ((j & 1) * 4)) & 15;
+                    const int at = order[j];
+                    if (at < 8) lo |= nibble << (at * 4); else hi |= nibble << ((at - 8) * 4);
+                }
+                dst[g * 2] = lo; dst[g * 2 + 1] = hi;
+                raw.scale_bytes |= unsigned(scales[tuple]) << (g * 8);
+            }
+            return raw;
+        }
         const uint4* p = reinterpret_cast<const uint4*>(
             codes + static_cast<std::int64_t>(row) * (k / 2) + chunk * 32);
         Raw raw;

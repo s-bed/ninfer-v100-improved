@@ -12,4 +12,4 @@ add_library(ninfer_artifact STATIC
   views.cpp
 )
 ninfer_internal_includes(ninfer_artifact)
-target_link_libraries(ninfer_artifact PUBLIC ninfer_core ninfer::json)
+target_link_libraries(ninfer_artifact PUBLIC ninfer_core ninfer::json PRIVATE ninfer_ops)

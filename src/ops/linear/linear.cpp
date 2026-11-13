@@ -3,6 +3,7 @@
 
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
+#include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
@@ -86,11 +87,14 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 // only routes that read the panel layout. Without an arena, the widths that need none.
 bool sm70_route(const Tensor& x, const Weight& w, const WorkspaceArena* workspace) {
     return detail::sm70::covers(w, x.ne[1]) &&
-           (workspace != nullptr || detail::sm70::direct_tokens(x.ne[1]));
+           (workspace != nullptr || detail::sm70::direct_tokens(x.ne[1]) ||
+            (w.qtype==QType::FP8_E4M3FN_ROW_BF16 && w.layout==QuantLayout::VoltaQpnPrepacked));
 }
 
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
+    if(w.qtype==QType::FP8_E4M3FN_ROW_BF16 && w.layout==QuantLayout::VoltaQpnPrepacked)
+        detail::validate_fp8_projection_weight(w,"packed FP8 linear");
     if (sm70_route(x, w, workspace)) {
         detail::sm70::Destination all{nullptr, w.n, 0, 0, w.n, false};
         if (out.dtype == DType::FP32) {
@@ -99,12 +103,13 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
             all.data = static_cast<__nv_bfloat16*>(out.data);
         }
         if (workspace == nullptr) {
-            detail::sm70::project_for(detail::sm70::prepare_direct(x), w, {&all, 1}, stream);
+            detail::sm70::project_direct_chunks(x,w,{&all,1},stream);
             return;
         }
         auto scope            = workspace->scope();
         const auto activation = detail::sm70::prepare_for(
-            x, w.n, *workspace, stream, detail::sm70::integer_takes(w, x.ne[1], policy));
+            x, w.n, *workspace, stream, w.qtype, detail::sm70::integer_takes(w, x.ne[1], policy),
+            detail::sm70::ProjectionPurpose::Generic,w.layout);
         detail::sm70::project_for(activation, w, {&all, 1}, stream);
         return;
     }

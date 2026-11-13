@@ -88,3 +88,44 @@ target_include_directories(ninfer_linear_gguf_cooperative_test PRIVATE
 ninfer_add_op_test(ninfer_linear_stq_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_stq.cpp"
   LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_v100_port_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_v100_port.cpp"
+  LIBRARIES ninfer_linear_test_support ninfer_linear_swiglu_test_support)
+
+# Qualify packed-layout native fallbacks using the same independent FP64 oracles.
+add_test(NAME ninfer_v100_native_packed_test
+  COMMAND ninfer_v100_port_test --native-packed)
+set_tests_properties(ninfer_v100_native_packed_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# Opt-in event timings: invoke a separate process for each fixed kernel policy.
+ninfer_add_op_test(ninfer_v100_port_bench STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/v100_port_bench.cpp"
+  LIBRARIES ninfer_ops)
+
+# Qualified native RowScale FP8 donor routes; oracle and events remain separate.
+ninfer_add_op_test(ninfer_v100_fp8_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_v100_fp8.cpp"
+  LIBRARIES ninfer_linear_test_support)
+ninfer_add_op_test(ninfer_v100_fp8_bench STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/v100_fp8_bench.cpp"
+  LIBRARIES ninfer_ops)
+
+# Private FP8 byte-layout experiment. It directly instantiates the donor leaf;
+# it links no production Ops, materializer, artifact reader or layout validator.
+if(NINFER_ARCH_VOLTA)
+  ninfer_add_op_test(ninfer_v100_fp8_prepack_experiment STANDALONE
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/v100_fp8_prepack_experiment.cu"
+    LIBRARIES ${NINFER_CUDART_TARGET})
+  set_target_properties(ninfer_v100_fp8_prepack_experiment PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+  ninfer_cuda_archive(ninfer_v100_fp8_prepack_experiment)
+  target_compile_options(ninfer_v100_fp8_prepack_experiment PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(ninfer_v100_fp8_prepack_experiment PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fno-fast-math>
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>)
+  endif()
+  set_tests_properties(ninfer_v100_fp8_prepack_experiment PROPERTIES TIMEOUT 900)
+endif()

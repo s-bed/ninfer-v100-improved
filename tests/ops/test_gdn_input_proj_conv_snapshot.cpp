@@ -1,3 +1,5 @@
+#include "ops/common/v100_kernel_policy.h"
+#include <string_view>
 #include "core/weight.h"
 #include "ninfer/ops/gdn_input_proj.h"
 
@@ -1077,14 +1079,15 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     failures +=
         verify_preserved("snapshot base slot" + suffix, device_snapshot_base, snapshot_base_value);
     failures += parent.verify_preserved("snapshot parent weight" + suffix);
-    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+    if (workspace.used() != 0 || (workspace.peak_used()>workspace_bytes ||
+        (!ops::v100_ported_kernels_enabled() && workspace.peak_used()!=workspace_bytes))) {
         std::cerr << "snapshot" << suffix << ": workspace query/execution high-water mismatch\n";
         ++failures;
     }
     return failures;
 }
 
-int run_fp8() {
+int run_fp8(bool v100_scoped=false) {
     constexpr std::int32_t kHidden    = 5120;
     constexpr std::int32_t kValueRows = 6144;
     constexpr std::int32_t kZRows     = 6144;
@@ -1094,6 +1097,16 @@ int run_fp8() {
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, 929U));
 
     int failures = 0;
+    if (v100_scoped) {
+        for (bool packed : {false,true}) {
+            if (packed) parent.prepack_fp8();
+            for (int width : {1,2,3,4,5,6,8,16,32,33,64,65,128})
+                failures+=run_fp8_case(parent,width,ops::LinearPolicy::A16Only,width+1);
+            // Shared and independent state selectors both remain covered.
+            failures+=run_fp8_case(parent,1,ops::LinearPolicy::A16Only,2,true,true);
+        }
+        return failures;
+    }
     failures += run_fp8_case(parent, 1, ops::LinearPolicy::A16Only, 2, true, true);
     failures += run_fp8_case(parent, 3, ops::LinearPolicy::A16Only, 4);
     failures += run_fp8_case(parent, 4, ops::LinearPolicy::A16Only, 5);
@@ -1160,12 +1173,25 @@ int run_fp8() {
 
 } // namespace
 
-int main() {
+int main(int argc,char** argv) {
+    const bool v100_fp8=argc==2 && std::string_view(argv[1])=="--v100-fp8";
+    if (argc!=1 && !v100_fp8) {
+        std::cerr<<"usage: ninfer_gdn_input_proj_conv_snapshot_test [--v100-fp8]\n";
+        return 2;
+    }
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
 
+    if (v100_fp8) {
+        if (!ops::detail::sm70::enabled()) return 77;
+        ops::set_v100_kernel_policy(true);
+        const int failures=run_fp8(true);
+        const auto routes=ops::v100_kernel_route_counts();
+        std::cout<<"FP8 routes ported="<<routes.ported<<" fallback="<<routes.fallback<<'\n';
+        return failures || !routes.ported ? 1 : 0;
+    }
     int failures = 0;
     const std::size_t q4_decode =
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 1, 1);

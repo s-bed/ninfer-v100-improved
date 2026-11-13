@@ -1,3 +1,6 @@
+#include "ops/common/v100_kernel_policy.h"
+#include "ops/linear/sm70/sm70_gemm.h"
+#include <string_view>
 #include "core/weight.h"
 #include "core/device.h"
 #include "ninfer/ops/gdn_input_proj.h"
@@ -122,7 +125,7 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
              std::int32_t z_rows, std::int32_t width, std::int32_t batch,
              std::vector<std::int32_t> valid_columns, std::size_t snapshot_workspace_bytes,
              std::size_t record_workspace_bytes, SnapshotLaunch&& snapshot_launch,
-             RecordLaunch&& record_launch, std::uint32_t seed) {
+             RecordLaunch&& record_launch, std::uint32_t seed, bool allow_unused_workspace=false) {
     const std::int32_t channels          = kQueryRows + kKeyRows + value_rows;
     const std::int32_t aggregate_columns = width * batch;
     const std::int32_t source_slots      = 8;
@@ -268,11 +271,13 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     failures += record_z.verify_guards(std::string(label) + " record z");
     failures += conv_record.verify_guards(std::string(label) + " conv record");
     if (snapshot_workspace.used() != 0 ||
-        snapshot_workspace.peak_used() != snapshot_workspace_bytes) {
+        (snapshot_workspace.peak_used()>snapshot_workspace_bytes ||
+        (!allow_unused_workspace && snapshot_workspace.peak_used()!=snapshot_workspace_bytes))) {
         std::cerr << label << ": snapshot workspace query/execution mismatch\n";
         ++failures;
     }
-    if (record_workspace.used() != 0 || record_workspace.peak_used() != record_workspace_bytes) {
+    if (record_workspace.used() != 0 || (record_workspace.peak_used()>record_workspace_bytes ||
+        (!allow_unused_workspace && record_workspace.peak_used()!=record_workspace_bytes))) {
         std::cerr << label << ": record workspace query/execution mismatch\n";
         ++failures;
     }
@@ -528,15 +533,26 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t width, std::int32_t ba
             ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid_columns, initial,
                                             record, q, k, v, z, policy, workspace, stream);
         },
-        seed);
+        seed, ops::v100_ported_kernels_enabled());
 }
 
-int run_fp8() {
+int run_fp8(bool v100_scoped=false) {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kRows   = 16384;
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, 1701U));
     int failures = 0;
+    if (v100_scoped) {
+        for (bool packed : {false,true}) {
+            if (packed) parent.prepack_fp8();
+            for (int width : {2,3,4,6,8,16,32,33,64})
+                failures+=run_fp8_case(parent,width,1,{},ops::LinearPolicy::A16Only,1700U+width);
+            failures+=run_fp8_case(parent,3,3,{3,2,1},ops::LinearPolicy::A16Only,1771U);
+            failures+=run_fp8_case(parent,6,3,{6,4,1},ops::LinearPolicy::A16Only,1777U);
+            failures+=run_fp8_case(parent,4,8,ragged(4,8),ops::LinearPolicy::A16Only,1783U);
+        }
+        return failures;
+    }
     for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
         const std::string tag = policy == ops::LinearPolicy::A16Only
                                     ? "gdn_input_proj_conv_record FP8 A16"
@@ -569,12 +585,25 @@ int run_fp8() {
 
 } // namespace
 
-int main() {
+int main(int argc,char** argv) {
+    const bool v100_fp8=argc==2 && std::string_view(argv[1])=="--v100-fp8";
+    if (argc!=1 && !v100_fp8) {
+        std::cerr<<"usage: ninfer_gdn_input_proj_conv_record_test [--v100-fp8]\n";
+        return 2;
+    }
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
 
+    if (v100_fp8) {
+        if (!ops::detail::sm70::enabled()) return 77;
+        ops::set_v100_kernel_policy(true);
+        const int failures=run_fp8(true);
+        const auto routes=ops::v100_kernel_route_counts();
+        std::cout<<"FP8 routes ported="<<routes.ported<<" fallback="<<routes.fallback<<'\n';
+        return failures || !routes.ported ? 1 : 0;
+    }
     int failures = test_record_capacity_domain();
     failures += run_q4_q5();
     failures += run_t2();

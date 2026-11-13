@@ -1,3 +1,8 @@
+ninfer_add_test(ninfer_v100_kernel_policy_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_v100_kernel_policy.cpp"
+          "${PROJECT_SOURCE_DIR}/src/ops/common/v100_kernel_policy.cpp")
+add_test(NAME ninfer_v100_kernel_policy_native_test COMMAND ninfer_v100_kernel_policy_test native)
+
 ninfer_add_test(ninfer_admission_policy_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_admission_policy.cpp"
   LIBRARIES ninfer_runtime_support)
 

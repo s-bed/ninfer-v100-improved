@@ -120,6 +120,17 @@ inline std::uint16_t load_u16_le(const std::vector<std::uint8_t>& payload, std::
            static_cast<std::uint16_t>(static_cast<std::uint16_t>(payload[off + 1]) << 8);
 }
 
+// Test-owned little-endian decoding, independent of the production artifact/kernel helpers.
+inline std::uint32_t load_u32_le(const std::vector<std::uint8_t>& payload, std::size_t off) {
+    if (off > payload.size() || payload.size() - off < 4) {
+        throw std::out_of_range("quantized-weight fixture: truncated binary32 word");
+    }
+    return static_cast<std::uint32_t>(payload[off]) |
+           (static_cast<std::uint32_t>(payload[off + 1]) << 8U) |
+           (static_cast<std::uint32_t>(payload[off + 2]) << 16U) |
+           (static_cast<std::uint32_t>(payload[off + 3]) << 24U);
+}
+
 inline double decode_e2m1(std::uint8_t word) {
     constexpr double magnitudes[]{0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
     const double magnitude = magnitudes[word & 0x07U];
@@ -719,7 +730,9 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
     if (weight.qtype == QType::NVFP4) {
         if (weight.layout != QuantLayout::BlockScaleK16M128x4 ||
             weight.scale_dtype != DType::FP8_E4M3FN || weight.group != 16 ||
-            !std::isfinite(weight.weight_scale_divisor) || weight.weight_scale_divisor <= 0.0F) {
+            !std::isfinite(weight.weight_scale_divisor) || weight.weight_scale_divisor <= 0.0F ||
+            weight.weight_divisor_rows <= 0 || weight.n % weight.weight_divisor_rows != 0 ||
+            weight.weight_divisor_rows % 128 != 0) {
             throw std::invalid_argument("quantized-weight fixture: invalid NVFP4 metadata");
         }
         const std::size_t code_offset =
@@ -738,9 +751,24 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
             static_cast<std::size_t>(row_tile * k_tiles + scale_tile) * 512U +
             static_cast<std::size_t>(row_inner % 32) * 16U +
             static_cast<std::size_t>(row_inner / 32) * 4U + static_cast<std::size_t>(scale_lane);
+        // The serialized table follows the scale plane. Select the logical row's source,
+        // checking the table before index arithmetic so a malformed fixture cannot wrap an offset.
+        if (packed.weight_divisor_offset > packed.payload.size()) {
+            throw std::out_of_range("quantized-weight fixture: divisor table exceeds payload");
+        }
+        const auto table = static_cast<std::size_t>(packed.weight_divisor_offset);
+        const auto entry = static_cast<std::size_t>(row / weight.weight_divisor_rows);
+        if (entry >= (packed.payload.size() - table) / sizeof(float)) {
+            throw std::out_of_range("quantized-weight fixture: missing source divisor");
+        }
+        const float divisor = detail::bits_float(
+            detail::load_u32_le(packed.payload, table + entry * sizeof(float)));
+        if (!std::isfinite(divisor) || divisor <= 0.0F) {
+            throw std::invalid_argument("quantized-weight fixture: invalid source divisor");
+        }
         const double decoded = detail::decode_e2m1(code) *
                                detail::decode_e4m3fn(packed.payload[scale_offset]) /
-                               static_cast<double>(weight.weight_scale_divisor);
+                               static_cast<double>(divisor);
         return static_cast<double>(static_cast<float>(decoded));
     }
 

@@ -1,3 +1,6 @@
+#include "ops/common/v100_kernel_policy.h"
+#include "ops/linear/sm70/sm70_gemm.h"
+#include <string_view>
 #include "core/weight.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
@@ -466,7 +469,8 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
         failures += verify_output_range_sampled("gdn z" + suffix, z, kZRows, 0, kZRows, parent.host,
                                                 kQkvRows, activation, kHidden, tokens, criterion,
                                                 sample_count);
-        if (workspace.peak_used() != capacity) {
+        if (workspace.used()!=0 || workspace.peak_used()>capacity ||
+            (!ops::v100_ported_kernels_enabled() && workspace.peak_used()!=capacity)) {
             std::cerr << "gdn workspace" << suffix << ": query/execution high-water mismatch\n";
             ++failures;
         }
@@ -477,13 +481,30 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     return failures;
 }
 
-int run_fp8() {
+int run_fp8(bool v100_scoped=false) {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kRows   = 16384;
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, 613U));
 
     int failures = 0;
+    if (v100_scoped) {
+        for (bool packed : {false,true}) {
+            if (packed) parent.prepack_fp8();
+            for (int width : {1,2,3,4,5,6,8,16,32,33,64,65,128,512,513}) {
+                const auto before=ops::v100_kernel_route_counts();
+                failures+=run_fp8_case(parent,width,ops::LinearPolicy::A16Only);
+                const auto after=ops::v100_kernel_route_counts();
+                if ((after.ported!=before.ported)!=((packed && width<=32) || (width>=33 && width<=4096))) {
+                    std::cerr<<"FP8 GDN selected an unqualified route T="<<width<<'\n';
+                    ++failures;
+                }
+            }
+            for (int width : {3,6,33,65,513})
+                failures+=run_fp8_case(parent,width,ops::LinearPolicy::A16Only,false,true);
+        }
+        return failures;
+    }
     for (int columns : {5, 8, 16, 24, 32, 33, 64, 65, 96, 97, 128, 129}) {
         failures += run_fp8_case(parent, columns, ops::LinearPolicy::A16Only);
     }
@@ -532,12 +553,25 @@ int run_fp8() {
 
 } // namespace
 
-int main() {
+int main(int argc,char** argv) {
+    const bool v100_fp8=argc==2 && std::string_view(argv[1])=="--v100-fp8";
+    if (argc!=1 && !v100_fp8) {
+        std::cerr<<"usage: ninfer_gdn_input_proj_test [--v100-fp8]\n";
+        return 2;
+    }
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
 
+    if (v100_fp8) {
+        if (!ops::detail::sm70::enabled()) return 77;
+        ops::set_v100_kernel_policy(true);
+        const int failures=run_fp8(true);
+        const auto routes=ops::v100_kernel_route_counts();
+        std::cout<<"FP8 routes ported="<<routes.ported<<" fallback="<<routes.fallback<<'\n';
+        return failures || !routes.ported ? 1 : 0;
+    }
     int failures = 0;
     failures += run_q4_q5();
     failures += run_t2();

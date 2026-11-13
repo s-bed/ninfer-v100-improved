@@ -11,6 +11,7 @@
 #include "ops/linear/sm70/sm70_gemm.h"
 #include "ops/linear/sm70/sm70_integer.h"
 #include "ops/linear/sm70/sm70_project.h"
+#include "ops/linear/sm70/v100_fp8.h"
 #include "ops/linear/t2/t2_a8.h"
 #include "ops/linear/t2/t2_weight_view.h"
 #include "ops/linear_swiglu/q4cublas/cublas_prefill_gate.h"
@@ -331,8 +332,12 @@ void sm70_project_gdn(const Tensor& x, const Weight& first, const Weight* second
     const bool integer =
         detail::sm70::integer_takes(first, x.ne[1], policy) &&
         (second == nullptr || detail::sm70::integer_takes(*second, x.ne[1], policy));
+    const auto preparation_format =
+        (first.qtype == QType::NVFP4 || (second && second->qtype == QType::NVFP4))
+            ? QType::NVFP4 : first.qtype;
     const auto activation = detail::sm70::prepare_for(
-        x, std::max(first.n, second != nullptr ? second->n : 0), workspace, stream, integer);
+        x, std::max(first.n, second != nullptr ? second->n : 0), workspace, stream,
+        preparation_format, integer, detail::sm70::ProjectionPurpose::GdnInput,first.layout);
     auto* qkv_plane             = static_cast<__nv_bfloat16*>(qkv.data);
     auto* z_plane               = static_cast<__nv_bfloat16*>(z.data);
     const std::int32_t qkv_rows = qkv.ne[0];
@@ -385,7 +390,10 @@ std::size_t sm70_projection_bytes(QType first, QType second, std::int32_t rows,
                 detail::sm70::integer_format(second, input_rows, min_tokens, policy)
             ? policy
             : LinearPolicy::A16Only;
-    return detail::sm70::covered_bytes(first, rows, input_rows, min_tokens, max_tokens, shared);
+    const auto preparation_format=(first==QType::NVFP4 || second==QType::NVFP4)
+                                      ? QType::NVFP4 : first;
+    return detail::sm70::covered_bytes(preparation_format, rows, input_rows, min_tokens, max_tokens,
+                                        shared, detail::sm70::ProjectionPurpose::GdnInput);
 }
 
 // The registered conv-form shapes name their parents: query/key/value 2048/2048/6144 is the
@@ -438,9 +446,21 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         require_matrix(qkv, kQkvRows, cols, "qkv");
         require_matrix(z, kZRows, cols, "z");
         require_single_parent_nonoverlap(x, qkv, z);
-        detail::validate_fp8_weight(weight, "fp8 gdn_input_proj");
+        detail::validate_fp8_projection_weight(weight, "fp8 gdn_input_proj");
+        if(weight.layout==QuantLayout::VoltaQpnPrepacked && !detail::sm70::v100_fp8_enabled())
+            throw std::invalid_argument("packed FP8 GDN requires ported sm70 policy");
         if (weight.n != kRows || weight.k != kHidden) {
             throw std::invalid_argument("fp8 gdn_input_proj: unsupported weight shape");
+        }
+        if(weight.layout==QuantLayout::VoltaQpnPrepacked && workspace==nullptr) {
+            const detail::sm70::Destination parts[]={{static_cast<__nv_bfloat16*>(qkv.data),kQkvRows,0,0,kQkvRows,false},
+                {static_cast<__nv_bfloat16*>(z.data),kZRows,0,kQkvRows,kZRows,false}};
+            detail::sm70::project_direct_chunks(x,weight,parts,stream);
+            return;
+        }
+        if (workspace != nullptr && detail::sm70::v100_fp8_enabled()) {
+            sm70_project_gdn(x, weight, nullptr, qkv, z, policy, *workspace, stream);
+            return;
         }
         detail::fp8_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
         return;
@@ -601,7 +621,9 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
         constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
         constexpr std::int32_t kParentRows = kChannels + kZRows;
         const ConvGeometry geometry        = require_snapshot_input(x, kHidden);
-        detail::validate_fp8_weight(weight, "fp8 gdn_input_proj_conv_snapshot");
+        detail::validate_fp8_projection_weight(weight, "fp8 gdn_input_proj_conv_snapshot");
+        if(weight.layout==QuantLayout::VoltaQpnPrepacked && !detail::sm70::v100_fp8_enabled())
+            throw std::invalid_argument("packed FP8 GDN requires ported sm70 policy");
         if (weight.n != kParentRows || weight.k != kHidden) {
             throw std::invalid_argument(
                 "fp8 gdn_input_proj_conv_snapshot: unsupported weight shape");
@@ -629,6 +651,16 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                                                     &value,
                                                     &z};
         require_parent_nonoverlap(weight, tensors, workspace, "fp8 gdn_input_proj_conv_snapshot");
+        if (detail::sm70::v100_fp8_enabled()) {
+            compose_batched_snapshot(x, conv_weight, conv_states, valid_columns,
+                                     initial_state_slots, snapshot_base_slots, query, key, value, z,
+                                     kQueryRows, kKeyRows, kValueRows, geometry, workspace, stream,
+                                     [&](const Tensor& input, Tensor& projected, Tensor& z_output) {
+                                         gdn_input_proj(input, weight, projected, z_output, policy,
+                                                        workspace, stream);
+                                     });
+            return;
+        }
         detail::fp8_gdn_snapshot_dispatch(x, weight, conv_weight, conv_states, valid_columns,
                                           initial_state_slots, snapshot_base_slots, query, key,
                                           value, z, policy, workspace, stream);
@@ -761,7 +793,9 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
         constexpr std::int32_t kParentRows = kChannels + kZRows;
         const ConvGeometry geometry        = require_record_input(x, kHidden);
-        detail::validate_fp8_weight(weight, "fp8 gdn_input_proj_conv_record");
+        detail::validate_fp8_projection_weight(weight, "fp8 gdn_input_proj_conv_record");
+        if(weight.layout==QuantLayout::VoltaQpnPrepacked && !detail::sm70::v100_fp8_enabled())
+            throw std::invalid_argument("packed FP8 GDN requires ported sm70 policy");
         if (weight.n != kParentRows || weight.k != kHidden) {
             throw std::invalid_argument("fp8 gdn_input_proj_conv_record: unsupported weight shape");
         }
@@ -783,6 +817,15 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
             &x,           &conv_weight, &conv_states, &valid_columns, &initial_state_slots,
             &conv_record, &query,       &key,         &value,         &z};
         require_parent_nonoverlap(weight, tensors, workspace, "fp8 gdn_input_proj_conv_record");
+        if (detail::sm70::v100_fp8_enabled()) {
+            compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots,
+                           conv_record, query, key, value, z, geometry, workspace, stream,
+                           [&](const Tensor& input, Tensor& record, Tensor& z_output) {
+                               gdn_input_proj(input, weight, record, z_output, policy,
+                                              workspace, stream);
+                           });
+            return;
+        }
         detail::fp8_gdn_record_dispatch(x, weight, conv_weight, conv_states, valid_columns,
                                         initial_state_slots, conv_record, query, key, value, z,
                                         policy, workspace, stream);
@@ -1051,6 +1094,11 @@ std::size_t single_parent_route_bytes(QType parent_qtype, std::int32_t parent_ro
             input_rows != detail::Fp8N16384K5120::kInputRows) {
             throw std::invalid_argument("gdn_input_proj workspace: unsupported FP8 profile");
         }
+        if (detail::sm70::v100_fp8_enabled()) {
+            return detail::sm70::covered_bytes(parent_qtype, parent_rows, input_rows,
+                                               min_tokens, max_tokens, without_integer(policy),
+                                               detail::sm70::ProjectionPurpose::GdnInput);
+        }
         return detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
     if (parent_qtype == QType::Q8_G32_FP16 && parent_rows == 12288 && input_rows == 2048) {
@@ -1146,6 +1194,12 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 &&
         parent_rows == detail::Fp8N16384K5120::kOutputRows &&
         input_rows == detail::Fp8N16384K5120::kInputRows) {
+        if (detail::sm70::v100_fp8_enabled()) {
+            const int columns = batch_size * max_width;
+            const auto projection = gdn_input_proj_workspace_capacity_bytes(
+                parent_qtype, parent_rows, input_rows, policy, batch_size * min_width, columns);
+            return composed_snapshot_capacity(10240, columns, projection);
+        }
         return detail::fp8_gdn_snapshot_workspace_capacity_bytes(policy, batch_size, min_width,
                                                                  max_width);
     }
@@ -1247,6 +1301,11 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 &&
         parent_rows == detail::Fp8N16384K5120::kOutputRows &&
         input_rows == detail::Fp8N16384K5120::kInputRows) {
+        if (detail::sm70::v100_fp8_enabled()) {
+            return gdn_input_proj_workspace_capacity_bytes(parent_qtype, parent_rows, input_rows,
+                                                           policy, batch_size * min_width,
+                                                           batch_size * max_width);
+        }
         return detail::fp8_gdn_record_workspace_capacity_bytes(policy, batch_size, min_width,
                                                                max_width);
     }

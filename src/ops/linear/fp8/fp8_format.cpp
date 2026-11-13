@@ -1,5 +1,6 @@
 #include "core/weight.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/common/device_tier.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -35,7 +36,7 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, const char*
 
 } // namespace
 
-Fp8WeightGeometry validate_fp8_weight(const Weight& weight, const char* operation) {
+static Fp8WeightGeometry validate(const Weight& weight, const char* operation, bool projection) {
     if (weight.n <= 0 || weight.k <= 0) {
         throw std::invalid_argument(std::string(operation) + ": FP8 shape must be positive");
     }
@@ -49,7 +50,10 @@ Fp8WeightGeometry validate_fp8_weight(const Weight& weight, const char* operatio
         checked_add(geometry.scale_plane_offset, geometry.scale_plane_bytes, operation);
 
     const std::int64_t scale_stride = static_cast<std::int64_t>(weight.n) * 2;
-    if (weight.qtype != QType::FP8_E4M3FN_ROW_BF16 || weight.layout != QuantLayout::RowScale ||
+    const bool packed = projection && weight.layout == QuantLayout::VoltaQpnPrepacked &&
+                        current_device_volta() && weight.n % 32 == 0 && weight.k % 128 == 0;
+    if (weight.qtype != QType::FP8_E4M3FN_ROW_BF16 ||
+        (weight.layout != QuantLayout::RowScale && !packed) ||
         weight.scale_dtype != DType::BF16 ||
         weight.group_size != static_cast<std::uint32_t>(weight.k) || weight.group != weight.k ||
         weight.ndim != 2 || weight.shape[0] != weight.n || weight.shape[1] != weight.k ||
@@ -70,6 +74,13 @@ Fp8WeightGeometry validate_fp8_weight(const Weight& weight, const char* operatio
         throw std::invalid_argument(std::string(operation) + ": invalid FP8 plane geometry");
     }
     return geometry;
+}
+
+Fp8WeightGeometry validate_fp8_weight(const Weight& w,const char* operation) {
+    return validate(w,operation,false);
+}
+Fp8WeightGeometry validate_fp8_projection_weight(const Weight& w,const char* operation) {
+    return validate(w,operation,true);
 }
 
 } // namespace ninfer::ops::detail

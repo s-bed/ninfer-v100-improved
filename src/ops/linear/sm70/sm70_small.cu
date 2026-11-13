@@ -104,10 +104,11 @@ void with_decoder(const Weight& w, F&& f) {
     case QType::BF16:
         return f(Bf16Decoder{static_cast<const __nv_bfloat16*>(w.qdata), w.k});
     case QType::FP8_E4M3FN_ROW_BF16:
-        return f(Fp8Decoder{static_cast<const std::uint8_t*>(w.qdata), w.k});
+        return f(Fp8Decoder{static_cast<const std::uint8_t*>(w.qdata), w.k,
+                            w.layout == QuantLayout::VoltaQpnPrepacked});
     case QType::NVFP4:
         return f(Nvfp4Decoder{static_cast<const std::uint8_t*>(w.qdata),
-                              static_cast<const std::uint8_t*>(w.scales), w.k});
+                              static_cast<const std::uint8_t*>(w.scales), w.k, w.layout == QuantLayout::VoltaQpnPrepacked});
     default:
         break;
     }

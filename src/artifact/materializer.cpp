@@ -2,6 +2,10 @@
 
 #include "artifact/framing.h"
 #include "artifact/permute_row_split.h"
+#include "ops/common/v100_kernel_policy.h"
+#include "ops/common/device_tier.h"
+#include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
+#include "ops/linear/fp8/fp8_prepack_sm70.h"
 #include "artifact/transcode.h"
 #include "artifact/reader.h"
 #include "core/startup.h"
@@ -653,7 +657,18 @@ WeightGeometry placement_geometry(const Reader& reader, const DevicePlacement& p
                                : reader.geometry(placement.object);
 }
 
-// upload_device_bytes, then the panel permutation of the placements that ask for it. Loading and a
+// One predicate owns both the published device label and the actual upload/resume
+// transform. Call only with the placement's rank current.
+bool fp8_qpn_placement(const DevicePlacement& placement,const WeightGeometry& geometry) {
+    if (!placement.fp8_qpn) { return false; }
+    if (placement.source || placement.selection || placement.transcode || placement.panel ||
+        !ops::detail::fp8_qpn_prepack_eligible(geometry)) {
+        throw ArtifactError("FP8 QPN placement requires a complete native projection parent");
+    }
+    return ops::v100_ported_kernels_enabled() && ops::current_device_volta();
+}
+
+// upload_device_bytes, then the requested device-only code permutations. Loading and a
 // resume after a model suspend upload through here alike.
 UploadTotals upload_device_objects(const Reader& reader,
                                    std::span<const DevicePlacement> placements,
@@ -664,6 +679,26 @@ UploadTotals upload_device_objects(const Reader& reader,
         upload_device_bytes(reader, placements, bases, device, observer, phase, done, total);
     std::vector<bool> permuted_rank(bases.size(), false);
     for (const auto& placement : placements) {
+        if (ops::v100_ported_kernels_enabled()) {
+            const auto geometry = placement_geometry(reader, placement);
+            if (ops::detail::nvfp4_qpn_prepack_eligible(geometry)) {
+                const ScopedRank bound(device, placement.rank);
+                if (ops::current_device_volta()) {
+                    ops::detail::nvfp4_prepack_parent_sm70(
+                        geometry, bases[placement.rank] + placement.offset, nullptr);
+                }
+            }
+        }
+        if (placement.fp8_qpn) {
+            const ScopedRank bound(device,placement.rank);
+            const auto geometry=placement_geometry(reader,placement);
+            if (fp8_qpn_placement(placement,geometry)) {
+                // The helper synchronizes and releases temporary code scratch before
+                // inference or context allocation. It never touches file/Host scales.
+                ops::detail::fp8_prepack_parent_sm70(
+                    geometry,bases[placement.rank]+placement.offset,nullptr);
+            }
+        }
         if (!placement.panel) { continue; }
         const ScopedRank bound(device, placement.rank);
         permute_row_split_to_panel(placement_geometry(reader, placement),
@@ -927,6 +962,16 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 throw ArtifactError("a panel placement names an object without the layout");
             }
             geometry.layout = QuantLayout::RowSplitPanel;
+        }
+        if (ops::v100_ported_kernels_enabled() && ops::detail::nvfp4_qpn_prepack_eligible(geometry)) {
+            const ScopedRank bound(device, placement.rank);
+            if (ops::current_device_volta()) { geometry.layout = QuantLayout::VoltaQpnPrepacked; }
+        }
+        if (placement.fp8_qpn) {
+            const ScopedRank bound(device,placement.rank);
+            if (fp8_qpn_placement(placement,geometry)) {
+                geometry.layout=QuantLayout::VoltaQpnPrepacked;
+            }
         }
         auto& object = out.objects_.at(placement.object.index);
         if (placement.rank >= rank_count) {

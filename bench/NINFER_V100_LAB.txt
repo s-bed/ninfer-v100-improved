@@ -1,0 +1,67 @@
+October 30, 2026 V100 lab campaign snapshot
+
+Results
+  NINFER_PRECISION.txt: three-engine represented-weight precision, likelihood,
+    deterministic answer quality, Decode/Verify, image and long-context checks.
+  NINFER_AGENTIC.txt: small native-cache comparison with tool/history changes
+    and vision; 45 requests and 30 measured cases per engine.
+
+The measured engines are original ninfer-v100 b37d0dd3, unchanged vendor
+ninfer-all 33163f05fb54, and the accepted R5 implementation ec94ca8d. Publishing
+these benchmark files creates a later commit containing tooling and reports;
+it does not rebuild the measured binaries or change the measured R5 identity.
+
+R5 gained captured-operator precision versus V100 and retained the tested
+contracts versus vendor. Perplexity was retained against both. Primary task
+accuracy was retained versus vendor and inconclusive versus V100. Substantial
+sampled MTP/state differences and the adverse 131K sentinel remain disclosed;
+there is no overall full-model state-precision verdict. The small native-cache
+test scored V100/vendor/R5 18/15/15 correct out of 30; comparisons of useful
+response speed must retain the paired correctness counts and native-template
+differences. See the reports for confidence intervals, coverage and limits.
+
+Layout and prerequisites
+  This is site-specific campaign tooling from the separate llama-stack checkout
+  at /home/simon/llama. It is not a portable product benchmark or part of the
+  normal CMake benchmark targets. Python modules resolve the stack root from
+  their own bench/ directory and expect that root's llama-swap.yaml and
+  docker-compose.yaml. Running the session commands directly from an engine
+  source checkout does not provide that layout.
+
+  To reproduce, place this snapshot in bench/ of an equivalently configured,
+  authorized llama-stack checkout. Preserve its actual service configuration;
+  do not copy a live deployment configuration from another host. The canonical
+  /models/engine paths, exact source revisions, packaged runtimes, model
+  artifacts and local corpus/build dependencies must exist as recorded in the
+  reports and harness constants. Future reruns need isolated checkouts of the
+  measured source revisions rather than assuming the publication branch HEAD
+  remains ec94ca8d. Native route profiles are read from the lab configuration.
+
+  Preparation/analysis use Python 3.11. Probe builds use CUDA 12.9, GCC/G++ 13,
+  sm_70 and the existing dependency trees. The independent streamed FP64 oracle
+  links OpenBLAS 0.3.32 at the recorded local path, with two BLAS threads.
+  ninfer_tune.py supplies the shared client/server helpers; ninfer_session.py
+  coordinates sequential GPU work and restores llama-swap in finally.
+
+  Completed lab verification: 35 precision CPU tests and 6 agentic CPU tests,
+  plus the actual GPU campaigns and independent completion audits. From the
+  original stack layout, the focused CPU commands are:
+    python3.11 -m unittest discover -s bench -p 'test_ninfer_precision*.py'
+    python3.11 -m unittest discover -s bench -p 'ninfer_agentic_test.py'
+  The scalar-oracle test needs the compiled .local/precision-oracle; the native
+  profile test reads the stack's llama-swap.yaml. An export without these local
+  prerequisites cannot claim those checks passed solely from this source copy.
+
+Evidence and operations
+  Raw records, frozen fixtures, source/build provenance, private caches and
+  restoration evidence remain under:
+    /models/engine/iamwavecut-ninfer-all/bench-runs/precision-20261030
+  The agentic subset is its agentic/ directory. These large local records,
+  weights, binaries, production caches, live configuration and credentials are
+  not included in this source/report publication. Paths printed in the reports
+  identify the lab evidence; they are not downloadable repository assets.
+
+  GPU sessions stop llama-swap and restore its configured preload. They require
+  authorization for the host being used. The completed campaign kept 150 W,
+  ComfyUI off and the accepted runtime selection; publication runs no GPU work
+  and changes no deployed bundle or service configuration.

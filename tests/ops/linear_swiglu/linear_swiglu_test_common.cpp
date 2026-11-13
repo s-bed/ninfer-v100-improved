@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
 #include "ops/linear_swiglu/linear_swiglu_test_common.h"
 
 #include "core/arena.h"
@@ -11,6 +12,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -257,7 +259,7 @@ bool cuda_available() { return !test::cuda_unavailable(); }
 
 int run_profile(std::string_view label, const Profile& profile,
                 std::span<const std::int32_t> token_cases,
-                std::span<const std::int32_t> graph_cases) {
+                std::span<const std::int32_t> graph_cases, bool v100_prepack) {
     validate_profile(profile);
     if (token_cases.empty()) { throw std::invalid_argument("linear_swiglu test: no token cases"); }
     for (std::size_t index = 0; index < token_cases.size(); ++index) {
@@ -279,6 +281,14 @@ int run_profile(std::string_view label, const Profile& profile,
     }
     quantized_weight::PackedWeight host_weight = quantized_weight::make_patterned_weight(
         profile.qtype, profile.gate_up_rows, profile.input_rows, profile.seed, weight_options);
+    if (profile.stacked_nvfp4) {
+        if (profile.qtype != QType::NVFP4) throw std::invalid_argument("stacked fixture needs NVFP4");
+        host_weight.payload.resize(host_weight.weight_divisor_offset + 2 * sizeof(float));
+        const std::array<float,2> divisors{0.3F,1.7F};
+        std::memcpy(host_weight.payload.data()+host_weight.weight_divisor_offset,divisors.data(),sizeof(divisors));
+        host_weight.weight.weight_divisor_rows=profile.output_rows;
+        host_weight.weight.payload_bytes=host_weight.payload.size();
+    }
     const std::vector<std::uint16_t> host_activation = make_activation(profile, maximum_tokens);
     const std::vector<double> reference =
         linear_swiglu_oracle_fp64(profile, host_weight, host_activation, maximum_tokens);
@@ -295,7 +305,11 @@ int run_profile(std::string_view label, const Profile& profile,
 
     test::GuardedDeviceBuffer device_weight(host_weight.payload.size());
     device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
-    const Weight weight = host_weight.device_weight(device_weight.data());
+    Weight weight = host_weight.device_weight(device_weight.data());
+    if (v100_prepack) {
+        ops::detail::nvfp4_prepack_qpn_sm70(weight);
+        device_weight.copy_to_host(host_weight.payload.data(),host_weight.payload.size());
+    }
 
     test::GuardedDeviceBuffer device_activation(host_activation.size() * sizeof(std::uint16_t));
     device_activation.copy_from_host(host_activation.data(),

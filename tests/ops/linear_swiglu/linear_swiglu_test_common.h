@@ -28,6 +28,7 @@ struct Profile {
     std::int32_t output_rows;
     std::uint32_t seed;
     ActivationCompute activation_compute;
+    bool stacked_nvfp4 = false;
 };
 
 // A program checks this first and skips (exit 77) without a device: run_profile returns a count
@@ -36,6 +37,6 @@ bool cuda_available();
 
 int run_profile(std::string_view label, const Profile& profile,
                 std::span<const std::int32_t> token_cases,
-                std::span<const std::int32_t> graph_cases = {});
+                std::span<const std::int32_t> graph_cases = {}, bool v100_prepack = false);
 
 } // namespace ninfer::test::linear_swiglu

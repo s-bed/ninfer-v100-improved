@@ -130,8 +130,11 @@ void sm70_split(const Tensor& x, const Weight& first, std::initializer_list<Tens
     const bool integer =
         detail::sm70::integer_takes(first, x.ne[1], policy) &&
         (second == nullptr || detail::sm70::integer_takes(*second, x.ne[1], policy));
-    const auto activation = detail::sm70::prepare_for(x, std::max(first.n, second ? second->n : 0),
-                                                      workspace, stream, integer);
+    const auto preparation_format =
+        (first.qtype == QType::NVFP4 || (second && second->qtype == QType::NVFP4))
+            ? QType::NVFP4 : first.qtype;
+    const auto activation = detail::sm70::prepare_for(
+        x, std::max(first.n, second ? second->n : 0), workspace, stream, preparation_format, integer,detail::sm70::ProjectionPurpose::Generic,first.layout);
     const auto destinations = [](std::initializer_list<Tensor*> planes) {
         std::vector<detail::sm70::Destination> out;
         std::int32_t row = 0;
@@ -151,7 +154,9 @@ void sm70_split(const Tensor& x, const Weight& first, std::initializer_list<Tens
 // its plane straight from the BF16 activations. False where the width needs a workspace.
 bool sm70_direct_split(const Tensor& x, const Weight& weight, std::initializer_list<Tensor*> planes,
                        cudaStream_t stream) {
-    if (!detail::sm70::direct_tokens(x.ne[1]) || !detail::sm70::covers(weight, x.ne[1])) {
+    if ((!detail::sm70::direct_tokens(x.ne[1]) &&
+         !(weight.qtype==QType::FP8_E4M3FN_ROW_BF16 && weight.layout==QuantLayout::VoltaQpnPrepacked)) ||
+        !detail::sm70::covers(weight, x.ne[1])) {
         return false;
     }
     std::vector<detail::sm70::Destination> destinations;
@@ -160,7 +165,7 @@ bool sm70_direct_split(const Tensor& x, const Weight& weight, std::initializer_l
         destinations.push_back({plane(*t), t->ne[0], 0, row, t->ne[0], false});
         row += t->ne[0];
     }
-    detail::sm70::project_for(detail::sm70::prepare_direct(x), weight, destinations, stream);
+    detail::sm70::project_direct_chunks(x,weight,destinations,stream);
     return true;
 }
 
@@ -169,6 +174,8 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
                             cudaStream_t stream) {
     validate_policy(policy);
     policy = without_integer(policy);
+    if(weight.qtype==QType::FP8_E4M3FN_ROW_BF16 && weight.layout==QuantLayout::VoltaQpnPrepacked)
+        detail::validate_fp8_projection_weight(weight,"packed FP8 attn_input_proj");
     // The parent's rows are [query; key; gate; value].
     if (workspace != nullptr && detail::sm70::covers(weight, x.ne[1]) &&
         weight.n == 2 * q.ne[0] + 2 * k.ne[0] && gate.ne[0] == q.ne[0] && v.ne[0] == k.ne[0]) {
@@ -224,10 +231,12 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         require_matrix(gate, kQRows, cols, "gate");
         require_matrix(k, kKvRows, cols, "k");
         require_matrix(v, kKvRows, cols, "v");
-        detail::validate_fp8_weight(weight, "fp8 attn_input_proj");
+        detail::validate_fp8_projection_weight(weight, "fp8 attn_input_proj");
         if (weight.n != kRows || weight.k != kHidden) {
             throw std::invalid_argument("fp8 attn_input_proj: unsupported weight shape");
         }
+        if(weight.layout==QuantLayout::VoltaQpnPrepacked &&
+           sm70_direct_split(x,weight,{&q,&k,&gate,&v},stream))return;
         detail::fp8_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
         return;
     }
@@ -484,7 +493,9 @@ attn_input_proj_split_workspace_capacity_bytes(QType query_key_qtype, std::int32
         !detail::sm70::covered_format(gate_value_qtype, input_rows)) {
         return routes(min_tokens, max_tokens);
     }
-    return detail::sm70::capacity(query_key_qtype, std::max(query_key_rows, gate_value_rows),
+    const auto preparation_format=(query_key_qtype==QType::NVFP4 || gate_value_qtype==QType::NVFP4)
+                                      ? QType::NVFP4 : query_key_qtype;
+    return detail::sm70::capacity(preparation_format, std::max(query_key_rows, gate_value_rows),
                                   input_rows, min_tokens, max_tokens, policy, routes);
 }
 

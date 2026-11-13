@@ -38,6 +38,19 @@ ninfer_add_test(ninfer_qwen3_5_loading_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading.cpp"
   LIBRARIES ninfer_model_loading)
 
+# CPU-only model-owned FP8 request selection; GPU upload/resume is explicitly scoped.
+ninfer_add_test(ninfer_v100_fp8_loading_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_v100_fp8_loading.cpp"
+  LIBRARIES ninfer_model_loading TEST_ARGS ported)
+add_test(NAME ninfer_v100_fp8_loading_native_test
+  COMMAND ninfer_v100_fp8_loading_test native)
+add_test(NAME ninfer_v100_fp8_loading_gpu_test
+  COMMAND ninfer_v100_fp8_loading_test ported --gpu)
+set_tests_properties(ninfer_v100_fp8_loading_gpu_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_v100_fp8_loading_native_gpu_test
+  COMMAND ninfer_v100_fp8_loading_test native --gpu)
+set_tests_properties(ninfer_v100_fp8_loading_native_gpu_test PROPERTIES SKIP_RETURN_CODE 77)
+
 set_tests_properties(
   ninfer_qwen3_5_loading_real_test
   PROPERTIES SKIP_RETURN_CODE 77)

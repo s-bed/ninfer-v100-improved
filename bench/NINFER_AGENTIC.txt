@@ -1,0 +1,85 @@
+Small native-cache agentic performance comparison
+Evidence: /models/engine/iamwavecut-ninfer-all/bench-runs/precision-20261030/agentic
+
+Three frozen logical lineages; 10 measured stages and 5 equal-ancestor setup re-primes per lineage/engine.
+Native templates/settings intentionally differ. Actual prompt tokens are reported; live continuation payloads preserve actual assistant history and can differ across engines.
+Requests go directly to isolated loopback engine servers using the frozen llama-swap native options. This measures engine/request/cache behavior, not llama-swap proxy overhead or model-switch latency.
+Descriptive medians and min/max ranges, n=3 per stage. No formal equivalence or pure kernel-performance claim.
+TTFT is first visible streaming content/tool/reasoning event; end-to-end is measured at the client. Decode rates use actual completion counts and short outputs; interpret cautiously.
+
+Engine | Stage | n | Correct | Prompt tokens median | Cache % median | TTFT median [min,max] s | End-to-end median [min,max] s | Output tokens median | Decode t/s median
+v100 | new-lineage | 3/3 | 1 | 7598 | 0.0 | 10.671 [10.318,10.865] | 10.781 [10.671,10.865] | 32 | 82.7130007619108
+v100 | identical | 3/3 | 1 | 7598 | 99.90787049223479 | 0.444 [0.102,0.653] | 0.563 [0.444,0.653] | 32 | 84.05931699501717
+v100 | append-tool | 3/3 | 3 | 7809 | 97.65006385696041 | 1.205 [0.885,1.267] | 1.671 [1.342,1.734] | 32 | 69.25494410072037
+v100 | followup | 3/3 | 3 | 7871 | 99.60614915512642 | 0.450 [0.444,0.468] | 0.674 [0.668,0.690] | 32 | 143.10811744035283
+v100 | late-result-edit | 3/3 | 0 | 7597 | 0.0 | 10.882 [10.858,10.926] | 10.882 [10.858,10.926] | 47 | 85.65060904234618
+v100 | tools-reordered | 3/3 | 3 | 7598 | 0.0 | 10.387 [10.208,10.397] | 10.855 [10.672,10.863] | 32 | 68.6836217467002
+v100 | tool-added | 3/3 | 1 | 7661 | 0.0 | 10.646 [10.332,10.746] | 10.746 [10.646,10.800] | 30 | 82.34779017687539
+v100 | tool-schema-changed | 3/3 | 0 | 7619 | 0.0 | 10.678 [10.676,10.724] | 10.678 [10.676,10.724] | 30 | 82.88093740594569
+v100 | vision-turn | 3/3 | 3 | 8003 | 95.27913076058448 | 1.126 [1.109,1.182] | 1.642 [1.473,1.693] | 36 | 70.55992250262592
+v100 | vision-followup | 3/3 | 3 | 8068 | 99.62816063460586 | 0.445 [0.442,0.445] | 0.715 [0.668,0.718] | 36 | 133.18231445409904
+vendor | new-lineage | 3/3 | 0 | 7550 | 8.395127118644067 | 24.520 [23.597,25.443] | 24.520 [23.597,25.443] | 30 | 33.43493705465193
+vendor | identical | 3/3 | 0 | 7550 | 99.88079470198676 | 1.154 [1.145,1.990] | 1.154 [1.145,1.990] | 30 | 33.406595556362895
+vendor | append-tool | 3/3 | 3 | 7763 | 97.13954387321222 | 1.341 [1.328,1.343] | 3.001 [3.001,3.011] | 32 | 19.324160669574436
+vendor | followup | 3/3 | 3 | 7825 | 99.0926517571885 | 0.706 [0.705,0.707] | 1.686 [1.684,1.691] | 32 | 32.984272085833865
+vendor | late-result-edit | 3/3 | 0 | 7549 | 11.100808054046894 | 22.591 [22.397,22.619] | 22.591 [22.398,22.619] | 30 | 33.43002678855022
+vendor | tools-reordered | 3/3 | 3 | 7550 | 8.395127118644067 | 22.733 [22.727,24.650] | 24.417 [24.400,26.300] | 32 | 19.296959622962685
+vendor | tool-added | 3/3 | 0 | 7607 | 8.33442881556461 | 24.081 [23.946,24.081] | 24.081 [23.946,24.082] | 30 | 33.355294644634554
+vendor | tool-schema-changed | 3/3 | 0 | 7571 | 8.649148289977552 | 23.683 [23.659,26.304] | 23.683 [23.659,26.304] | 30 | 33.17374891318237
+vendor | vision-turn | 3/3 | 3 | 7957 | 94.7705845380264 | 2.292 [2.263,2.342] | 4.124 [4.088,4.163] | 36 | 19.732374128887347
+vendor | vision-followup | 3/3 | 3 | 8022 | 99.07753677387186 | 0.925 [0.923,0.928] | 1.906 [1.897,1.910] | 36 | 37.03805325909709
+r5 | new-lineage | 3/3 | 0 | 7550 | 8.395127118644067 | 9.633 [9.626,10.488] | 9.633 [9.626,10.488] | 47 | 97.26785421155436
+r5 | identical | 3/3 | 0 | 7550 | 99.88079470198676 | 0.568 [0.564,0.569] | 0.568 [0.564,0.569] | 47 | 97.19982424038248
+r5 | append-tool | 3/3 | 3 | 7780 | 96.9280205655527 | 0.573 [0.571,0.573] | 1.043 [1.036,1.045] | 32 | 69.35509061477748
+r5 | followup | 3/3 | 3 | 7842 | 99.09461871971436 | 0.394 [0.391,0.407] | 0.683 [0.681,0.692] | 32 | 114.79434589345864
+r5 | late-result-edit | 3/3 | 0 | 7549 | 11.100808054046894 | 8.897 [8.845,8.909] | 8.897 [8.845,8.909] | 30 | 117.34273022261331
+r5 | tools-reordered | 3/3 | 3 | 7550 | 8.395127118644067 | 9.140 [9.091,9.931] | 9.615 [9.556,10.392] | 32 | 70.56204058929677
+r5 | tool-added | 3/3 | 0 | 7607 | 8.33442881556461 | 9.728 [9.489,9.800] | 9.728 [9.489,9.800] | 47 | 96.76358701068833
+r5 | tool-schema-changed | 3/3 | 0 | 7571 | 8.649148289977552 | 9.433 [9.369,10.414] | 9.433 [9.369,10.414] | 30 | 116.77950116164658
+r5 | vision-turn | 3/3 | 3 | 7974 | 94.56985201906195 | 1.040 [1.039,1.126] | 1.547 [1.546,1.627] | 36 | 71.21566020182047
+r5 | vision-followup | 3/3 | 3 | 8039 | 99.07948749844509 | 0.443 [0.440,0.443] | 0.736 [0.734,0.736] | 36 | 126.5862211699969
+
+Paired R5/baseline TTFT and end-to-end ratios (less than1 is faster):
+r5_vs_v100 new-lineage: all paired n=3, TTFT n=3 0.934 [0.886,0.983], end-to-end n=3 0.894 [0.886,0.983]; both-correct secondary subset n=0, TTFT n=0 unavailable, end-to-end n=0 unavailable.
+r5_vs_v100 identical: all paired n=3, TTFT n=3 1.270 [0.872,5.564], end-to-end n=3 1.009 [0.872,1.270]; both-correct secondary subset n=0, TTFT n=0 unavailable, end-to-end n=0 unavailable.
+r5_vs_v100 append-tool: all paired n=3, TTFT n=3 0.474 [0.452,0.647], end-to-end n=3 0.620 [0.603,0.777]; both-correct secondary subset n=3, TTFT n=3 0.474 [0.452,0.647], end-to-end n=3 0.620 [0.603,0.777].
+r5_vs_v100 followup: all paired n=3, TTFT n=3 0.876 [0.870,0.882], end-to-end n=3 1.013 [1.002,1.019]; both-correct secondary subset n=3, TTFT n=3 0.876 [0.870,0.882], end-to-end n=3 1.013 [1.002,1.019].
+r5_vs_v100 late-result-edit: all paired n=3, TTFT n=3 0.814 [0.813,0.821], end-to-end n=3 0.814 [0.813,0.821]; both-correct secondary subset n=0, TTFT n=0 unavailable, end-to-end n=0 unavailable.
+r5_vs_v100 tools-reordered: all paired n=3, TTFT n=3 0.880 [0.874,0.973], end-to-end n=3 0.886 [0.880,0.974]; both-correct secondary subset n=3, TTFT n=3 0.880 [0.874,0.973], end-to-end n=3 0.886 [0.880,0.974].
+r5_vs_v100 tool-added: all paired n=3, TTFT n=3 0.912 [0.891,0.942], end-to-end n=3 0.901 [0.891,0.912]; both-correct secondary subset n=0, TTFT n=0 unavailable, end-to-end n=0 unavailable.
+r5_vs_v100 tool-schema-changed: all paired n=3, TTFT n=3 0.880 [0.878,0.975], end-to-end n=3 0.880 [0.878,0.975]; both-correct secondary subset n=0, TTFT n=0 unavailable, end-to-end n=0 unavailable.
+r5_vs_v100 vision-turn: all paired n=3, TTFT n=3 0.937 [0.923,0.953], end-to-end n=3 0.961 [0.941,1.050]; both-correct secondary subset n=3, TTFT n=3 0.937 [0.923,0.953], end-to-end n=3 0.961 [0.941,1.050].
+r5_vs_v100 vision-followup: all paired n=3, TTFT n=3 0.996 [0.989,1.001], end-to-end n=3 1.029 [1.022,1.103]; both-correct secondary subset n=3, TTFT n=3 0.996 [0.989,1.001], end-to-end n=3 1.029 [1.022,1.103].
+r5_vs_vendor new-lineage: all paired n=3, TTFT n=3 0.408 [0.393,0.412], end-to-end n=3 0.408 [0.393,0.412]; both-correct secondary subset n=0, TTFT n=0 unavailable, end-to-end n=0 unavailable.
+r5_vs_vendor identical: all paired n=3, TTFT n=3 0.492 [0.286,0.493], end-to-end n=3 0.492 [0.286,0.493]; both-correct secondary subset n=0, TTFT n=0 unavailable, end-to-end n=0 unavailable.
+r5_vs_vendor append-tool: all paired n=3, TTFT n=3 0.427 [0.427,0.430], end-to-end n=3 0.347 [0.345,0.348]; both-correct secondary subset n=3, TTFT n=3 0.427 [0.427,0.430], end-to-end n=3 0.347 [0.345,0.348].
+r5_vs_vendor followup: all paired n=3, TTFT n=3 0.557 [0.555,0.578], end-to-end n=3 0.405 [0.402,0.411]; both-correct secondary subset n=3, TTFT n=3 0.557 [0.555,0.578], end-to-end n=3 0.405 [0.402,0.411].
+r5_vs_vendor late-result-edit: all paired n=3, TTFT n=3 0.394 [0.394,0.395], end-to-end n=3 0.394 [0.394,0.395]; both-correct secondary subset n=0, TTFT n=0 unavailable, end-to-end n=0 unavailable.
+r5_vs_vendor tools-reordered: all paired n=3, TTFT n=3 0.402 [0.400,0.403], end-to-end n=3 0.394 [0.392,0.395]; both-correct secondary subset n=3, TTFT n=3 0.402 [0.400,0.403], end-to-end n=3 0.394 [0.392,0.395].
+r5_vs_vendor tool-added: all paired n=3, TTFT n=3 0.404 [0.396,0.407], end-to-end n=3 0.404 [0.396,0.407]; both-correct secondary subset n=0, TTFT n=0 unavailable, end-to-end n=0 unavailable.
+r5_vs_vendor tool-schema-changed: all paired n=3, TTFT n=3 0.396 [0.396,0.399], end-to-end n=3 0.396 [0.396,0.399]; both-correct secondary subset n=0, TTFT n=0 unavailable, end-to-end n=0 unavailable.
+r5_vs_vendor vision-turn: all paired n=3, TTFT n=3 0.460 [0.453,0.481], end-to-end n=3 0.378 [0.375,0.391]; both-correct secondary subset n=3, TTFT n=3 0.460 [0.453,0.481], end-to-end n=3 0.378 [0.375,0.391].
+r5_vs_vendor vision-followup: all paired n=3, TTFT n=3 0.478 [0.474,0.480], end-to-end n=3 0.386 [0.384,0.388]; both-correct secondary subset n=3, TTFT n=3 0.478 [0.474,0.480], end-to-end n=3 0.386 [0.384,0.388].
+vendor_vs_v100 new-lineage: all paired n=3, TTFT n=3 2.287 [2.257,2.384], end-to-end n=3 2.257 [2.189,2.384]; both-correct secondary subset n=0, TTFT n=0 unavailable, end-to-end n=0 unavailable.
+vendor_vs_v100 identical: all paired n=3, TTFT n=3 3.048 [2.578,11.312], end-to-end n=3 2.577 [2.051,3.047]; both-correct secondary subset n=0, TTFT n=0 unavailable, end-to-end n=0 unavailable.
+vendor_vs_v100 append-tool: all paired n=3, TTFT n=3 1.102 [1.060,1.514], end-to-end n=3 1.796 [1.737,2.236]; both-correct secondary subset n=3, TTFT n=3 1.102 [1.060,1.514], end-to-end n=3 1.796 [1.737,2.236].
+vendor_vs_v100 followup: all paired n=3, TTFT n=3 1.571 [1.506,1.590], end-to-end n=3 2.501 [2.440,2.533]; both-correct secondary subset n=3, TTFT n=3 1.571 [1.506,1.590], end-to-end n=3 2.501 [2.440,2.533].
+vendor_vs_v100 late-result-edit: all paired n=3, TTFT n=3 2.068 [2.058,2.083], end-to-end n=3 2.068 [2.058,2.083]; both-correct secondary subset n=0, TTFT n=0 unavailable, end-to-end n=0 unavailable.
+vendor_vs_v100 tools-reordered: all paired n=3, TTFT n=3 2.188 [2.186,2.415], end-to-end n=3 2.249 [2.246,2.464]; both-correct secondary subset n=3, TTFT n=3 2.188 [2.186,2.415], end-to-end n=3 2.249 [2.246,2.464].
+vendor_vs_v100 tool-added: all paired n=3, TTFT n=3 2.249 [2.241,2.331], end-to-end n=3 2.241 [2.230,2.249]; both-correct secondary subset n=0, TTFT n=0 unavailable, end-to-end n=0 unavailable.
+vendor_vs_v100 tool-schema-changed: all paired n=3, TTFT n=3 2.218 [2.206,2.463], end-to-end n=3 2.218 [2.206,2.463]; both-correct secondary subset n=0, TTFT n=0 unavailable, end-to-end n=0 unavailable.
+vendor_vs_v100 vision-turn: all paired n=3, TTFT n=3 2.036 [1.981,2.040], end-to-end n=3 2.511 [2.459,2.775]; both-correct secondary subset n=3, TTFT n=3 2.036 [1.981,2.040], end-to-end n=3 2.511 [2.459,2.775].
+vendor_vs_v100 vision-followup: all paired n=3, TTFT n=3 2.086 [2.075,2.093], end-to-end n=3 2.662 [2.652,2.854]; both-correct secondary subset n=3, TTFT n=3 2.086 [2.075,2.093], end-to-end n=3 2.662 [2.652,2.854].
+
+Configuration and limits:
+All exact source commands and adapted flags: fixtures/settings.json and runs/<engine>/native-options.json. Only benchmark host/port/logs/private persistence/profile-copy paths differ; vendor omits unsupported --v100-kernels.
+Original uses separate16GiB Host KV plus8 Host state slots,3 extra Device states, requested/effective chunk2048. Vendor/R5 use hybrid unified16GiB Host,2 Device snapshots, requested chunk4096, MTP3/ngram15 and auto KV/headroom256. Native NInfer-all alignment is preserved; pinned-source calculation gives effective4224 on this geometry, with narrower final tails. This source-derived width is not a measured launch count; progress samples and logs are preserved. Native-cache budget/planner differences are intentional.
+New-lineage means a changed leading nonce, not guaranteed zero cache. Actual cached tokens/fraction are reported; identical/reprime requests are separate from cold and live appended turns.
+Tool choice is auto so definitions render. Add/schema changes must change actual prompt-token count; see tool_render_checks. A missing check invalidates attribution of tooling-prefix effects.
+Three unique512px color images are used, one per lineage; the immediate vision continuation preserves the same image and actual assistant reply. Prefix reuse does not by itself prove a media-encoder cache hit.
+Tools are scripted history only; no external commands/files are executed. Correctness uses exact typed JSON fields after optional whole-response JSON-fence removal, including known vision colors. No model judge.
+Actual assistant reasoning/call IDs are retained. Unexpected tool calls fail grading and receive deterministic no-execution results; malformed/truncated arguments, unknown tools or duplicate/missing call IDs cause dependent stages to be recorded as skipped rather than sending invalid histories. Table n is measured/recorded, with target3.
+This small test does not measure cache eviction pressure, concurrent agent sessions, near-limit capacity, disk restart reuse or general vision quality.
+All raw request payloads, responses, logs, per-request timing/usage, GPU samples and shutdowns are retained. Failures remain in the summary and are not excluded from latency records.
+All-paired timing ratios include wrong answers and are not evidence of useful agentic speed by themselves. The explicitly labeled secondary both-correct subset reports only pairs where both deterministic grades passed, with its sample count; no cases are removed from the full results.
+Service restoration evidence: control/restored.json; interruption/session accounting: control/budget.json. Accepted selection and production caches/config remain unchanged.

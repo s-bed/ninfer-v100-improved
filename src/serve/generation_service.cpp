@@ -322,6 +322,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.context_cost.preset_path = options.context_cost_presets;
     engine_options.device_profile           = options.device_profile;
     engine_options.device_profile_path      = options.device_profile_path;
+    engine_options.v100_kernels              = options.v100_kernels;
     engine_options.media_cache_bytes        = options.media_cache_bytes;
     engine_options.media_live_bytes         = options.media_live_bytes;
     engine_options.media_preprocess_threads = options.media_preprocess_threads;

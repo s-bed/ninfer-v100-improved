@@ -53,7 +53,7 @@ ninfer_add_test(ninfer_mcp_proxy_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_mcp_proxy.cpp"
   LIBRARIES ninfer_serve)
 
-ninfer_add_test(ninfer_serve_options_test
+ninfer_add_test(ninfer_serve_options_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_options.cpp"
   LIBRARIES ninfer_serve)
 
@@ -112,3 +112,7 @@ ninfer_add_test(ninfer_http_routes_test
 ninfer_add_test(ninfer_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"
   LIBRARIES ninfer_serve)
+
+ninfer_add_test(ninfer_engine_watch_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_engine_watch.cpp"
+  LIBRARIES Threads::Threads)

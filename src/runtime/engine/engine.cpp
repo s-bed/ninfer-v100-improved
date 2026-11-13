@@ -6,6 +6,7 @@
 #include "core/gpu_clock_floor.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
+#include "ops/common/v100_kernel_policy.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
@@ -364,6 +365,28 @@ public:
                   with_family_attention(with_family_embedding(std::move(engine_options))))))),
           device(initialize_device(options)),
           clock_floor(device.device_ids(), options.gpu_clock_floor_mhz) {
+        if (options.v100_kernels != V100KernelPolicy::Native &&
+            options.v100_kernels != V100KernelPolicy::Ported) {
+            throw std::invalid_argument("invalid v100 kernel policy");
+        }
+        const bool ported = options.v100_kernels == V100KernelPolicy::Ported;
+        if (ported) {
+            for (std::size_t rank = 0; rank < device.size(); ++rank) {
+                ops::validate_v100_kernel_architecture(true, device.rank(rank).compute_capability());
+            }
+        }
+        ops::set_v100_kernel_policy(ported);
+        runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                    "v100 kernels: %s (host route selections include graph capture)",
+                                    ported ? "ported" : "native");
+        if (ported) {
+            runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                "v100 route policy | qualified NVFP4: QPN T<=63, FP16 split MLP and "
+                "packed down staging T<=32, "
+                "CUTLASS T64..2047, native wide fallback | qualified FP8: packed FP16 QPN "
+                "T<=32, raw fused MLP T<=8, GDN CUTLASS T33..4096, native fallbacks | "
+                "head/embedding stay native");
+        }
         report_gpu_clock_floor(options, clock_floor);
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         if (runtime::is_gemma4_artifact(options.artifact_path)) {
@@ -483,6 +506,12 @@ public:
             device.synchronize();
         } catch (...) {}
         if (persists) { report_prefix_cache_save(); }
+        const auto routes = ops::v100_kernel_route_counts();
+        runtime::publish_diagnostic(
+            options.diagnostic_observer, DiagnosticLevel::Info,
+            "v100 kernel route selections: ported=%llu fallback=%llu (graph replays not counted)",
+            static_cast<unsigned long long>(routes.ported),
+            static_cast<unsigned long long>(routes.fallback));
     }
 
     void stop() noexcept {

@@ -1,6 +1,9 @@
 #include "ops/linear/sm70/sm70_project.h"
 
 #include "core/device.h"
+#include "ops/common/v100_kernel_policy.h"
+#include "ops/linear/sm70/v100_qpn.h"
+#include "ops/linear/sm70/v100_fp8.h"
 #include "core/layout.h"
 #include "ops/common/math.cuh"
 #include "ops/linear/sm70/sm70_dequantize.h"
@@ -164,7 +167,8 @@ bool covers(const Weight& w, std::int32_t tokens) {
 }
 
 std::size_t covered_bytes(QType format, std::int32_t max_rows, std::int32_t k,
-                          std::int32_t min_tokens, std::int32_t max_tokens, LinearPolicy policy) {
+                          std::int32_t min_tokens, std::int32_t max_tokens, LinearPolicy policy,
+                          ProjectionPurpose purpose) {
     std::size_t bytes = 0;
     if (small_takes(min_tokens)) {
         bytes = small_workspace_bytes(k, std::min(max_tokens, cublas_min_tokens() - 1));
@@ -173,13 +177,28 @@ std::size_t covered_bytes(QType format, std::int32_t max_rows, std::int32_t k,
         bytes = std::max(bytes, integer_bytes(k, std::min(max_tokens, kIntegerMaxTokens)));
     }
     if (takes(max_tokens)) { bytes = std::max(bytes, workspace_bytes(max_rows, k, max_tokens)); }
+    bytes += v100_qpn_scratch_capacity(format,max_rows,k,min_tokens,max_tokens);
+    bytes += v100_fp8_scratch_capacity(format,max_rows,k,min_tokens,max_tokens,purpose);
     return bytes;
 }
 
 Activation prepare_for(const Tensor& x, std::int32_t max_rows, WorkspaceArena& workspace,
-                       cudaStream_t stream, bool integer) {
-    if (takes(x.ne[1])) { return prepare(x, max_rows, workspace, stream); }
+                       cudaStream_t stream, QType format, bool integer, ProjectionPurpose purpose,
+                       QuantLayout source_layout) {
+    if (takes(x.ne[1])) {
+        auto out = prepare(x,max_rows,workspace,stream);
+        out.purpose = purpose;
+        out.source_layout = source_layout;
+        v100_qpn_prepare(out,workspace,stream,format);
+        v100_fp8_prepare(out,workspace,stream,format);
+        return out;
+    }
     Activation out = small_prepare(x, workspace, stream);
+    out.max_rows = max_rows;
+    out.purpose = purpose;
+    out.source_layout = source_layout;
+    v100_qpn_prepare(out, workspace, stream, format);
+    v100_fp8_prepare(out, workspace, stream, format);
     if (integer) { integer_prepare(x, workspace, stream, out); }
     return out;
 }
@@ -196,8 +215,30 @@ Activation prepare_direct(const Tensor& x) {
     return small_direct(x);
 }
 
+void project_direct_chunks(const Tensor& input,const Weight& w,
+                           std::span<const Destination> destinations,cudaStream_t stream) {
+    if(!covers(w,input.ne[1]) || destinations.empty() || destinations.size()>kMaxDestinations)
+        throw std::invalid_argument("sm70 direct chunks: unsupported projection");
+    for(int first=0;first<input.ne[1];first+=kSmallDirectTokens) {
+        const int count=std::min(kSmallDirectTokens,input.ne[1]-first);
+        Tensor part(static_cast<__nv_bfloat16*>(input.data)+std::int64_t(first)*input.ne[0],
+                    DType::BF16,{input.ne[0],count});
+        Destination shifted[kMaxDestinations];
+        for(std::size_t i=0;i<destinations.size();++i) {
+            shifted[i]=destinations[i];
+            const auto skip=std::size_t(first)*shifted[i].leading;
+            if(shifted[i].fp32)shifted[i].fp32+=skip;else shifted[i].data+=skip;
+        }
+        // No donor flags/natural plane: project_for selects the native packed decoder.
+        project_for(prepare_direct(part),w,{shifted,destinations.size()},stream);
+    }
+}
+
 void project_for(const Activation& x, const Weight& w, std::span<const Destination> destinations,
                  cudaStream_t stream) {
+    if (v100_fp8_project(x,w,destinations,stream)) return;
+    if (v100_qpn_project(x,w,destinations,stream)) return;
+    record_v100_kernel_route(false);
     if (x.codes != nullptr && w.qtype == QType::T2_G128_FP16) {
         integer_project(x, w, destinations, stream);
     } else if (takes(x.tokens)) {
@@ -209,6 +250,9 @@ void project_for(const Activation& x, const Weight& w, std::span<const Destinati
 
 void swiglu_for(const Activation& x, const Weight& gate, const Weight* up, Tensor& out,
                 cudaStream_t stream) {
+    if (v100_fp8_swiglu(x,gate,up,out,stream)) return;
+    if (v100_qpn_swiglu(x,gate,up,out,stream)) return;
+    record_v100_kernel_route(false);
     if (x.codes != nullptr && gate.qtype == QType::T2_G128_FP16) {
         integer_swiglu(x, gate, up, out, stream);
     } else if (takes(x.tokens)) {

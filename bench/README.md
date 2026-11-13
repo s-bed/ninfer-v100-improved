@@ -16,6 +16,12 @@ subagent fan-outs, compaction, retries and aborts in a closed loop and reports c
 cold prefill and output rates, with an optional arm on the hybrid prefix cache;
 [`ab/`](ab/README.md) replays a fixed 14-request agentic workload.
 
+The October 30, 2026 three-engine PG500/V100 precision and native-cache campaign is
+recorded in [the lab snapshot notes](NINFER_V100_LAB.txt), with the
+[precision report](NINFER_PRECISION.txt) and [agentic report](NINFER_AGENTIC.txt).
+These scripts require the separate llama-stack lab layout described in the notes;
+they are not part of the product benchmark targets below.
+
 ## Build
 
 `CMakeLists.txt` includes explicit registrations from `ops/`, `inference/`, `context_cost/`
