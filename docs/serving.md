@@ -382,8 +382,10 @@ escapes (including valid surrogate pairs); lone surrogates and malformed UTF-8 a
 rejected. Length bounds count decoded Unicode scalars, independent of escape spelling. Nonnegative length/item bounds
 must fit a signed 32-bit integer. `$ref` cannot have sibling constraints; `anyOf` permits
 the proven common `type`/`required` intersections described above. `const` and `enum`
-allow a matching single `type` declaration and compatible const/enum intersections,
-but no other sibling constraints. Move other assertions into the referenced schema
+allow a matching scalar `type` or nonempty array of unique JSON type names and
+compatible const/enum intersections, but no other sibling constraints. Each finite
+value must satisfy a declared type. Including `"null"` in the type array does not
+add null to an enum; null must be an explicit enum member. Move other assertions into the referenced schema
 or each union branch. Missing `additionalProperties`
 and `items` retain JSON Schema defaults unless the schema is strict (see below). Properties are emitted in schema declaration order;
 this is a valid subset of the requested schema. Whitespace between JSON elements is bounded to

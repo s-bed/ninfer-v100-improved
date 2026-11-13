@@ -223,6 +223,78 @@ int main() {
         const auto accepts_schema_value = [&](const std::string& schema_value, const std::string& json_value) {
             return accepts_value(compiler.compile({StructuredOutputKind::JsonSchema, schema_value}), json_value);
         };
+        // Finite values intersect type unions without widening the enum to every union member.
+        // These include the 26 cases from the Home Assistant enum/type-array probe.
+        {
+            const std::string category =
+                R"({"type":["string","null"],"enum":["Cabane","Camera","Car","Enfants"]})";
+            for (const char* value : {R"("Cabane")", R"("Camera")", R"("Car")", R"("Enfants")"})
+                require(accepts_schema_value(category, value), "category union lost an enum member");
+            for (const char* value : {"null", R"("Other")", "12"})
+                require(!accepts_schema_value(category, value), "category union widened its enum");
+
+            const std::string nullable =
+                R"({"type":["string","null"],"enum":["Cabane","Camera","Car","Enfants",null]})";
+            require(accepts_schema_value(nullable, "null"), "explicit enum null rejected");
+            require(!accepts_schema_value(nullable, R"("Other")"), "nullable enum widened strings");
+            const std::string constant = R"({"type":["string","null"],"const":"Cabane"})";
+            require(accepts_schema_value(constant, R"("Cabane")"), "union lost string constant");
+            require(!accepts_schema_value(constant, "null"), "type union widened a constant");
+            require(accepts_schema_value(R"({"type":["string","null"],"const":null})", "null"),
+                    "union lost null constant");
+            const std::string mixed = R"({"type":["string","integer"],"enum":["x",7]})";
+            require(accepts_schema_value(mixed, "7"), "mixed enum lost integer member");
+            require(!accepts_schema_value(mixed, "true"), "mixed enum accepted boolean");
+
+            const auto rejects_schema = [&](const std::string& bad) {
+                bool failed = false;
+                try {
+                    validate_structured_output({StructuredOutputKind::JsonSchema, bad});
+                } catch (const std::invalid_argument&) { failed = true; }
+                require(failed, "unsupported finite-value/type intersection passed validation");
+            };
+            rejects_schema(R"({"type":["string","null"],"enum":["Cabane",7]})");
+            rejects_schema(R"({"type":["string","null"],"enum":["Cabane"],"minLength":10})");
+            const std::string scalar = R"({"type":"string","enum":["Cabane"]})";
+            require(accepts_schema_value(scalar, R"("Cabane")"), "scalar enum member rejected");
+            require(!accepts_schema_value(scalar, "null"), "scalar enum widened to null");
+            const std::string integers = R"({"type":"integer","enum":[1,2]})";
+            require(accepts_schema_value(integers, "1"), "scalar integer enum member rejected");
+            require(!accepts_schema_value(integers, "3"), "scalar integer enum widened");
+            rejects_schema(R"({"type":["string","bogus"],"enum":["Cabane"]})");
+            rejects_schema(R"({"type":[],"enum":["Cabane"]})");
+
+            const std::string home_assistant =
+                R"({"type":"object","properties":{"name":{"type":"string"},"description":{"type":["string","null"]},"labels":{"type":["array","null"],"items":{"type":"string"}},"category":{"type":["string","null"],"enum":["Cabane","Camera","Car","Enfants"]}},"required":["name","description","labels","category"],"additionalProperties":false})";
+            require(accepts_schema_value(home_assistant,
+                        R"({"name":"Test","description":null,"labels":null,"category":"Cabane"})"),
+                    "Home Assistant schema lost a valid category");
+            require(!accepts_schema_value(home_assistant,
+                        R"({"name":"Test","description":null,"labels":null,"category":null})"),
+                    "Home Assistant schema implicitly added enum null");
+            require(!accepts_schema_value(home_assistant,
+                        R"({"name":"Test","description":null,"labels":null,"category":"Other"})"),
+                    "Home Assistant schema lost category restriction");
+            rejects_schema(R"({"type":["string","string"],"enum":["Cabane"]})");
+
+            // Other recognized types and malformed arrays, including const/enum intersections.
+            for (const char* bad : {
+                     R"({"type":["string",null],"const":"Cabane"})",
+                     R"({"type":["string",7],"enum":["Cabane"]})",
+                     R"({"type":["string","null","null"],"const":null})",
+                     R"({"type":["string","null"],"const":true})",
+                     R"({"type":["string","null"],"const":"Cabane","enum":["Camera"]})",
+                     R"({"type":["string","null"],"const":"Cabane","pattern":"^C"})"})
+                rejects_schema(bad);
+            const std::string other_types =
+                R"({"type":["boolean","number","array","object","null"],"enum":[true,1.5,[],{},null]})";
+            for (const char* value : {"true", "1.5", "[]", "{}", "null"})
+                require(accepts_schema_value(other_types, value), "finite union lost recognized type");
+            require(!accepts_schema_value(other_types, "false"), "finite union widened boolean enum");
+            require(accepts_schema_value(
+                        R"({"type":["string","null"],"const":"Cabane","enum":["Cabane","Camera"]})",
+                        R"("Cabane")"), "compatible const/enum union rejected");
+        }
         const std::string anchored = R"({"type":"string","pattern":"^code-[AB][0-9]+$"})";
         require(accepts_schema_value(anchored, R"("code-A12")"), "anchored pattern lost valid value");
         require(!accepts_schema_value(anchored, R"("bad-code-A12")"), "start anchor ignored");

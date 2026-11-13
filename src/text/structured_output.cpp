@@ -188,16 +188,32 @@ void schema_check(const Json& s) {
                 }
                 if (key == "type" &&
                     (std::string_view(branch) == "enum" || std::string_view(branch) == "const")) {
+                    if (value.is_array()) {
+                        static const std::unordered_set<std::string> types = {
+                            "string", "integer", "number", "boolean", "null", "array", "object"};
+                        std::unordered_set<std::string> seen;
+                        if (value.empty()) throw std::invalid_argument("type array must not be empty");
+                        for (const auto& type : value) {
+                            if (!type.is_string() || !types.contains(type.get<std::string>()) ||
+                                !seen.insert(type.get<std::string>()).second)
+                                throw std::invalid_argument("type array must contain unique JSON Schema type names");
+                        }
+                    }
                     const auto matches = [&](const Json& v) {
-                        if (!value.is_string()) { return false; }
-                        const auto type = value.get<std::string>();
-                        return (type == "string" && v.is_string()) ||
-                               (type == "integer" && v.is_number_integer()) ||
-                               (type == "number" && v.is_number()) ||
-                               (type == "boolean" && v.is_boolean()) ||
-                               (type == "null" && v.is_null()) ||
-                               (type == "array" && v.is_array()) ||
-                               (type == "object" && v.is_object());
+                        const auto matches_one = [&](const Json& item) {
+                            if (!item.is_string()) { return false; }
+                            const auto type = item.get<std::string>();
+                            return (type == "string" && v.is_string()) ||
+                                   (type == "integer" && v.is_number_integer()) ||
+                                   (type == "number" && v.is_number()) ||
+                                   (type == "boolean" && v.is_boolean()) ||
+                                   (type == "null" && v.is_null()) ||
+                                   (type == "array" && v.is_array()) ||
+                                   (type == "object" && v.is_object());
+                        };
+                        return value.is_array()
+                            ? std::any_of(value.begin(), value.end(), matches_one)
+                            : matches_one(value);
                     };
                     if (s.contains("const") && matches(s.at("const"))) { continue; }
                     if (s.contains("enum") && s.at("enum").is_array() &&
