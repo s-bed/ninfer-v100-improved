@@ -4,6 +4,7 @@
 #include <cmath>
 #include <functional>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace ninfer::runtime::prefix_cache {
@@ -591,6 +592,76 @@ std::uint32_t PrefixCacheIndex::device_backed_evictable_blocks() const noexcept 
     return lru_[kBacked].count;
 }
 
+bool PrefixCacheIndex::reclaimable_slot_tail(const Snapshot& snapshot) const noexcept {
+    return snapshot.device_slot != kNoId && snapshot.pins == 0 && snapshot.tail_len != 0 &&
+           snapshot.tail_device_copy == CopyState::Resident;
+}
+
+std::uint64_t PrefixCacheIndex::reclaimable_for_admission(std::span<const NodeRef> path,
+                                                          SnapshotRef source) const {
+    std::uint64_t pages = device_evictable_blocks();
+    // These entries are deliberately outside both ordinary LRUs.
+    for (const auto owner : slot_owner_) {
+        if (owner != kNoId && reclaimable_slot_tail(snapshots_[owner])) { ++pages; }
+    }
+    std::uint64_t protected_pages = 0;
+    for (const NodeRef node : path) {
+        (void)require(node);
+        if (lru_links_[node.index].list != kNoList) { ++protected_pages; }
+    }
+    if (source.valid()) {
+        const Snapshot& snapshot = require(source);
+        if (lru_links_[config_.max_nodes + source.index].list != kNoList ||
+            reclaimable_slot_tail(snapshot)) {
+            ++protected_pages;
+        }
+    }
+    return pages - std::min(pages, protected_pages);
+}
+
+void PrefixCacheIndex::drop_slot_image(std::uint32_t index) {
+    Snapshot& snapshot = snapshots_[index];
+    const auto slot = snapshot.device_slot;
+    backend_->drop_snapshot_device_image(ref_of_snapshot(index));
+    snapshot.device_slot = kNoId;
+    slot_owner_[slot] = kNoId;
+    set_slot(slot, SlotState::Free);
+    refresh_tail(index);
+}
+
+bool PrefixCacheIndex::reclaim_slot_tail() {
+    // Prefer a complete Host backup. Within each tier release a superseded owner first;
+    // the least valuable Device-only owner is the last resort. D bounds this scan.
+    const auto rank = [&](const Snapshot& s) {
+        const bool backed = config_.host_blocks && s.host == CopyState::Resident;
+        return std::tuple{!backed, !s.superseded, backed || s.superseded ? 0.0 : priority(s),
+                          s.superseded ? s.superseded_tick : s.last_hit_tick};
+    };
+    std::uint32_t victim = kNoId;
+    for (const auto owner : slot_owner_) {
+        if (owner != kNoId && reclaimable_slot_tail(snapshots_[owner]) &&
+            (victim == kNoId || rank(snapshots_[owner]) < rank(snapshots_[victim]))) {
+            victim = owner;
+        }
+    }
+    if (victim == kNoId) { return false; }
+    Snapshot& snapshot = snapshots_[victim];
+    if (config_.host_blocks && snapshot.host == CopyState::Resident) {
+        // Demote both parts together: the same snapshot and its Host slabs remain usable.
+        const auto tail = snapshot.tail_device;
+        snapshot.tail_device = kNoId;
+        snapshot.tail_device_copy = CopyState::Absent;
+        drop_slot_image(victim);
+        backend_->release_device_block(tail);
+    } else {
+        if (!snapshot.superseded) { inflation_ = std::max(inflation_, priority(snapshot)); }
+        remove_snapshot(victim);
+    }
+    ++counters_.device_slot_evictions;
+    ++counters_.device_block_evictions;
+    return true;
+}
+
 void PrefixCacheIndex::drop_node_device_copy(std::uint32_t index) {
     Node& node = nodes_[index];
     if (node.device != CopyState::Resident) { invariant("prefix cache drops a non-resident page"); }
@@ -862,10 +933,7 @@ std::optional<std::uint32_t> PrefixCacheIndex::acquire_device_slot(double claim)
     };
     const auto drop_device_copy = [&](std::uint32_t slot) {
         const std::uint32_t owner = slot_owner_[slot];
-        backend_->drop_snapshot_device_image(ref_of_snapshot(owner));
-        snapshots_[owner].device_slot = kNoId;
-        slot_owner_[slot]             = kNoId;
-        refresh_tail(owner); // its tail may now leave the Device too
+        drop_slot_image(owner);
         return take(slot);
     };
     // A superseded owner goes first, backed or not: its lineage resumes from a newer snapshot.

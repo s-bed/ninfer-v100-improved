@@ -530,6 +530,77 @@ void test_persistence_roundtrip() {
     tiny.check_invariants();
 }
 
+// The four slot-owned tails stay hot under ordinary pressure. Required reservations can
+// reclaim the exact pages quoted after the selected source has been pinned.
+void test_required_tail_reclaim() {
+    for (const bool host : {false, true}) {
+        RecordingBackend backend;
+        PrefixCacheIndex index(small_config(host ? 64 : 0, 4), backend);
+        const auto tokens = make_tokens(2 * kBlockTokens + 7, 18);
+        const auto path = insert_sequence(index, backend, tokens);
+        const SnapshotRef selected =
+            publish_at(index, backend, path, tokens, static_cast<std::uint32_t>(tokens.size()),
+                       SnapshotKind::Boundary);
+        std::vector<SnapshotRef> others;
+        for (std::uint32_t i = 0; i < 3; ++i) {
+            others.push_back(publish_at(index, backend, {}, make_tokens(9, 20 + i), 9,
+                                        SnapshotKind::Endpoint));
+        }
+        if (host) {
+            for (const auto node : path) { backup_node(index, node); }
+            backup_snapshot(index, selected);
+            // Keep one unbacked owner. Reclaim must prefer the two complete Host backups.
+            backup_snapshot(index, others[0]);
+            backup_snapshot(index, others[1]);
+        }
+        index.supersede(others[1], Supersession::Endpoint);
+        index.release_path(path);
+        require(index.reclaimable_for_admission({}, {}) == 6 &&
+                    index.reclaimable_for_admission(path, selected) == 3,
+                "root and resumed reservations must account for exactly their freeable pages");
+        // These are the same pin operations used to stage an admission.
+        index.acquire_path(path);
+        index.pin_snapshot(selected);
+        require(index.evict_device_blocks(1) == 0 && index.device_evictable_blocks() == 0,
+                "ordinary LRU pressure must preserve the slot owners");
+        for (unsigned i = 0; i < 3; ++i) {
+            require(index.reclaimable_for_admission({}, {}) == 3 - i && index.reclaim_slot_tail(),
+                    "a required reservation must recover each page it quoted");
+            if (i == 0) {
+                require(host ? index.snapshot(others[1]).device_slot == kNoId : !index.valid(others[1]),
+                        "the superseded owner goes first within its tier");
+            }
+            if (host && i < 2) {
+                require(index.valid(others[2]), "a complete Host-backed owner can demote first");
+            }
+        }
+        require(!index.reclaim_slot_tail() && index.reclaimable_for_admission(path, selected) == 0 &&
+                    backend.live.size() == 3 && index.snapshot(selected).device_slot != kNoId,
+                "the selected image, tail and both anchor pages must remain intact");
+        for (unsigned i = 0; i < others.size(); ++i) {
+            if (host && i < 2) {
+                const SnapshotView saved = index.snapshot(others[i]);
+                require(saved.device_slot == kNoId && saved.host == CopyState::Resident &&
+                            saved.tail_device_copy == CopyState::Absent && saved.host_slabs.size() == 5,
+                        "a backed owner must retain both Host image and tail");
+            } else {
+                require(!index.valid(others[i]), "a Device-only victim must retire as a whole");
+            }
+        }
+        index.unpin_snapshot(selected);
+        index.release_path(path);
+        require(index.reclaimable_for_admission(path, selected) == 0,
+                "a matched path plus its only remaining slot tail leaves no reclaimable page");
+        const auto root_pages = index.reclaimable_for_admission({}, {});
+        auto released = index.evict_device_blocks(3);
+        if (released < root_pages && index.reclaim_slot_tail()) { ++released; }
+        require(root_pages == 3 && released == root_pages && backend.live.empty() &&
+                    index.stats().free_device_slots == 4,
+                "an idle root reservation must recover the full physical pool");
+        index.check_invariants();
+    }
+}
+
 void test_tail_device_fill() {
     RecordingBackend backend;
     PrefixCacheIndex index(small_config(64, 2), backend);
@@ -1782,6 +1853,7 @@ int main() {
         test_restore_plan();
         test_image_only_host_tier();
         test_slot_snapshot_keeps_tail();
+        test_required_tail_reclaim();
         test_write_through_claim();
         test_image_write_keeps_superseded_tap();
         test_random_stress();

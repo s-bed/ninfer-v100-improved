@@ -1461,7 +1461,9 @@ private:
     // Builds the lane from the staged, Device-resident source.
     [[nodiscard]] StartResult hybrid_activate(HybridMaterializationTransaction& transaction);
     void hybrid_abort_materialization(HybridMaterializationTransaction& transaction) noexcept;
-    [[nodiscard]] bool hybrid_make_room(std::uint32_t text_pages, std::uint32_t backend_pages);
+    [[nodiscard]] std::uint32_t hybrid_reclaim_one(bool required);
+    [[nodiscard]] bool hybrid_make_room(std::uint32_t text_pages, std::uint32_t backend_pages,
+                                        bool required);
     // The backend KV frontier restored with a snapshot at `frontier` (MTP trails by one token).
     [[nodiscard]] std::uint32_t hybrid_backend_frontier(std::uint32_t frontier) const noexcept;
     // Inserts every newly committed full block of the lane's sequence into the tree, then

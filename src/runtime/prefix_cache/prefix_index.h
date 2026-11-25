@@ -284,6 +284,12 @@ public:
     std::uint32_t evict_backed_device_blocks(std::uint32_t blocks);
     [[nodiscard]] std::uint32_t device_evictable_blocks() const noexcept;
     [[nodiscard]] std::uint32_t device_backed_evictable_blocks() const noexcept;
+    // Physical pages available to a required reservation after protecting its matched source.
+    // Ordinary eviction and speculative prefetch keep slot-owned tails, but a required
+    // reservation can reclaim one as a last resort once transfers and the LRUs are exhausted.
+    [[nodiscard]] std::uint64_t reclaimable_for_admission(std::span<const NodeRef> path,
+                                                          SnapshotRef source) const;
+    [[nodiscard]] bool reclaim_slot_tail();
 
     // ---- host residency (§9.3)
     // ------------------------------------------------------------------- Allocates a slab for a
@@ -461,6 +467,8 @@ private:
     void unpin_path_from(std::uint32_t node, bool deepest_first_order);
     void refresh_node(std::uint32_t node);
     void refresh_tail(std::uint32_t snapshot);
+    [[nodiscard]] bool reclaimable_slot_tail(const Snapshot& snapshot) const noexcept;
+    void drop_slot_image(std::uint32_t index);
 
     std::uint32_t evict_device_entries(std::uint32_t blocks, bool unbacked);
     void lru_remove(std::uint32_t entry);

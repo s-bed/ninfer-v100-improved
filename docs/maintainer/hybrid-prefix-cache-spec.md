@@ -927,6 +927,13 @@ Device copy. A larger Host tier backs more tails, which this list consumes first
 of conversations resuming from slot snapshots reused fewer prompt tokens with 4 GiB than with
 2 GiB (the numbers are in §9.3).
 
+A required admission or active KV reservation can release slot-owned tails after exhausting the
+ordinary lists and settling pending transfers. It demotes a whole Host-backed slot owner first.
+If only Device copies remain, it retires a whole unpinned owner. Within each tier superseded
+owners go first. The source snapshot and its path are pinned before this reclamation. The quote
+counts only pages that this reservation can release while protecting those pins. Optional tap
+copies continue to use the ordinary lists.
+
 ### 9.2 Device snapshot slots
 
 Slots hold at most `D` images. A sequence about to snapshot past its previous snapshot (the one

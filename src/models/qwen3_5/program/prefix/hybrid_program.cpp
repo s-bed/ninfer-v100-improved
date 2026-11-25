@@ -242,18 +242,8 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
             candidate != nullptr ? candidate->host_only_blocks +
                                        (candidate->tail && !candidate->tail_on_device ? 1U : 0U)
                                  : 0U;
-        // Entries this admission pins stop being evictable: its unpinned Device-resident path
-        // blocks and the snapshot's Device-resident tail.
-        std::uint32_t evictable_on_path = 0;
-        for (const pc::NodeRef node : path) {
-            const pc::NodeView view = index.node(node);
-            if (view.pins == 0 && view.device == pc::CopyState::Resident) { ++evictable_on_path; }
-        }
-        if (candidate != nullptr && candidate->tail && candidate->tail_on_device &&
-            index.snapshot(candidate->snapshot).pins == 0) {
-            ++evictable_on_path;
-        }
-        const std::uint64_t evictable = index.device_evictable_blocks() - evictable_on_path;
+        const auto evictable = index.reclaimable_for_admission(
+            path, candidate != nullptr ? candidate->snapshot : pc::SnapshotRef{});
         const std::uint64_t text_need = static_cast<std::uint64_t>(plan.text_kv_page_entitlement) -
                                         frontier / kBlock + restored;
         if (text_need > text_kv_pages->physical_pool().available_pages() + evictable) {
@@ -656,15 +646,25 @@ ProgramImpl::progress_hybrid_materialization(runtime::CancellationFlagView cance
     return out;
 }
 
-bool ProgramImpl::hybrid_make_room(std::uint32_t text_pages, std::uint32_t backend_pages) {
+std::uint32_t ProgramImpl::hybrid_reclaim_one(bool required) {
+    for (;;) {
+        const auto pages = hybrid_->index().evict_device_blocks(1);
+        if (pages != 0) { return pages; }
+        if (!hybrid_->transfers_pending()) {
+            return required && hybrid_->index().reclaim_slot_tail() ? 1U : 0U;
+        }
+        hybrid_->drain();
+    }
+}
+
+bool ProgramImpl::hybrid_make_room(std::uint32_t text_pages, std::uint32_t backend_pages,
+                                   bool required) {
     const DeviceKVPagePool& text_pool = text_kv_pages->physical_pool();
     const DeviceKVPagePool* backend_pool =
         backend_kv_pages ? &backend_kv_pages->physical_pool() : nullptr;
     while (text_pool.available_pages() < text_pages ||
            (backend_pool != nullptr && backend_pool->available_pages() < backend_pages)) {
-        if (hybrid_->index().evict_device_blocks(1) != 0) { continue; }
-        if (!hybrid_->transfers_pending()) { return false; }
-        hybrid_->drain();
+        if (hybrid_reclaim_one(required) == 0) { return false; }
     }
     return true;
 }
@@ -734,7 +734,7 @@ bool ProgramImpl::hybrid_stage(HybridMaterializationTransaction& transaction,
             : 0U;
     // The quote counted these pages; failing here means it went stale, and the Engine plans the
     // request again instead of failing it.
-    if (!hybrid_make_room(text_need, backend_need)) { return false; }
+    if (!hybrid_make_room(text_need, backend_need, true)) { return false; }
     transaction.text_pages = text_kv_pages->physical_pool().reserve(text_need);
     if (!transaction.text_pages) { return false; }
     if (backend_pool) {
@@ -1190,7 +1190,7 @@ void ProgramImpl::hybrid_publish_blocks(SequenceState& sequence) {
 std::optional<std::uint32_t> ProgramImpl::hybrid_copy_tail(const HybridBlockPages& source,
                                                            std::uint32_t columns) {
     const bool backend_pool = backend_kv_pages != nullptr;
-    if (!hybrid_make_room(1U, backend_pool ? 1U : 0U)) { return std::nullopt; }
+    if (!hybrid_make_room(1U, backend_pool ? 1U : 0U, false)) { return std::nullopt; }
     std::optional<DeviceKVPageReservation> text_reservation =
         text_kv_pages->physical_pool().reserve(1U);
     std::optional<DeviceKVPageReservation> backend_reservation;
@@ -1547,12 +1547,8 @@ std::uint32_t ProgramImpl::hybrid_reclaim_device_kv(std::uint32_t main_pages,
     std::uint32_t released = 0;
     while (text_pool.available_pages() < text_target ||
            (backend_pool != nullptr && backend_pool->available_pages() < backend_target)) {
-        const std::uint32_t count = hybrid_->index().evict_device_blocks(1);
-        if (count == 0) {
-            if (!hybrid_->transfers_pending()) { break; }
-            hybrid_->drain();
-            continue;
-        }
+        const auto count = hybrid_reclaim_one(true);
+        if (count == 0) { break; }
         released += count;
     }
     if (released != 0) { advance_resource_revision(); }
