@@ -2269,7 +2269,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--use-alt-prefix-caching` | the hybrid prefix cache ([spec](maintainer/hybrid-prefix-cache-spec.md)), the default: content-addressed 64-token KV blocks shared across requests plus sparse state snapshots. It configures itself: `--kv-capacity` defaults to `auto` (free VRAM becomes Device block cache) and `--host-cache-mib` sizes the one pinned Host pool that blocks and snapshots share. Without this flag or `--use-original-prefix-caching`, an option only the checkpoint catalog serves selects the catalog instead: its capacities (`--device-state-slots`, `--host-state-slots`, `--host-kv-mib`, `--max-private-continuations`, `--max-shared-prefixes`, `--max-long-anchors-per-continuation`), its anchors and policies (`--auto-long-anchors`, `--long-anchor-spacing`, `--branch-anchors`, `--no-endpoint-anchors`, `--progress-anchor-tokens`, `--auto-prefix-grid`, `--derive-session-keys`, `--context-cache-policy`, `--release-diverged-checkpoints`, `--thorough-admission-search`, `--recency-eviction`, `--value-aware-demote`), the disk tier, slot files, pipeline `--devices`, `--no-prefix-reuse` or a `--graft`. Named, the flag rejects those options instead. Gemma 4 and Qwen3.8-Flash-Next keep their own context caches, which the catalog options configure. Requests that share a new prefix with one still prefilling wait for its snapshot instead of prefilling the prefix again, which needs `--concurrent-prefill` to admit them meanwhile. On an RTX 3090 with Qwen3.8-27B (`rk4v4`, 131K context) the agentic replay of `bench/agentic_ab` (seed 42, half scale) ran with an average time to first token of 55.6 s instead of 97.9 s on the catalog, served 84 % of prompt tokens from the cache instead of 46 %, and finished in 43.6 instead of 60.2 minutes; its one history-edit turn took 389 s instead of 183 s, and decode ran 1.4 % slower | default |
 | `--use-original-prefix-caching` | select the checkpoint catalog in place of the hybrid prefix cache. Rejected together with `--use-alt-prefix-caching` and with the hybrid options below | off |
-| `--device-snapshot-slots N` | hybrid: Device state snapshot slots (`1..64`) | `max-concurrency + 1`; `+ 2` without a Host tier |
+| `--device-snapshot-slots N` | hybrid: Device state snapshot slots (`1..64`) | `max-concurrency + 2` |
 | `--cache-taps-per-request N` | hybrid: new prefill state snapshots per request (`0..64`) | `8`; `2` without a Host tier |
 | `--cache-tap-ladder N` | hybrid: history-snapshot ladder base G; flexible taps at `prompt − G·2^k` | `max(4096, 2 * prefill-chunk)` |
 | `--cache-tap-min-gap N` | hybrid: minimum tokens between ladder snapshots | `max(1024, prefill-chunk)` |
@@ -2733,20 +2733,29 @@ lets every configured lane be admitted at the same time. Once its prompt is prep
 finds the largest output whose admission entitlement -- Main KV pages for the prompt and output,
 plus the MTP draft-window or DFlash backend KV pages when speculation is on -- fits one lane's share
 (`1/--max-concurrency`) of each KV pool, and clamps it to the remaining context
-(`--max-context` minus the prompt). With one lane, or a pool of at least `--max-concurrency` times
-`--max-context`, that is the whole remaining context, so long reasoning runs are not cut at an
-arbitrary count; with several lanes over a smaller pool, each limitless request stays inside its
-share and they all run concurrently. A prompt that alone overruns one lane's share can never run
-beside full-share lanes, so it keeps the whole remaining context.
+(`--max-context` minus the prompt). With the prefix cache on, a Qwen3.5-core lane also keeps pages
+of its share free for the cache's snapshot copies: one per snapshot a request may capture (the
+hybrid cache's `--cache-taps-per-request`, 8 with a Host tier; the catalog's 7 prompt candidates)
+plus one. A snapshot whose frontier falls inside a 64-token page copies that page, and a repeat of
+the prompt that resumes there keeps the copy pinned while it takes its own. Neither page is part of
+a request's entitlement, so an entitlement that fills the pool leaves a repeated prompt no such
+snapshot to resume from. With one lane, or a pool of at least `--max-concurrency` times
+`--max-context` plus those pages, the budget is the whole remaining context, so long reasoning runs
+are not cut at an arbitrary count; with one lane and `--kv-capacity` equal to `--max-context` it is
+the remaining context less those pages (576 tokens with a Host tier). With several lanes over a
+smaller pool, each limitless request stays inside its share and they all run concurrently. A prompt
+that leaves no output beside the spare pages is sized without them, and one that alone overruns one
+lane's share can never run beside full-share lanes, so it keeps the whole remaining context.
 
 A run that exhausts the budget finishes with `finish_reason:"length"`, Responses `incomplete` with
 reason `max_output_tokens`, or Anthropic `stop_reason:"max_tokens"`, or
 `stop_reason:"model_context_window_exceeded"` when the budget was the remaining context. An explicit
-request limit always wins, and `--default-max-tokens N` replaces the derived default with a fixed cap
-(still bounded by the remaining context). Chat Completions `max_tokens: -1`, llama.cpp's "no limit"
-that its WebUI sends by default, always receives the derived budget, even with
-`--default-max-tokens`. The JSONL request record reports the budget actually
-submitted as `requested_output_tokens`.
+request limit always wins, and `--default-max-tokens N` replaces the derived default with a fixed
+cap (still bounded by the remaining context). An explicit limit whose entitlement fills the pool
+runs, but publishes no snapshot inside a page and resumes from none. Chat Completions
+`max_tokens: -1`, llama.cpp's "no limit" that its WebUI sends by default, always receives the
+derived budget, even with `--default-max-tokens`. The JSONL request record reports the budget actually submitted as
+`requested_output_tokens`.
 
 Each reusable checkpoint contains KV and complete continuation state. At admission, capture, and
 finish boundaries, resource pressure may keep it on Device, move its StateImage and/or KV replicas

@@ -378,15 +378,27 @@ struct HybridLaneState {
     // Deepest snapshot frontier known on this path (reused or created by this sequence).
     std::uint32_t deepest_snapshot = 0;
     // The snapshot this sequence resumed from (invalid: root). Once the sequence publishes a
-    // deeper snapshot, its lineage resumes from that one and this one is superseded.
+    // deeper tap, its lineage resumes from that one and this one is superseded; its endpoint
+    // supersedes only an endpoint it resumed from.
     runtime::prefix_cache::SnapshotRef resume_snapshot;
     std::uint32_t resume_frontier = 0;
+    // Hits the superseded resume snapshot still counted: the snapshots this sequence publishes
+    // next start with them (§9.3).
+    std::uint32_t lineage_hits = 0;
     // The newest Tap (not Boundary) this sequence published. A deeper tap of the same prompt
     // supersedes it: the lineage resumes from the deeper one, and it only serves a request
     // diverging between them. The endpoint does not, since a next turn whose template re-renders
     // the reply resumes from the prompt-end tap.
     runtime::prefix_cache::SnapshotRef tap_snapshot;
     std::uint32_t tap_frontier = 0;
+    // The newest tap a deeper tap of the same prompt superseded. This sequence's Host writes
+    // (its snapshot images and the block write-through at release) do not evict it (§9.3): a
+    // request diverging later in this prompt (the next question about the same document) resumes
+    // from it, and the blocks written are its own.
+    runtime::prefix_cache::SnapshotRef superseded_tap;
+    // Snapshots this sequence published (taps and endpoint). The block write-through at release
+    // displaces no retained snapshot worth more than the most valuable of them still retained.
+    std::vector<runtime::prefix_cache::SnapshotRef> published;
     // The Host restore this sequence was admitted from (0 without one). Its first prefill pass
     // queues behind the restore's per-layer events; releasing the lane queues behind the whole
     // restore if it may still be landing.
@@ -556,6 +568,8 @@ struct SharedPrefixSlot {
 // gives every occupied request slot its own instance of this state.
 struct RequestControl {
     std::unique_ptr<NgramProposer> ngram;
+    // The build of `ngram` until its first proposal takes it.
+    std::shared_ptr<NgramIndexBuild> ngram_build;
     std::shared_ptr<const NgramSnapshot> ngram_snapshot;
     std::uint64_t ngram_copy_source = 0;
     std::uint32_t ngram_copy_offset = 0;
@@ -838,6 +852,9 @@ public:
     [[nodiscard]] detail::PhysicalResources admission_capacity() const noexcept;
     [[nodiscard]] KVEntitlementShape kv_entitlement_shape() const noexcept;
     [[nodiscard]] std::uint32_t concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept;
+    // Pages of each KV pool the derived output budget leaves beside one lane's entitlement for the
+    // prefix cache's tail copies.
+    [[nodiscard]] KVPageEntitlement prefix_cache_copy_headroom() const noexcept;
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
 
     [[nodiscard]] bool hybrid_prefix_cache() const noexcept { return hybrid_ != nullptr; }
@@ -1444,7 +1461,9 @@ private:
     // Builds the lane from the staged, Device-resident source.
     [[nodiscard]] StartResult hybrid_activate(HybridMaterializationTransaction& transaction);
     void hybrid_abort_materialization(HybridMaterializationTransaction& transaction) noexcept;
-    [[nodiscard]] bool hybrid_make_room(std::uint32_t text_pages, std::uint32_t backend_pages);
+    [[nodiscard]] std::uint32_t hybrid_reclaim_one(bool required);
+    [[nodiscard]] bool hybrid_make_room(std::uint32_t text_pages, std::uint32_t backend_pages,
+                                        bool required);
     // The backend KV frontier restored with a snapshot at `frontier` (MTP trails by one token).
     [[nodiscard]] std::uint32_t hybrid_backend_frontier(std::uint32_t frontier) const noexcept;
     // Inserts every newly committed full block of the lane's sequence into the tree, then
@@ -1470,8 +1489,11 @@ private:
     // Drops the lane's index pins. Safe on any lane state.
     void hybrid_release_lane(std::uint32_t lane) noexcept;
     // Supersedes the snapshot the sequence resumed from once it snapshots past it at
-    // `frontier`, before the new snapshot takes a slot or slabs (spec §9.2, §9.3).
-    void hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier);
+    // `frontier`, before the new snapshot takes a slot or slabs (spec §9.2, §9.3), and keeps the
+    // hits it still counted for the snapshots the lane publishes next. `cause` is Resumed for a
+    // tap and Endpoint for the endpoint.
+    void hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier,
+                                 runtime::prefix_cache::Supersession cause);
     void hybrid_supersede_tap(HybridLaneState& lane, std::uint32_t frontier);
 
     [[nodiscard]] std::optional<AdmissionCandidate>

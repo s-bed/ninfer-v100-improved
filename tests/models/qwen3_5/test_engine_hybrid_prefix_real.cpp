@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -557,6 +558,98 @@ int exercise_turns(const char* artifact, std::size_t host_bytes) {
     return failures;
 }
 
+// Cancels the request once it has generated `tokens` tokens.
+class CancelAfterTokensSink final : public ninfer::OutputSink {
+public:
+    explicit CancelAfterTokensSink(std::uint32_t tokens) : tokens_(tokens) {}
+
+    void start(ninfer::GenerationStart) override {}
+
+    void progress(ninfer::PromptProgress) override {}
+
+    void timing(ninfer::GenerationTimingObservation timing) override {
+        if (timing.generated_tokens >= tokens_) { reached_.store(true, std::memory_order_release); }
+    }
+
+    void publish(ninfer::OutputDelta) override {}
+
+    [[nodiscard]] bool reached() const noexcept { return reached_.load(std::memory_order_acquire); }
+
+private:
+    std::uint32_t tokens_;
+    std::atomic<bool> reached_{false};
+};
+
+// One lane over a KV pool exactly its context (--kv-capacity equal to --max-context), serving
+// requests without an output limit: each receives the derived budget. The generation-opener tap
+// lies inside a page, so it copies its tail into a page of its own, and a repeat of the prompt
+// resuming there keeps that page pinned while it copies the tail again. The budget leaves those
+// pages free, so the repeat resumes at the opener instead of prefilling the prompt again. Each
+// request generates past the opener's page before it is cancelled, so the tap publishes while the
+// lane holds its whole entitlement.
+int exercise_full_pool(const char* artifact) {
+    ninfer::EngineOptions options =
+        hybrid_options(artifact, ninfer::SpeculativeBackend::None, 4096, 1ULL << 30, 2);
+    const std::uint32_t context = options.max_context;
+    ninfer::Engine engine(std::move(options));
+
+    std::string system = "You maintain the runbook of a small storage cluster.";
+    for (int step = 0; step < 50; ++step) {
+        system += " Step " + std::to_string(step) + ": check node " + std::to_string(step % 7) +
+                  ", record its free space, and escalate when it falls below the threshold.";
+    }
+    const std::vector<ninfer::ChatMessage> messages{
+        text_message(ninfer::ChatRole::System, system),
+        text_message(ninfer::ChatRole::User, "Summarize the runbook in one paragraph.")};
+
+    struct Run {
+        std::uint32_t budget = 0;
+        ninfer::GenerationResult result;
+    };
+    const auto run = [&] {
+        ninfer::PreparedPrompt prompt = engine.prepare(conversation(messages));
+        Run out{.budget = engine.concurrent_output_budget(prompt), .result = {}};
+        CancelAfterTokensSink sink(kBlock + 16U);
+        out.result = engine
+                         .submit(std::move(prompt), greedy(out.budget),
+                                 ninfer::OutputConsumerMode::Streaming,
+                                 ninfer::GenerationObservationOptions{.live_timings = true})
+                         .wait(&sink, ninfer::CancellationView([&sink] { return sink.reached(); }));
+        return out;
+    };
+    const Run first  = run();
+    const Run second = run();
+
+    int failures            = 0;
+    const std::uint32_t n   = first.result.prompt.prompt_tokens;
+    const std::uint32_t end = first.budget + n - 1U;
+    if (end + kBlock > context) {
+        std::cerr << "full-pool: the derived budget " << first.budget << " for " << n
+                  << " prompt tokens left less than a page of the " << context << "-token pool\n";
+        ++failures;
+    }
+    if (first.result.generated_token_ids.size() <= kBlock) {
+        std::cerr << "full-pool: the first request ended after "
+                  << first.result.generated_token_ids.size()
+                  << " tokens, before its opener's page filled\n";
+        ++failures;
+    }
+    if (second.result.reused_prompt_tokens + 64U + 16U < n ||
+        second.result.reused_prompt_tokens >= n) {
+        std::cerr << "full-pool: the repeat reused " << second.result.reused_prompt_tokens << " of "
+                  << n << " prompt tokens; expected the generation opener\n";
+        ++failures;
+    }
+    const ninfer::RuntimeStats stats = engine.runtime_stats();
+    if (stats.hybrid_taps_created == 0 || stats.hybrid_snapshot_hits == 0) {
+        std::cerr << "full-pool: taps=" << stats.hybrid_taps_created
+                  << " skipped=" << stats.hybrid_taps_skipped
+                  << " hits=" << stats.hybrid_snapshot_hits << '\n';
+        ++failures;
+    }
+    return failures;
+}
+
 // Typed decision reads (src/serve/systemone.cpp) without the drafter: one-token reads of one
 // state, Disposable, with explicit boundaries after the system turn and after the state part, on
 // an Engine drafting with `backend`. The drafter never changes what the target computes, so the
@@ -886,6 +979,57 @@ int exercise_vision(const char* artifact) {
         std::cerr << "vision: generation did not complete\n";
         ++failures;
     }
+
+    // A media item shorter than a block: a single-frame clip after a paragraph of the user's text,
+    // which puts the generation opener far enough from the system boundary to be tapped. The clip's
+    // tokens are placeholders and a snapshot's tail is compared as tokens alone, so no frontier in
+    // the block the clip begins in may be a resume point: a second clip of the same shape under the
+    // same text would otherwise resume past the first clip's rows. Each round's system text is
+    // about sixteen tokens longer, which moves the clip through its block, so in some rounds the
+    // clip and the rest of the prompt share one block.
+    std::string preface = "Before the clip, some context for the description.";
+    for (int sentence = 0; sentence < 8; ++sentence) {
+        preface += " Note " + std::to_string(sentence) + ": the viewer cannot see the screen.";
+    }
+    const auto clip_prompt = [&](const std::vector<std::uint8_t>& frame) {
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = preface, .media = {}});
+        ninfer::MessagePart media;
+        media.kind              = ninfer::MessagePartKind::Media;
+        media.media.kind        = ninfer::MediaKind::Video;
+        media.media.bytes       = frame;
+        media.media.media_type  = "image/x-portable-pixmap";
+        media.media.source_name = "single-frame.ppm";
+        user.parts.push_back(std::move(media));
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = "Describe the clip.", .media = {}});
+        return conversation({text_message(ninfer::ChatRole::System, system), std::move(user)});
+    };
+    const std::vector<std::uint8_t> first_frame  = gradient_ppm(64, 0);
+    const std::vector<std::uint8_t> second_frame = gradient_ppm(64, 97);
+    // The vision end marker, the question and the generation opener follow the clip.
+    constexpr std::uint32_t kAfterClip = 8;
+    for (int round = 0; round < 4; ++round) {
+        system += " Further: one two three four five six seven eight nine ten eleven twelve.";
+        ninfer::PreparedPrompt prepared = engine.prepare(clip_prompt(first_frame));
+        const auto clip_tokens = static_cast<std::uint32_t>(prepared.preparation_stats().vision_tokens);
+        const ninfer::GenerationResult first_clip = engine.generate(std::move(prepared), greedy(4));
+        const ninfer::GenerationResult other_clip =
+            engine.generate(engine.prepare(clip_prompt(second_frame)), greedy(4));
+        std::cout << "vision: clip of " << clip_tokens << " tokens in a prompt of "
+                  << first_clip.prompt.prompt_tokens << "; a different clip reused "
+                  << other_clip.reused_prompt_tokens << '\n';
+        if (clip_tokens == 0 || other_clip.prompt.prompt_tokens != first_clip.prompt.prompt_tokens ||
+            other_clip.reused_prompt_tokens + clip_tokens + kAfterClip >
+                first_clip.prompt.prompt_tokens) {
+            std::cerr << "vision: a different clip of " << clip_tokens << " tokens reused "
+                      << other_clip.reused_prompt_tokens << " of "
+                      << other_clip.prompt.prompt_tokens << " tokens\n";
+            ++failures;
+        }
+    }
     return failures;
 }
 
@@ -904,7 +1048,7 @@ int main() {
     }
     const char* selected            = std::getenv("NINFER_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 15> kScenarios{"all",
+    constexpr std::array<std::string_view, 16> kScenarios{"all",
                                                           "restore-exact",
                                                           "restore-exact-mtp",
                                                           "restore-exact-dflash2",
@@ -918,7 +1062,8 @@ int main() {
                                                           "persist",
                                                           "turns-protocol",
                                                           "coalesce",
-                                                          "interleaved"};
+                                                          "interleaved",
+                                                          "full-pool"};
     if (std::find(kScenarios.begin(), kScenarios.end(), scenario) == kScenarios.end()) {
         std::cerr << "unknown NINFER_HYBRID_REAL_SCENARIO " << scenario << '\n';
         return 1;
@@ -952,6 +1097,7 @@ int main() {
         if (all || scenario == "vision") { failures += exercise_vision(artifact); }
         if (all || scenario == "persist") { failures += exercise_persist(artifact); }
         if (all || scenario == "interleaved") { failures += exercise_interleaved(artifact); }
+        if (all || scenario == "full-pool") { failures += exercise_full_pool(artifact); }
         if (all || scenario == "coalesce") {
             failures += exercise_coalesce(artifact, 6 * kPrefillChunk, true);
             failures += exercise_coalesce(artifact, 3000, false);
