@@ -438,6 +438,21 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
         } catch (const std::system_error&) { return std::future<text::TemplateOutput>{}; }
     };
     std::future<text::TemplateOutput> history_render, next_turn_render;
+    // Destroyed before the futures, whose destructors wait for their probes.
+    const struct StopProbes {
+        std::atomic<bool>& stop;
+
+        ~StopProbes() { stop.store(true, std::memory_order_relaxed); }
+    } stop_on_exit{stop_probes};
+    // CancellationView may call into the client's transport or other caller-owned state.
+    // Keep polling it on the preparing thread; workers observe only stop_probes.
+    const auto await_probe = [&](std::future<text::TemplateOutput>& probe) {
+        while (probe.wait_for(std::chrono::milliseconds(10)) == std::future_status::timeout) {
+            check_preparation_control(control, "chat template");
+        }
+        check_preparation_control(control, "chat template");
+        return probe.get();
+    };
     if (!continuation && options.add_generation_prompt) {
         Json probe                     = context;
         probe["add_generation_prompt"] = false;
@@ -447,12 +462,6 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
         next_turn_render = start_probe(next_turn_context(), next_turn_options);
     }
 
-    // Destroyed before the futures, whose destructors wait for their probes.
-    const struct StopProbes {
-        std::atomic<bool>& stop;
-
-        ~StopProbes() { stop.store(true, std::memory_order_relaxed); }
-    } stop_on_exit{stop_probes};
     auto output = compiled_.render(context, execution);
     auto layout = inspect_prompt_layout(output, media);
     if (continuation) {
@@ -493,7 +502,7 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
         try {
             text::TemplateOutput rendered;
             if (count == messages.size() && history_render.valid()) {
-                rendered = history_render.get();
+                rendered = await_probe(history_render);
             } else {
                 Json probe = context;
                 probe["messages"].erase(probe["messages"].begin() +
@@ -597,7 +606,7 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
     if (first_tail_assistant && layout.messages[*first_tail_assistant].closed) {
         try {
             const auto next_turn = next_turn_render.valid()
-                                       ? next_turn_render.get()
+                                       ? await_probe(next_turn_render)
                                        : compiled_.render(next_turn_context(), next_turn_options);
             const auto history_bytes = generation_begin.value_or(output.text.size());
             retain_open_turn         = same_prefix(next_turn, output, history_bytes);

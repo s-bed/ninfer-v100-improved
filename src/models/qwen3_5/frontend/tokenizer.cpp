@@ -1213,6 +1213,7 @@ public:
         for (auto at = first; at != last; ++at) {
             if (at->second->run->text == text) {
                 order_.splice(order_.begin(), order_, at->second);
+                touch_source(*at->second);
                 return at->second->run;
             }
         }
@@ -1225,10 +1226,9 @@ public:
         std::size_t common = 0;
         {
             const std::lock_guard lock(mutex_);
-            std::size_t searched = 0;
-            for (const Entry& entry : order_) {
-                const OrdinaryRun& run = *entry.run;
-                if (run.normalized.empty()) { continue; }
+            for (const Entry* entry : prefix_sources_) {
+                if (!entry) { break; }
+                const OrdinaryRun& run = *entry->run;
                 const std::size_t limit = std::min(run.normalized.size(), normalized.size());
                 const auto first =
                     std::mismatch(normalized.begin(), normalized.begin() + std::ptrdiff_t(limit),
@@ -1237,9 +1237,8 @@ public:
                 const auto shared = static_cast<std::size_t>(first - normalized.begin());
                 if (shared > common) {
                     common = shared;
-                    best   = entry.run;
+                    best   = entry->run;
                 }
-                if (++searched == kKeptRuns) { break; }
             }
         }
         if (!best || common < kWordLookaheadBytes) { return std::nullopt; }
@@ -1273,6 +1272,7 @@ public:
             // Another request encoded the same run meanwhile.
             if (at->second->run->text == run->text) {
                 order_.splice(order_.begin(), order_, at->second);
+                touch_source(*at->second);
                 return;
             }
         }
@@ -1282,6 +1282,7 @@ public:
         order_.push_front(Entry{.run = std::move(run), .hash = hash, .bytes = bytes});
         by_hash_.emplace(hash, order_.begin());
         bytes_ += bytes;
+        touch_source(order_.front());
     }
 
 private:
@@ -1293,7 +1294,20 @@ private:
 
     using Order = std::list<Entry>;
 
+    // Short exact-match entries share the byte budget, but never enter the prefix search.
+    void touch_source(const Entry& entry) {
+        if (entry.run->normalized.empty()) { return; }
+        auto at = std::find(prefix_sources_.begin(), prefix_sources_.end(), &entry);
+        if (at == prefix_sources_.end()) { at = std::prev(prefix_sources_.end()); }
+        std::move_backward(prefix_sources_.begin(), at, std::next(at));
+        prefix_sources_.front() = &entry;
+    }
+
     void drop(Order::iterator at) {
+        if (!at->run->normalized.empty()) {
+            const auto end = std::remove(prefix_sources_.begin(), prefix_sources_.end(), &*at);
+            std::fill(end, prefix_sources_.end(), nullptr);
+        }
         const auto [first, last] = by_hash_.equal_range(at->hash);
         for (auto it = first; it != last; ++it) {
             if (it->second == at) {
@@ -1307,6 +1321,7 @@ private:
 
     mutable std::mutex mutex_;
     Order order_;
+    std::array<const Entry*, kKeptRuns> prefix_sources_{};
     std::unordered_multimap<std::size_t, Order::iterator> by_hash_;
     std::size_t bytes_ = 0;
 };
