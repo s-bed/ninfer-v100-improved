@@ -12,6 +12,8 @@
 
 #include "guarded_main.h"
 #include "ninfer/engine.h"
+#include "ops/common/device_tier.h"
+#include "ops/common/v100_kernel_policy.h"
 
 #include <cuda_runtime.h>
 
@@ -33,6 +35,7 @@ struct Configuration {
     bool host_weights     = false;
     bool mtp              = false;
     bool hybrid_cache     = false;
+    bool volta_flash      = false;
     std::vector<int> devices;
 };
 
@@ -56,6 +59,11 @@ ninfer::EngineOptions engine_options(const char* artifact, const Configuration& 
     options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(4096);
     options.prefill_chunk = 512;
     options.kv_cache      = ninfer::KvCacheStorage::Int8Group64;
+    if (configuration.volta_flash) {
+        options.prefill_chunk = 2048;
+        options.kv_cache = ninfer::KvCacheStorage::BFloat16;
+        options.v100_kernels = ninfer::V100KernelPolicy::Ported;
+    }
     options.suspend.enabled         = configuration.suspend;
     options.suspend.snapshot_memory = configuration.pinned ? ninfer::SuspendSnapshotMemory::Pinned
                                                            : ninfer::SuspendSnapshotMemory::Pageable;
@@ -223,6 +231,14 @@ void run_configuration(const char* artifact, const Configuration& configuration,
         engine.generate(engine.prepare_tokens(short_prompt()), greedy(24)).generated_token_ids;
     check(short_again == expected.short_run,
           configuration.label + ": identical after an explicit resume");
+    if (configuration.volta_flash) {
+        const auto before = ninfer::ops::v100_kernel_route_counts().flash;
+        const auto long_again =
+            engine.generate(engine.prepare_tokens(long_prompt()), greedy(24)).generated_token_ids;
+        check(long_again == expected.long_run, "cold Flash prompt is identical after remapping");
+        check(ninfer::ops::v100_kernel_route_counts().flash > before,
+              "the cold prompt exercised Flash after remapping");
+    }
     check(engine.residency().resume_count == 2, "two resumes counted");
 }
 
@@ -237,6 +253,19 @@ int run() {
         ninfer::Engine engine(engine_options(artifact, configuration));
         return run_requests(engine, nullptr);
     };
+    if (std::getenv("NINFER_QWEN35_SUSPEND_V100_FLASH") != nullptr) {
+        if (!ninfer::ops::current_device_volta()) {
+            std::cout << "skip: Flash suspend coverage needs Volta\n";
+            return 77;
+        }
+        const Configuration flash{.label = "Volta Flash", .volta_flash = true};
+        const Outputs expected = reference_of(flash);
+        check(expected.long_run.size() == 24 && expected.continued_run.size() == 8 &&
+                  expected.reused_tokens > 0 && ninfer::ops::v100_kernel_route_counts().flash > 0,
+              "the Flash reference exercised a cold prompt and reused a continuation");
+        run_configuration(artifact, flash, expected);
+        return failures == 0 ? 0 : 1;
+    }
     const Outputs reference = reference_of({.label = "reference"});
     if (reference.short_run.size() != 24 || reference.long_run.size() != 24 ||
         reference.continued_run.size() != 8 || reference.reused_tokens == 0) {

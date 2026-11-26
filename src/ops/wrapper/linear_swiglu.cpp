@@ -38,6 +38,7 @@ void validate_policy(LinearPolicy policy) {
     case LinearPolicy::AllowA8:
     case LinearPolicy::AllowA4:
     case LinearPolicy::AllowA8Int:
+    case LinearPolicy::AllowNvfp4Int8:
     case LinearPolicy::AllowA8IntDecode:
     // The cuBLAS prefill route is registered only for linear_swiglu and linear_add. Everywhere else
     // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
@@ -132,7 +133,8 @@ std::size_t linear_swiglu_route_workspace_bytes(QType qtype, std::int32_t gate_u
 // it does on the other targets, unless the integer gate/up trade (AllowA8IntDecode,
 // --mlp-a8-decode) is asked for.
 LinearPolicy sm70_policy(LinearPolicy policy) {
-    return policy == LinearPolicy::AllowA8IntDecode ? policy : LinearPolicy::A16Only;
+    return policy == LinearPolicy::AllowA8IntDecode || policy == LinearPolicy::AllowNvfp4Int8
+               ? policy : LinearPolicy::A16Only;
 }
 
 } // namespace
@@ -214,7 +216,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         const auto activation = detail::sm70::prepare_for(
             x, gate_up_weight.n, ws, stream, gate_up_weight.qtype,
             detail::sm70::integer_takes(gate_up_weight, t, sm70_policy(policy)),
-            detail::sm70::ProjectionPurpose::SwiGLU,gate_up_weight.layout);
+            detail::sm70::ProjectionPurpose::SwiGLU, gate_up_weight.layout, policy);
         detail::sm70::swiglu_for(activation, gate_up_weight, nullptr, out, stream);
         return;
     }

@@ -1,3 +1,5 @@
+#include "product/v100_options.h"
+
 #include "ninfer_bench_support.h"
 #include "product/hybrid_expert_options.h"
 #include "product/rope_yarn_options.h"
@@ -336,6 +338,7 @@ std::string usage_text(std::string_view program) {
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --no-cuda-graph             use eager decode\n"
         << "  --no-prefill-a8             full prefill tiles keep their A16 routes\n"
+        << "  --v100-kernels native|ported  --nvfp4-w4a8-int (opt-in narrow Volta NVFP4)\n"
         << "  --prefill-cublas            hand wide prefill GEMMs to cuBLAS (quality trade; wants a "
            "larger --prefill-chunk)\n"
         << "  --no-prefill-cublas-projections  keep attention/GDN input projections off that route\n"
@@ -432,6 +435,10 @@ BenchOptions parse_args(int argc, char** argv) {
             options.prefill_a8 = false;
         } else if (arg == "--lookup-ngram") {
             options.speculative.lookup_ngram = parse_u32(value("--lookup-ngram"), "lookup-ngram");
+        } else if (arg == "--v100-kernels") {
+            options.v100_kernels = ninfer::product::parse_v100_kernel_policy(value("--v100-kernels"));
+        } else if (arg == "--nvfp4-w4a8-int") {
+            options.nvfp4_w4a8_int = true;
         } else if (arg == "--prefill-cublas") {
             options.prefill_cublas = true;
         } else if (arg == "--no-prefill-cublas-projections") {
@@ -477,6 +484,7 @@ BenchOptions parse_args(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
     product::apply_default_ngram_draft_tokens(options.speculative, ngram_width_explicit);
+    ninfer::product::validate_v100_options(options.v100_kernels, options.nvfp4_w4a8_int);
     product::validate_speculative_cli_options(options.speculative);
     return options;
 }
@@ -688,6 +696,8 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << "  config:     max_context=" << env.max_context
         << " rope_yarn_factor=" << env.rope_yarn_factor << " prefill_chunk=" << env.prefill_chunk
         << " fast_prefill_kernel=" << (env.fast_prefill_kernel ? "on" : "off")
+        << " v100_kernels=" << (env.v100_kernels == V100KernelPolicy::Ported ? "ported" : "native")
+        << " nvfp4_w4a8_int=" << (env.nvfp4_w4a8_int ? "on" : "off")
         << " kv_cache=" << kv_cache_name(env.kv_cache)
         << " experts=" << expert_residency_name(env.expert_residency)
         << " embedding=" << (env.embedding_residency == EmbeddingResidency::Host ? "host" : "device")
@@ -814,6 +824,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"rope_yarn_factor\": " << env.rope_yarn_factor << ",\n"
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
         << "    \"fast_prefill_kernel\": " << (env.fast_prefill_kernel ? "true" : "false") << ",\n"
+        << "    \"v100_kernels\": \"" << (env.v100_kernels == V100KernelPolicy::Ported ? "ported" : "native") << "\",\n"
+        << "    \"nvfp4_w4a8_int\": " << (env.nvfp4_w4a8_int ? "true" : "false") << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
         << "    \"expert_residency\": \"" << expert_residency_name(env.expert_residency) << "\",\n"
         << "    \"embedding_residency\": \""

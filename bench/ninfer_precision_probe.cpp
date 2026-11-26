@@ -16,6 +16,7 @@ namespace frontend = ninfer::models::qwen3_5::frontend;
 #include <iostream>
 #include <iterator>
 #include <stdexcept>
+#include <string>
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 static std::string read(const fs::path& path) {
@@ -26,11 +27,26 @@ static std::string read(const fs::path& path) {
 int main(int argc, char** argv) {
   try {
     if (argc == 2 && std::string(argv[1]) == "--help") {
+#ifdef NINFER_V100_FROZEN_QUALITY
+        std::cout << "ninfer-v100-quality-probe score|generate ARTIFACT JOBS OUT 0 CONTEXT "
+                     "int8|bf16 a16|w4a8\n";
+#else
         std::cout << "precision-probe tokenize RESOURCES JOBS OUT | score|generate|native ARTIFACT JOBS OUT [K] [CONTEXT]\n";
+#endif
         return 0;
     }
     if (argc < 5) throw std::invalid_argument("missing arguments");
     std::string mode = argv[1];
+#ifdef NINFER_V100_FROZEN_QUALITY
+    if (argc != 9 || (mode != "score" && mode != "generate") || std::string(argv[5]) != "0") {
+        throw std::invalid_argument("expected frozen quality probe settings; see --help");
+    }
+    const std::string kv = argv[7];
+    const std::string arithmetic = argv[8];
+    if ((kv != "int8" && kv != "bf16") || (arithmetic != "a16" && arithmetic != "w4a8")) {
+        throw std::invalid_argument("invalid KV format or arithmetic mode");
+    }
+#endif
     std::ifstream jobs(argv[3]);
     if (!jobs) throw std::runtime_error("jobs missing");
     std::ofstream out(argv[4], std::ios::app);
@@ -74,10 +90,27 @@ int main(int argc, char** argv) {
 #ifdef PRECISION_R5
     opts.v100_kernels=ninfer::V100KernelPolicy::Ported;
 #endif
+#ifdef NINFER_V100_FROZEN_QUALITY
+    opts.v100_kernels = ninfer::V100KernelPolicy::Ported;
+    const auto expected_kv = kv == "int8" ? ninfer::KvCacheStorage::Int8Group64
+                                         : ninfer::KvCacheStorage::BFloat16;
+    opts.kv_cache = expected_kv;
+    opts.context_cache.enabled = false;
+#ifdef NINFER_V100_QUALITY_W4A8
+    opts.nvfp4_w4a8_int = arithmetic == "w4a8";
+#else
+    if (arithmetic == "w4a8") { throw std::invalid_argument("probe lacks W4A8 support"); }
+#endif
+#endif
 #ifndef PRECISION_V100
     opts.device_profile="off";
 #endif
     ninfer::Engine engine(std::move(opts));
+#ifdef NINFER_V100_FROZEN_QUALITY
+    if (engine.memory_summary().kv_cache != expected_kv) {
+        throw std::runtime_error("actual KV format differs from the frozen quality condition");
+    }
+#endif
     while(std::getline(jobs,line)) {
       auto job=json::parse(line);
       auto started=std::chrono::steady_clock::now();

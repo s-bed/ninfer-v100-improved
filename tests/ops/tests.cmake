@@ -46,6 +46,15 @@ foreach(op IN LISTS ninfer_op_tests)
     LIBRARIES ninfer_ops)
 endforeach()
 
+if(NINFER_ARCH_VOLTA)
+  add_test(NAME ninfer_v100_gdn_recurrent_test
+    COMMAND ninfer_tests ninfer_gated_delta_net_two_stage_test --v100-recurrent)
+  add_test(NAME ninfer_v100_gdn_forced_two_stage_test
+    COMMAND ninfer_tests ninfer_gated_delta_net_two_stage_test --v100-forced-two-stage)
+  set_tests_properties(ninfer_v100_gdn_recurrent_test ninfer_v100_gdn_forced_two_stage_test
+    PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "NINFER_V100_CANDIDATES=gdn")
+endif()
+
 ninfer_add_op_test(ninfer_gguf_moe_geglu_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_moe_geglu.cpp"
   LIBRARIES ninfer_ops)
@@ -101,6 +110,12 @@ add_test(NAME ninfer_softmax_attention_int8_prompt_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --int8-prompt-only)
 add_test(NAME ninfer_softmax_attention_prompt_split_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --prompt-splits-only)
+if(NINFER_ARCH_VOLTA)
+  add_test(NAME ninfer_softmax_attention_volta_flash_test
+    COMMAND ninfer_tests ninfer_softmax_attention_test --volta-flash-only)
+  set_tests_properties(ninfer_softmax_attention_volta_flash_test PROPERTIES
+    ENVIRONMENT "NINFER_V100_CANDIDATES=flash" SKIP_RETURN_CODE 77)
+endif()
 # The pipelined small-T tier in both PV forms; the switch is read once per process.
 add_test(NAME ninfer_softmax_attention_small_t_pipelined_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --small-t-pipelined-only)

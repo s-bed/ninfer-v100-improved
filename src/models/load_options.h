@@ -33,6 +33,7 @@ struct LoadOptions {
     // See EngineOptions::prefill_cublas: hands wide prefill GEMMs to cuBLAS, a further quality
     // trade on top of prefill_a8 and therefore off unless asked for.
     bool prefill_cublas = false;
+    bool nvfp4_w4a8_int = false;
     // See EngineOptions::prefill_cublas_projections.
     bool prefill_cublas_projections = true;
     // Store the GDN recurrent state in FP16 between steps; the recurrence still computes in FP32.
@@ -140,6 +141,7 @@ struct LoadOptions {
             .mlp_a8_decode  = options.mlp_a8_decode,
             .prefill_a8     = options.prefill_a8,
             .prefill_cublas = options.prefill_cublas,
+            .nvfp4_w4a8_int = options.nvfp4_w4a8_int,
             .prefill_cublas_projections = options.prefill_cublas_projections,
             .gdn_state_fp16 = options.gdn_state_fp16,
             .vision_max_merged_tokens = options.vision_max_merged_tokens,

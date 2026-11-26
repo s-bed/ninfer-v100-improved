@@ -89,9 +89,13 @@ ninfer_add_op_test(ninfer_linear_stq_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_stq.cpp"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_v100_w4a8_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_v100_w4a8.cpp"
+  LIBRARIES ninfer_linear_test_support)
+
 ninfer_add_op_test(ninfer_v100_port_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_v100_port.cpp"
-  LIBRARIES ninfer_linear_test_support ninfer_linear_swiglu_test_support)
+  LIBRARIES ninfer_linear_test_support ninfer_linear_swiglu_test_support ninfer_model_runtime)
 
 # Qualify packed-layout native fallbacks using the same independent FP64 oracles.
 add_test(NAME ninfer_v100_native_packed_test

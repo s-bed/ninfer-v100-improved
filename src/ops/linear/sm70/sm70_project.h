@@ -51,6 +51,7 @@ enum class ProjectionPurpose { Generic, GdnInput, SwiGLU };
 struct Activation {
     ProjectionPurpose purpose = ProjectionPurpose::Generic;
     QuantLayout source_layout = QuantLayout::RowScale;
+    bool nvfp4_w4a8 = false;
     const __half* data        = nullptr;
     const __nv_bfloat16* bf16 = nullptr;
     __half* pass              = nullptr;
@@ -90,6 +91,10 @@ void project(const Activation& x, const Weight& w, std::span<const Destination> 
 void swiglu(const Activation& x, const Weight& gate, const Weight* up, Tensor& out,
             cudaStream_t stream);
 
+// Narrow NVFP4 activation quantization needs both the per-operand permission and the
+// process policy that owns the corresponding weights, workspaces and prefix state.
+[[nodiscard]] bool w4a8_allowed(LinearPolicy policy);
+
 // --- Both sm_70 routes ------------------------------------------------------------------------
 // The wide route above and the small-T one (sm70_small.h) together take every width of a dense
 // format on sm_70; the *_for functions pick the one a call's width takes.
@@ -114,7 +119,8 @@ template <class Routes>
                                      WorkspaceArena& workspace, cudaStream_t stream, QType format,
                                      bool integer = false,
                                      ProjectionPurpose purpose = ProjectionPurpose::Generic,
-                                     QuantLayout source_layout = QuantLayout::RowScale);
+                                     QuantLayout source_layout = QuantLayout::RowScale,
+                                     LinearPolicy policy = LinearPolicy::A16Only);
 // The activations of a call no wider than the small-T route's direct widths, which need no
 // workspace (callers without an arena check direct_tokens first).
 [[nodiscard]] bool direct_tokens(std::int32_t tokens);

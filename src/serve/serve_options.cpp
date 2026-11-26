@@ -1,3 +1,5 @@
+#include "product/v100_options.h"
+
 #include "serve/serve_options.h"
 #include "product/kv_resident_options.h"
 #include "product/ngram_table_options.h"
@@ -169,6 +171,7 @@ std::string serve_usage_text(const char* argv0) {
            "                                compiled-in values\n"
            "\n"
            "PRECISION & KERNELS\n"
+           "  --nvfp4-w4a8-int                narrow Volta NVFP4 integer route (requires ported)\n"
            "  --v100-kernels native|ported  native routes (default) or donor V100 kernels\n"
            "                                on sm_70; fixed until process restart\n"
            "  --fast-prefill-kernel         prefill an int8 or rk* KV cache with the fast\n"
@@ -736,14 +739,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             continue;
         }
         if (arg == "--v100-kernels") {
-            const std::string value = require_value("--v100-kernels");
-            if (value == "native") {
-                options.v100_kernels = V100KernelPolicy::Native;
-            } else if (value == "ported") {
-                options.v100_kernels = V100KernelPolicy::Ported;
-            } else {
-                throw std::invalid_argument("--v100-kernels must be native or ported");
-            }
+            options.v100_kernels = product::parse_v100_kernel_policy(require_value("--v100-kernels"));
+            continue;
+        }
+        if (arg == "--nvfp4-w4a8-int") {
+            options.nvfp4_w4a8_int = true;
             continue;
         }
         if (arg == "--device-profile") {
@@ -1870,6 +1870,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             "router mode takes its models from --models-dir / --models-preset, not an artifact "
             "path");
     }
+    ninfer::product::validate_v100_options(options.v100_kernels, options.nvfp4_w4a8_int);
     if (options.sleep_idle_seconds != 0 && !options.suspend.enabled && !options.router()) {
         throw std::invalid_argument("--sleep-idle-seconds requires --model-suspend");
     }

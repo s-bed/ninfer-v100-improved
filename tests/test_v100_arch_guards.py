@@ -20,7 +20,8 @@ def run(command: list[str]) -> str:
 
 
 def source_selection(source: Path, cmake: str) -> None:
-    manifest = source / "src/ops/linear/sm70/sources.cmake"
+    linear_manifest = source / "src/ops/linear/sm70/sources.cmake"
+    attention_manifest = source / "src/ops/softmax_attention/sources.cmake"
     for volta in (False, True):
         script = f'''
 set(NINFER_ARCH_VOLTA {"ON" if volta else "OFF"})
@@ -33,7 +34,8 @@ function(target_sources target)
 endfunction()
 function(set_source_files_properties)
 endfunction()
-include("{manifest.as_posix()}")
+include("{linear_manifest.as_posix()}")
+include("{attention_manifest.as_posix()}")
 get_property(collected GLOBAL PROPERTY collected)
 foreach(item IN LISTS collected)
   message("selected=${{item}}")
@@ -53,8 +55,13 @@ endforeach()
         assert ("v100_native_stubs.cpp" in names) is not volta, names
         assert ("v100_qpn.cu" in names) is volta, names
         assert ("v100_cutlass.cu" in names) is volta, names
+        assert ("v100_w4a8.cu" in names) is volta, names
+        assert ("v100_drafter_gemv.cu" in names) is volta, names
         assert ("v100_fp8.cu" in names) is volta, names
         assert ("v100_fp8_cutlass.cu" in names) is volta, names
+        assert ("volta_flash.cu" in names) is volta, names
+        assert ("volta_flash_bridge.cu" in names) is volta, names
+        assert "prompt_sm70.cu" in names, names
 
 
 def main() -> None:
@@ -75,13 +82,15 @@ def main() -> None:
     for name, markers in (
         ("v100_qpn.cu", (r"bool\s+v100_qpn_project\s*\([^;{}]*\)\s*\{",)),
         ("v100_cutlass.cu", (r"V100 CUTLASS GEMM failed",)),
+        ("v100_w4a8.cu", (r"void\s+w4a8_project\s*\([^;{}]*\)\s*\{",)),
+        ("v100_drafter_gemv.cu", (r"bool\s+v100_drafter_gemv_project\s*\([^;{}]*\)\s*\{",)),
         ("v100_fp8.cu", (r"bool\s+v100_fp8_project\s*\([^;{}]*\)\s*\{",
                          r"void\s+fp8_volta_qpn_gemm_kernel\s*\(")),
         ("v100_fp8_cutlass.cu", (r"V100 CUTLASS cannot implement qualified FP8 shape",)),
     ):
         path = source / "src/ops/linear/sm70" / name
-        # A 70;75 build uses one host launch implementation and separate device passes.
-        # The unsupported pass must not see definitions referring to sm_70-only leaves.
+        # The dedicated build emits real code for sm_70. An accidental expansion for
+        # another architecture must still exclude definitions referring to Volta leaves.
         unsupported = run(base + ["-DNINFER_TIER_VOLTA=1", "-D__CUDA_ARCH__=750",
                                   "-E", "-P", str(path)])
         for marker in markers:
@@ -97,7 +106,20 @@ def main() -> None:
                 for marker in markers:
                     assert re.search(marker, supported) is not None, (name, architecture, marker)
     if not args.cutlass:
-        print("NOTE: host/sm_70 expansion check skipped without a cached CUTLASS path")
+        print("NOTE: CUTLASS host/sm_70 expansion skipped without a cached CUTLASS path")
+    attention = source / "src/ops/softmax_attention/dense/causal_cache"
+    vendor = source / "third_party/llama_cpp_fattn"
+    for name, definition in (
+        ("volta_flash.cu", "volta_flash_prompt_launch"),
+        ("volta_flash_bridge.cu", "volta_flash_mma_launch"),
+    ):
+        marker = rf"\b{definition}\s*\([^;{{}}]*\)\s*\{{"
+        for architecture in (None, 700, 750, 860):
+            defines = [] if architecture is None else [f"-D__CUDA_ARCH__={architecture}"]
+            expanded = run(base + ["-I", str(vendor), "-DNINFER_TIER_VOLTA=1"] + defines +
+                           ["-E", "-P", str(attention / name)])
+            present = re.search(marker, expanded) is not None
+            assert present is (architecture in (None, 700)), (name, architecture)
     print("OK: native CMake/stub path and mixed-device pass guards")
 
 

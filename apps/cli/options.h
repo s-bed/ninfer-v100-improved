@@ -68,6 +68,8 @@ struct Options {
     bool wddm_evictable_budget = false;
     bool mlp_a8_decode  = false;
     bool prefill_a8     = true;
+    ninfer::V100KernelPolicy v100_kernels = ninfer::V100KernelPolicy::Native;
+    bool nvfp4_w4a8_int = false;
     bool prefill_cublas = false;
     bool prefill_cublas_projections = true;
 

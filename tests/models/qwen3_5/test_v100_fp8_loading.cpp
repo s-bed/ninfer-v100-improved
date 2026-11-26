@@ -48,12 +48,14 @@ struct LayoutFixture {
         file.root["bindings"]=Json::object();
         file.root["uses"]=Json::array();
     }
-    void tensor(std::string_view id,int n,int k) {
-        const auto geometry=weight_geometry(QType::FP8_E4M3FN_ROW_BF16,QuantLayout::RowScale,
+    void tensor(std::string_view id, int n, int k,
+                QType format = QType::FP8_E4M3FN_ROW_BF16,
+                QuantLayout layout = QuantLayout::RowScale) {
+        const auto geometry=weight_geometry(format,layout,
                                             std::array<std::uint64_t,2>{std::uint64_t(n),std::uint64_t(k)});
         const auto offset=(bytes+255)/256*256;
         file.root["objects"].push_back({{"id",id},{"kind","tensor"},{"shape",{n,k}},
-            {"format","fp8_e4m3fn_row_bf16"},{"layout","row_scale_v1"},
+            {"format",ar::format_name(format)},{"layout",ar::layout_name(layout)},
             {"offset",offset},{"bytes",geometry.bytes}});
         bytes=offset+geometry.bytes;
     }
@@ -61,7 +63,7 @@ struct LayoutFixture {
         file.root["bindings"][std::string(name)]={{"parts",Json::array({
             {{"object",object},{"range",{std::uint64_t(first)*k,std::uint64_t(last)*k}}}})}};
     }
-    void write(std::span<const std::byte> payload={}) {
+    std::uint64_t write(std::span<const std::byte> payload={}) {
         file.root["files"]=Json::array({{{"path",nullptr},{"payload_bytes",bytes}}});
         const std::string json=file.root.dump();
         std::array<std::byte,32> header{};
@@ -82,6 +84,7 @@ struct LayoutFixture {
             output.seekp(std::streamoff(payload_at+bytes-1));
             output.put('\0');
         }
+        return payload_at;
     }
 };
 
@@ -107,8 +110,9 @@ void define_model(LayoutFixture& f) {
     f.binding("up","mlp",5120,17408,34816);
     f.tensor("down",5120,17408);
     f.binding("down","down",17408,0,5120);
-    // A vocabulary matrix stays native even if a caller requests it directly.
     f.tensor("vocabulary",248320,5120);
+    f.binding("vocabulary","vocabulary",5120,0,248320);
+    f.binding("vocabulary_embedding","vocabulary",5120,0,248320);
     f.write();
 }
 
@@ -226,11 +230,94 @@ void cpu_selection() {
         require(plan.device_objects.size()==1 && !plan.device_objects[0].fp8_qpn,
                 "an unsupported selected request survived placement");
     }
-    {
+    for (bool tied_embedding : {false, true}) {
+        for (bool same_weight_id : {false, true}) {
+            ar::Binder binder(reader);
+            loading::Bindings b(binder);
+            auto model = bind_model(b);
+            model.text.output_head = b.parameter("vocabulary", {248320, 5120});
+            model.mtp.emplace().output_head = model.text.output_head;
+            if (tied_embedding) {
+                model.text.token_embedding = same_weight_id
+                    ? model.text.output_head : b.parameter("vocabulary_embedding", {248320, 5120});
+            }
+            loading::apply_device_layouts(b, model, volta);
+            const auto plan = std::move(binder).finish();
+            const bool expect_head = ops::kBuildVolta && !tied_embedding &&
+                ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Head);
+            require(requested(plan, reader.find("vocabulary")) == expect_head,
+                    "the complete shared text/MTP head did not honor its layout contract");
+        }
+    }
+}
+
+void cpu_drafter_panels() {
+    LayoutFixture f;
+    f.tensor("stem", 5120, 10240, QType::Q8_G32_FP16, QuantLayout::RowSplit);
+    f.tensor("proposal", 131072, 5120, QType::Q4_G64_FP16, QuantLayout::RowSplit);
+    f.binding("stem", "stem", 10240, 0, 5120);
+    f.binding("proposal", "proposal", 5120, 0, 131072);
+    f.binding("proposal_embedding_alias", "proposal", 5120, 0, 131072);
+    f.write();
+    ar::Reader reader(f.file.entry);
+    constexpr std::array volta{ops::DeviceTier::Volta};
+    const bool expect = ops::kBuildVolta &&
+                        ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Drafter);
+    for (bool tie_proposal : {false, true}) {
         ar::Binder binder(reader);
-        binder.require_device(reader.find("vocabulary"));
-        rejects([&]{binder.fp8_qpn_device(reader.find("vocabulary"));},
-                "the unqualified full vocabulary shape accepted FP8 packing");
+        loading::Bindings b(binder);
+        q::ModelWeights model;
+        model.mtp.emplace().input_projection = b.parameter("stem", {5120, 10240});
+        model.proposal.emplace().head = b.parameter("proposal", {131072, 5120});
+        model.mtp->output_head = model.proposal->head;
+        if (tie_proposal) {
+            model.text.token_embedding = b.parameter("proposal_embedding_alias", {131072, 5120});
+        }
+        loading::apply_device_layouts(b, model, volta);
+        const auto plan = std::move(binder).finish();
+        require(plan.device_objects.size() == 2, "drafter layout duplicated a device parent");
+        for (const auto& placement : plan.device_objects) {
+            const bool tied = placement.object == reader.find("proposal") && tie_proposal;
+            require(placement.panel == (expect && !tied),
+                    "drafter layout ignored its policy or a non-projection alias");
+        }
+    }
+}
+
+void cpu_dflash2_heads() {
+    LayoutFixture fixture;
+    fixture.tensor("vocabulary", 248320, 5120);
+    fixture.binding("vocabulary", "vocabulary", 5120, 0, 248320);
+    fixture.tensor("proposal", 131072, 5120, QType::Q4_G64_FP16, QuantLayout::RowSplit);
+    fixture.binding("proposal", "proposal", 5120, 0, 131072);
+    fixture.write();
+    ar::Reader reader(fixture.file.entry);
+    constexpr std::array volta{ops::DeviceTier::Volta};
+    const bool head_enabled = ops::kBuildVolta &&
+                              ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Head);
+
+    for (bool optimized : {false, true}) {
+        ar::Binder binder(reader);
+        loading::Bindings bindings(binder);
+        q::ModelWeights model;
+        model.text.output_head = bindings.parameter("vocabulary", {248320, 5120});
+        // bind_draft shares the target head; optimized loading then replaces that role.
+        model.draft.emplace().output_head = model.text.output_head;
+        if (optimized) {
+            model.proposal.emplace().head = bindings.parameter("proposal", {131072, 5120});
+            model.draft->output_head = model.proposal->head;
+        }
+        loading::apply_device_layouts(bindings, model, volta);
+        const auto plan = std::move(binder).finish();
+        require(requested(plan, reader.find("vocabulary")) == (optimized && head_enabled),
+                "DFlash2 full-head sharing changed the fused consumer's physical layout");
+        if (optimized) {
+            const auto proposal = reader.find("proposal");
+            const auto placement = std::find_if(plan.device_objects.begin(), plan.device_objects.end(),
+                [&](const auto& entry) { return entry.object == proposal; });
+            require(placement != plan.device_objects.end() && !placement->panel && !placement->fp8_qpn,
+                    "DFlash2 optimized candidate selection lost its RowSplit proposal head");
+        }
     }
 }
 
@@ -385,6 +472,114 @@ int gpu_materialization() {
     }
     return 0;
 }
+
+int gpu_head_materialization() {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || !count || !ops::current_device_volta()) {
+        return 77;
+    }
+    DeviceContext device;
+    if (!vmm::supported(device.rank(0).device)) return 77;
+    constexpr int n = 248320, k = 5120;
+    LayoutFixture f;
+    f.tensor("vocabulary", n, k);
+    f.binding("vocabulary", "vocabulary", k, 0, n);
+    const auto geometry = weight_geometry(QType::FP8_E4M3FN_ROW_BF16, QuantLayout::RowScale,
+                                          std::array<std::uint64_t, 2>{n, k});
+    const auto payload = f.write();
+    struct Point {
+        int row, column;
+        std::array<std::byte, 16> codes;
+        std::array<std::byte, 2> scale;
+    };
+    // Touch both matrix edges and every current bounded packing batch. The 4099-row stride
+    // changes position inside each 32-row tile. The sparse file stores only sampled records.
+    std::vector<int> rows{3, 31, 32, 6499, 6519, 6528, n / 2, n - 32, n - 1};
+    for (int row = 0; row < n; row += 4099) { rows.push_back(row); }
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    std::vector<Point> points;
+    {
+        std::fstream file(f.file.entry, std::ios::in | std::ios::out | std::ios::binary);
+        file.exceptions(std::ios::badbit | std::ios::failbit);
+        const auto write = [&](std::uint64_t offset, std::span<const std::byte> bytes) {
+            file.seekp(static_cast<std::streamoff>(payload + offset));
+            file.write(reinterpret_cast<const char*>(bytes.data()),
+                       static_cast<std::streamsize>(bytes.size()));
+        };
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            Point point{rows[i], int((i * 53) % (k / 16)) * 16, {},
+                        {std::byte(0x80U + i), std::byte{0x3b}}};
+            for (std::size_t j = 0; j < point.codes.size(); ++j) {
+                point.codes[j] = std::byte(1U + (17U * i + j) % 126U);
+            }
+            write(std::uint64_t(point.row) * k + point.column, point.codes);
+            write(geometry.scale_offset + std::uint64_t(point.row) * 2, point.scale);
+            points.push_back(point);
+        }
+    }
+    auto owner = std::make_shared<ar::Reader>(f.file.entry);
+    ar::Binder binder(*owner);
+    loading::Bindings bindings(binder);
+    q::ModelWeights model;
+    model.text.output_head = bindings.parameter("vocabulary", {n, k});
+    model.mtp.emplace().output_head = model.text.output_head;
+    constexpr std::array volta{ops::DeviceTier::Volta};
+    loading::apply_device_layouts(bindings, model, volta);
+    auto plan = std::move(binder).finish();
+    const auto object = owner->find("vocabulary");
+    const bool packed = ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Head);
+    require(requested(plan, object) == packed, "GPU head placement differs from its policy");
+    auto backing = ar::materialize(*owner, std::move(plan), device, nullptr, nullptr,
+        ar::MaterializeOptions{.suspendable=true, .retained_reader=owner});
+    const auto& parent = backing.device_parent(object);
+    const auto* address = parent.data;
+    const auto native = native_weight(ar::bind_view(bindings.at(model.text.output_head).reference,
+                                                   backing));
+    require(native.layout == (packed ? QuantLayout::VoltaQpnPrepacked : QuantLayout::RowScale) &&
+            native.scale_dtype == DType::BF16,
+            "the vocabulary head lost its prepared layout or BF16 scales");
+
+    const auto verify = [&] {
+        std::ifstream file(f.file.entry, std::ios::binary);
+        file.exceptions(std::ios::badbit | std::ios::failbit);
+        for (const auto& point : points) {
+            const auto stored_at = std::uint64_t(point.row) * k + point.column;
+            const auto scale_at = geometry.scale_offset + std::uint64_t(point.row) * 2;
+            const auto lane = ((point.row % 32) / 8) * 4 + (point.row % 4) +
+                              ((point.row & 4) ? 16 : 0);
+            const auto packed_at = (std::uint64_t(point.row / 32) * k / 128 +
+                                    point.column / 128) * 4096 +
+                                    std::uint64_t(point.column % 128 / 16 * 32 + lane) * 16;
+            std::array<std::byte, 16> observed{};
+            std::array<std::byte, 2> observed_scale{};
+            CUDA_CHECK(cudaMemcpy(observed.data(), address + (packed ? packed_at : stored_at),
+                                  observed.size(), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(observed_scale.data(), address + scale_at, observed_scale.size(),
+                                  cudaMemcpyDeviceToHost));
+            require(observed == point.codes && observed_scale == point.scale,
+                    "packed or restored vocabulary bytes differ from their stored values");
+            file.seekg(static_cast<std::streamoff>(payload + stored_at));
+            file.read(reinterpret_cast<char*>(observed.data()), observed.size());
+            file.seekg(static_cast<std::streamoff>(payload + scale_at));
+            file.read(reinterpret_cast<char*>(observed_scale.data()), observed_scale.size());
+            require(observed == point.codes && observed_scale == point.scale,
+                    "device packing changed the native vocabulary artifact bytes");
+        }
+    };
+    verify();
+    CUDA_CHECK(cudaMemset(const_cast<std::byte*>(address), 0xff, 16));
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    backing.release_device_backing();
+    require(!backing.device_backed(), "head suspend retained device backing");
+    backing.restore_device_backing(device);
+    require(backing.device_backed() && parent.data == address,
+            "head resume changed its prepared address");
+    const auto stats = backing.upload_device_objects_again(device);
+    require(stats.h2d_bytes >= geometry.bytes, "head resume did not reload its complete source");
+    verify();
+    return 0;
+}
 }
 
 int main(int argc,char** argv) {
@@ -396,9 +591,14 @@ int main(int argc,char** argv) {
     try {
         ops::set_v100_kernel_policy(std::string_view(argv[1])=="ported");
         cpu_selection();
+        cpu_drafter_panels();
+        cpu_dflash2_heads();
         cpu_qpn_geometry_factory();
         cpu_packed_metadata();
-        if (gpu) return gpu_materialization();
+        if (gpu) {
+            const int status = gpu_materialization();
+            return status != 0 ? status : gpu_head_materialization();
+        }
         std::cout<<"PASS FP8 model-owned complete-group selection and placement requests\n";
         return 0;
     } catch (const std::exception& error) {

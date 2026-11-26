@@ -13,6 +13,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/l2norm.h"
 #include "ninfer_bench_common.h"
+#include "ops/common/v100_kernel_policy.h"
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 
 #include <cuda_runtime.h>
@@ -57,6 +58,7 @@ struct Options {
     bool breakdown           = false;
     bool csv                 = false;
     bool help                = false;
+    bool v100_ported         = false;
     std::int32_t qk_heads    = kDefaultQkHeads;
     std::int32_t value_heads = kDefaultValueHeads;
     std::int32_t tokens      = kDefaultTokens;
@@ -140,6 +142,8 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--tokens") {
             options.tokens          = parse_integer("--tokens", take("--tokens"), 1);
             options.tokens_explicit = true;
+        } else if (arg == "--v100-ported") {
+            options.v100_ported = true;
         } else if (arg == "--sweep") {
             options.sweep = true;
         } else if (arg == "--qk-heads") {
@@ -180,6 +184,9 @@ Options parse_options(int argc, char** argv) {
     if (options.breakdown && options.mode != Mode::ChunkedOnly) {
         fail("--breakdown requires --chunked-only");
     }
+    if (options.v100_ported && options.mode != Mode::Running) {
+        fail("--v100-ported requires --running");
+    }
     if (options.qk_norm == "composed" && options.mode != Mode::BatchUpdate) {
         fail("--qk-norm composed is a batch-update comparison");
     }
@@ -199,6 +206,7 @@ void print_help(const char* program) {
         "  --batch-update     public selected-slot Gated DeltaNet update at T=1\n"
         "  --chunked-only     public pre-normalized BF16 chunked pipeline\n"
         "  --breakdown        with --chunked-only, also time prepare/state/output stages\n"
+        "  --v100-ported      use the ported Volta policy for --running\n"
         "\n"
         "Workload:\n"
         "  --tokens N         exact token extent (running/chunked default: 1024)\n"
@@ -548,16 +556,18 @@ BenchRow run_running(const Options& options, std::int32_t tokens, DeviceBuffer& 
                              ssm_out, out, launch_stream);
     };
     const GraphMeasurement measurement = measure_graph(launch, flush, stream, options);
-    const TrafficBytes traffic         = running_traffic(problem);
+    const bool recurrent = workspace_bytes == 0;
+    const TrafficBytes traffic = recurrent ? TrafficBytes{running_logical_bytes(problem), 0.0}
+                                           : running_traffic(problem);
 
-    const std::int32_t full_chunks = tokens / gated_delta_net_detail::kChunkSize;
+    const std::int32_t full_chunks = recurrent ? 0 : tokens / gated_delta_net_detail::kChunkSize;
     return {
         "running",
         "fused",
-        running_implementation(tokens),
+        recurrent ? "public.recurrent.qk_fused" : running_implementation(tokens),
         tokens,
         full_chunks,
-        tokens % gated_delta_net_detail::kChunkSize,
+        tokens - full_chunks * gated_delta_net_detail::kChunkSize,
         workspace_bytes,
         measurement.graph_nodes,
         running_logical_bytes(problem),
@@ -888,6 +898,8 @@ int main(int argc, char** argv) {
         }
         cudaDeviceProp device{};
         CUDA_CHECK(cudaGetDeviceProperties(&device, 0));
+        ops::validate_v100_kernel_architecture(options.v100_ported, 10 * device.major + device.minor);
+        if (options.v100_ported) ops::set_v100_kernel_policy(true);
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         DeviceBuffer flush(options.flush_bytes);
         print_banner(options, device);

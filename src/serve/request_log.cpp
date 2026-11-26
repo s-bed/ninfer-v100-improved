@@ -793,6 +793,8 @@ std::string format_server_start_json(
         {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
         {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
         {"max_concurrency", engine_options.max_concurrency},
+        {"v100_kernels", engine_options.v100_kernels == V100KernelPolicy::Ported ? "ported" : "native"},
+        {"nvfp4_w4a8_int", engine_options.nvfp4_w4a8_int},
         {"max_pending_requests", engine_options.max_pending_requests},
         {"pending_timeout_ms", engine_options.pending_timeout_ms},
         {"prefill_chunk", engine_options.prefill_chunk},

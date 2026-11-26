@@ -1,3 +1,5 @@
+#include "product/v100_options.h"
+
 #include "options.h"
 #include "product/kv_resident_options.h"
 #include "product/ngram_table_options.h"
@@ -258,6 +260,7 @@ std::string usage_text(const char* argv0) {
            "  --no-prefill-a8               return full prefill tiles to their A16 routes,\n"
            "                                which is how the integer routes are measured on\n"
            "                                a whole request\n"
+           "  --v100-kernels native|ported  --nvfp4-w4a8-int (opt-in narrow Volta NVFP4)\n"
            "  --prefill-cublas              hand wide prefill GEMMs to cuBLAS: a large\n"
            "                                prefill speedup for a small perplexity cost;\n"
            "                                wants a larger --prefill-chunk\n"
@@ -493,6 +496,10 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--mtp-attention-window") {
             options.speculative.mtp_attention_window =
                 parse_u32(value(arg), "mtp-attention-window", true);
+        } else if (arg == "--v100-kernels") {
+            options.v100_kernels = ninfer::product::parse_v100_kernel_policy(value("--v100-kernels"));
+        } else if (arg == "--nvfp4-w4a8-int") {
+            options.nvfp4_w4a8_int = true;
         } else if (arg == "--prefill-cublas") {
             options.prefill_cublas = true;
         } else if (arg == "--no-prefill-cublas-projections") {
@@ -690,6 +697,7 @@ Options parse_options(int argc, char** argv) {
         options.reasoning_loop != ninfer::ReasoningLoopAction::Off) {
         throw std::invalid_argument("--reasoning-loop cannot be combined with --no-thinking");
     }
+    ninfer::product::validate_v100_options(options.v100_kernels, options.nvfp4_w4a8_int);
     if (options.greedy) {
         options.sampling.temperature = 0.0F;
         if (options.post_thinking_sampling) { options.post_thinking_sampling->temperature = 0.0F; }

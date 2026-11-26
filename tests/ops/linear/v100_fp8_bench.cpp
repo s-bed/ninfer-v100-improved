@@ -127,9 +127,8 @@ void benchmark_shape(std::string_view mode, int n, int k, const std::vector<int>
     host.payload.clear();
     host.payload.shrink_to_fit();
     for (const int tokens : widths) {
-        // The full head is a narrow-only qualification; never query/reserve its
-        // multi-GiB full FP16 wide-weight scratch just to benchmark decode.
-        if (n==248320 && tokens>32) continue;
+        // Keep the vocabulary-head measurement focused on decode and its first fallback.
+        if (n==248320 && tokens>65) continue;
         std::vector<std::uint16_t> values(std::size_t(k)*tokens);
         for (std::size_t i=0; i<values.size(); ++i) {
             const float value = float(int((i*17+13)%127)-63) / 1024.0F;
@@ -226,7 +225,7 @@ int main(int argc,char** argv) {
             benchmark_shape(record_mode,5120,6144,options.widths,options.packed);
             benchmark_shape(record_mode,34816,5120,options.widths,options.packed);
             benchmark_shape(record_mode,5120,17408,options.widths,options.packed);
-            if(!options.packed)benchmark_shape(record_mode,248320,5120,options.widths,false);
+            benchmark_shape(record_mode,248320,5120,options.widths,options.packed);
         }
         return 0;
     } catch (const std::exception& e) {

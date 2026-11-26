@@ -305,6 +305,7 @@ void validate_policy(LinearPolicy policy) {
     // The split Q4/Q5 pair has an integer-activation route; the single-parent forms decline it
     // below, where no such route is registered for their qtypes.
     case LinearPolicy::AllowA8Int:
+    case LinearPolicy::AllowNvfp4Int8:
     case LinearPolicy::AllowA8IntDecode:
     // The cuBLAS prefill route is registered only for linear_swiglu and linear_add. Everywhere else
     // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
@@ -337,7 +338,7 @@ void sm70_project_gdn(const Tensor& x, const Weight& first, const Weight* second
             ? QType::NVFP4 : first.qtype;
     const auto activation = detail::sm70::prepare_for(
         x, std::max(first.n, second != nullptr ? second->n : 0), workspace, stream,
-        preparation_format, integer, detail::sm70::ProjectionPurpose::GdnInput,first.layout);
+        preparation_format, integer, detail::sm70::ProjectionPurpose::GdnInput, first.layout, policy);
     auto* qkv_plane             = static_cast<__nv_bfloat16*>(qkv.data);
     auto* z_plane               = static_cast<__nv_bfloat16*>(z.data);
     const std::int32_t qkv_rows = qkv.ne[0];
@@ -432,6 +433,11 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj");
         if (weight.n != kRows || weight.k != kHidden) {
             throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported weight shape");
+        }
+        if (detail::sm70::w4a8_allowed(policy) && workspace != nullptr &&
+            detail::sm70::covers(weight, cols)) {
+            sm70_project_gdn(x, weight, nullptr, qkv, z, policy, *workspace, stream);
+            return;
         }
         detail::nvfp4_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
         return;
@@ -591,10 +597,11 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                             "gdn_input_proj_conv_snapshot", "value");
         require_conv_tensor(z, kZRows, geometry.width, geometry.batch,
                             "gdn_input_proj_conv_snapshot", "z");
-        const detail::Nvfp4GdnConvPlan plan =
-            detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch);
-        if (geometry.batch > 1) {
-            if (plan.schedule != detail::Nvfp4GdnConvScheduleId::Materialized) {
+        const bool w4a8 = detail::sm70::w4a8_allowed(policy);
+        if (w4a8 || geometry.batch > 1) {
+            const auto plan = w4a8 ? detail::Nvfp4GdnConvScheduleId::Materialized
+                : detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch).schedule;
+            if (plan != detail::Nvfp4GdnConvScheduleId::Materialized) {
                 throw std::logic_error("batched NVFP4 GDN conv selected a fused schedule");
             }
             compose_batched_snapshot(x, conv_weight, conv_states, valid_columns,
@@ -759,9 +766,10 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         require_record_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                                   conv_record, query, key, value, z, workspace);
 
-        const detail::Nvfp4GdnConvPlan plan =
-            detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch);
-        if (plan.schedule == detail::Nvfp4GdnConvScheduleId::Materialized && geometry.batch > 1) {
+        const bool w4a8 = detail::sm70::w4a8_allowed(policy);
+        const auto schedule = w4a8 ? detail::Nvfp4GdnConvScheduleId::Materialized
+            : detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch).schedule;
+        if (w4a8 || (schedule == detail::Nvfp4GdnConvScheduleId::Materialized && geometry.batch > 1)) {
             compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                            conv_record, query, key, value, z, geometry, workspace, stream,
                            [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
@@ -770,7 +778,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                            });
             return;
         }
-        if (plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) {
+        if (schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) {
             detail::nvfp4_gdn_record_small_t_launch(x, weight, conv_weight, conv_states,
                                                     valid_columns, initial_state_slots, conv_record,
                                                     query, key, value, z, stream);
@@ -1087,6 +1095,10 @@ std::size_t single_parent_route_bytes(QType parent_qtype, std::int32_t parent_ro
             input_rows != detail::Nvfp4N16384K5120::kInputRows) {
             throw std::invalid_argument("gdn_input_proj workspace: unsupported NVFP4 profile");
         }
+        if (detail::sm70::w4a8_allowed(policy)) {
+            return detail::sm70::covered_bytes(parent_qtype, parent_rows, input_rows, min_tokens,
+                                               max_tokens, policy);
+        }
         return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16) {
@@ -1208,6 +1220,11 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         throw std::invalid_argument(
             "gdn_input_proj_conv_snapshot workspace: unsupported single-parent profile");
     }
+    if (detail::sm70::w4a8_allowed(policy)) {
+        const auto projection = gdn_input_proj_workspace_capacity_bytes(
+            parent_qtype, parent_rows, input_rows, policy, batch_size * min_width, batch_size * max_width);
+        return composed_snapshot_capacity(10240, batch_size * max_width, projection);
+    }
     if (batch_size == 1) {
         return detail::nvfp4_gdn_snapshot_workspace_capacity_bytes(policy, min_width, max_width);
     }
@@ -1313,6 +1330,10 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
         input_rows != detail::Nvfp4N16384K5120::kInputRows) {
         throw std::invalid_argument(
             "gdn_input_proj_conv_record workspace: unsupported single-parent profile");
+    }
+    if (detail::sm70::w4a8_allowed(policy)) {
+        return gdn_input_proj_workspace_capacity_bytes(parent_qtype, parent_rows, input_rows,
+                                                       policy, batch_size * min_width, batch_size * max_width);
     }
     const detail::Nvfp4GdnConvPlan minimum_plan =
         detail::nvfp4_gdn_conv_resolve_plan(policy, min_width, batch_size);

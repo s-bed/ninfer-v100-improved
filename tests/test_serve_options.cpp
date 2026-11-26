@@ -35,6 +35,10 @@ int main() {
     failures += check(parse({"ninfer-serve", "model.ninfer"}).v100_kernels ==
                           ninfer::V100KernelPolicy::Native,
                       "v100 kernels must default to native");
+    const auto w4a8 = parse({"ninfer-serve", "model.ninfer", "--v100-kernels", "ported", "--nvfp4-w4a8-int"});
+    failures += check(w4a8.nvfp4_w4a8_int && make_engine_options(w4a8).nvfp4_w4a8_int &&
+                          !parse({"ninfer-serve", "model.ninfer"}).nvfp4_w4a8_int,
+                      "W4A8 opt-in must reach EngineOptions");
     for (const auto* name : {"native", "ported"}) {
         const auto selected = parse({"ninfer-serve", "model.ninfer", "--v100-kernels", name});
         const auto expected = std::string_view(name) == "ported"

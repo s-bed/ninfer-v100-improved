@@ -18,8 +18,13 @@ bool unpacked(const MtpProjectionParameters& parameters) {
     return parameters.rows && parameters.packed.weight.qdata == nullptr;
 }
 
-bool gguf_rows(const MtpProjectionParameters& parameters) {
-    return parameters.rows && is_gguf((*parameters.rows)[1].weight.qtype);
+bool independent_kv_rows(const MtpProjectionParameters& parameters) {
+    if (!parameters.rows) { return false; }
+    const auto& key = (*parameters.rows)[1].weight;
+    const auto& value = (*parameters.rows)[3].weight;
+    // The fused Q8 pair reads stored row order. Other supported layouts and formats use Linear.
+    return key.qtype != QType::Q8_G32_FP16 || value.qtype != QType::Q8_G32_FP16 ||
+           key.layout != QuantLayout::RowSplit || value.layout != QuantLayout::RowSplit;
 }
 
 std::size_t row_bytes(const MtpProjectionParameters& parameters, std::size_t index,
@@ -53,7 +58,7 @@ std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parame
 std::size_t mtp_kv_workspace_bytes(const MtpProjectionParameters& parameters,
                                    const AttentionConfig& config, std::int32_t first,
                                    std::int32_t last) {
-    if (gguf_rows(parameters)) {
+    if (independent_kv_rows(parameters)) {
         return std::max(row_bytes(parameters, 1, first, last), row_bytes(parameters, 3, first, last));
     }
     if (parameters.rows) {
@@ -121,7 +126,7 @@ void mtp_projection(const Tensor& hidden, const MtpProjectionParameters& paramet
 void mtp_kv_projection(const Tensor& hidden, const MtpProjectionParameters& parameters,
                        const AttentionConfig& config, Tensor& key, Tensor& value,
                        WorkspaceArena& workspace, cudaStream_t stream) {
-    if (gguf_rows(parameters)) {
+    if (independent_kv_rows(parameters)) {
         const auto& k = (*parameters.rows)[1];
         const auto& v = (*parameters.rows)[3];
         {

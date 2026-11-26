@@ -5,6 +5,14 @@ It uses the artifact's tokenizer, Text model, selected Main KV representation, f
 and main output head. It is an offline evaluator, not a serving endpoint or a logits-export API.
 Only Text weights and resources are loaded; Vision and speculative components are not required.
 
+## Volta arithmetic
+
+On a Tesla V100, `--v100-kernels native|ported` selects the startup policy. Native is the
+default. With `ported`, `--nvfp4-w4a8-int` enables group-32 activation quantization for
+eligible narrow NVFP4 projections. KV storage is chosen independently with `--kv-dtype`.
+The Engine logs the selected policy at startup and route counts at shutdown.
+[V100 qualification and controls](../bench/v100/QUALIFICATION.md)
+
 ## Run the fixed corpus
 
 The repository includes `ninfer-ppl-1m-v1`, a fixed set of 16 independent UTF-8 streams covering

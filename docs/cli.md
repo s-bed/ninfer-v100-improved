@@ -354,6 +354,14 @@ generated token IDs in diagnostics.
 
 Run `./build/apps/ninfer --help` for the exact option contract.
 
+## Volta arithmetic
+
+On a Tesla V100, `--v100-kernels native|ported` selects the startup policy. Native is the
+default. With `ported`, `--nvfp4-w4a8-int` enables group-32 activation quantization for
+eligible narrow NVFP4 projections. KV storage is chosen independently with `--kv-dtype`.
+The Engine logs the selected policy at startup and route counts at shutdown.
+[V100 qualification and controls](../bench/v100/QUALIFICATION.md)
+
 ## CUDA synchronization
 
 `NINFER_CUDA_SYNC` selects the CUDA device synchronization schedule at startup for both the CLI

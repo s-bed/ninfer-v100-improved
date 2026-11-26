@@ -45,9 +45,9 @@ qw::PackedWeight broad_fp8_weight(int n,int k,std::uint32_t seed) {
 std::vector<lt::Invocation> calls(bool head=false) {
     std::vector<lt::Invocation> result;
     for (int t : {1,2,3,4,5,6,8,16,32,33,64,65,128,512,513})
-        if (!head || t<=32) result.push_back({t});
+        if (!head || t<=65) result.push_back({t});
     for (int t : {3,6,32,33,65,513})
-        if (!head || t<=32)
+        if (!head || t<=33)
             result.push_back({t,lt::CallForm::Policy,ops::LinearPolicy::A16Only,true});
     return result;
 }
@@ -65,6 +65,8 @@ int route_scratch_contracts() {
         {34816,5120,8,Purpose::Generic},
         {14336,5120,33,Purpose::Generic},
         {248320,5120,1,Purpose::Generic},
+        {248320,5120,32,Purpose::Generic},
+        {248320,5120,33,Purpose::Generic},
         {16384,5120,1,Purpose::GdnInput},
         {16384,5120,8,Purpose::GdnInput},
         {16384,5120,32,Purpose::GdnInput},
@@ -90,7 +92,9 @@ int route_scratch_contracts() {
             QType::FP8_E4M3FN_ROW_BF16,c.n,c.k,c.t,c.t,c.purpose);
         const bool shape=(c.k==5120 && (c.n==16384 || c.n==14336 || c.n==34816)) ||
                          (c.n==5120 && (c.k==6144 || c.k==17408));
-        const bool reachable=(shape && c.t<=32) ||
+        const bool head = c.n == 248320 && c.k == 5120 &&
+                          ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Head);
+        const bool reachable=((shape || head) && c.t<=32) ||
             (c.purpose==Purpose::GdnInput && c.n==16384 && c.k==5120 && c.t>=33 && c.t<=4096);
         const bool expected=reachable && ops::v100_ported_kernels_enabled();
         if ((bytes!=0)!=expected || interval!=bytes) {
@@ -125,10 +129,10 @@ int plain_projections(bool packed=false) {
     for (auto [n,k] : {std::pair{16384,5120},std::pair{14336,5120},
                        std::pair{5120,6144},std::pair{34816,5120},
                        std::pair{5120,17408},std::pair{248320,5120}}) {
-        if (packed && n==248320) continue; // Production eligibility excludes the head.
         const auto invocations=calls(n==248320);
         lt::ShapeCase shape{n,k,3601U,lt::Comparison::SampledRows,true,invocations};
         shape.v100_prepack=packed;
+        const auto shape_before = ops::v100_kernel_route_counts();
         failures+=lt::run_shape("V100 FP8 BF16",lt::ActivationCompute::A16,broad_fp8_weight,shape);
         shape.out=DType::FP32;
         failures+=lt::run_shape("V100 FP8 FP32",lt::ActivationCompute::A16,
@@ -141,6 +145,12 @@ int plain_projections(bool packed=false) {
             shape.activation_signs=lt::ActivationSigns::CenteredWideRange;
             failures+=lt::run_shape("V100 FP8 head FP32 outlier",lt::ActivationCompute::A16,
                                     broad_fp8_weight,shape);
+            const auto after = ops::v100_kernel_route_counts();
+            if ((after.ported != shape_before.ported) !=
+                (packed && ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Head))) {
+                std::cerr << "FP8 vocabulary head selected an unexpected route\n";
+                ++failures;
+            }
         }
         if (n!=248320) failures+=lt::verify_workspace_envelopes(
             QType::FP8_E4M3FN_ROW_BF16,n,k);

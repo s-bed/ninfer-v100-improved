@@ -71,6 +71,28 @@ public:
 #endif
     }
 
+    // Native preparation requires a complete FP8/NVFP4 parent, including for a selected TP piece.
+    // W4A8 consumes NVFP4 code planes directly and does not read GGUF input gathers.
+    void nvfp4_route(ops::LinearPolicy& policy, const Weight& weight) const {
+        if (model_.options().nvfp4_w4a8_int && weight.qtype == QType::NVFP4 &&
+            weight.k % 64 == 0 && weight.input_columns == nullptr &&
+            (policy == ops::LinearPolicy::A16Only || policy == ops::LinearPolicy::AllowA4)) {
+            policy = ops::LinearPolicy::AllowNvfp4Int8;
+        }
+    }
+
+    void nvfp4_route(LinearParameters& p) const { nvfp4_route(p.policy, p.weight); }
+
+    void nvfp4_route(ops::ProjectionWeights& projection) const {
+        if (auto* single = std::get_if<ops::SingleProjectionWeight>(&projection)) {
+            nvfp4_route(*single);
+        } else if (auto* parts = std::get_if<ops::PartProjectionWeights>(&projection)) {
+            // The part projection passes the same allowance to each Linear call. Only the
+            // NVFP4 operands use its quantization. The paired form is Q4/Q5 or T2 only.
+            for (const auto& part : parts->parts) { nvfp4_route(parts->policy, part.weight); }
+        }
+    }
+
     LinearParameters linear(WeightId id) const {
         return with_context(model_.weight(id).name,
                             [&] { return ops::prepare_linear_weight(model_.input(id)); });
@@ -145,6 +167,9 @@ public:
                     out.up      = ops::prepare_linear_weight(up);
                 }
                 out.down                  = rotated_linear(w.down);
+                nvfp4_route(out.gate_up);
+                if (out.up) { nvfp4_route(out.gate_up.policy, out.up->weight); }
+                nvfp4_route(out.down);
                 out.verify_gate_up_policy = out.gate_up.policy;
                 return out;
             });
@@ -152,6 +177,8 @@ public:
         DenseParameters out{with_context(model_.weight(w.gate).name,
                                          [&] { return ops::prepare_linear_swiglu_weight(gate, up); }),
                             rotated_linear(w.down)};
+        nvfp4_route(out.gate_up);
+        nvfp4_route(out.down);
         integer_route(out.gate_up, QType::Q4_G64_FP16, 34816, 5120);
         // The Q4 down projection (Q4 imatrix recipes) reaches the same A8 add route as Q5.
         integer_route(out.down, QType::Q4_G64_FP16, 5120, 17408);
@@ -292,6 +319,8 @@ public:
             ops::ProjectionWeights attention_projection = ops::prepare_attn_input_proj_weights(
                 model_.rotated_input(a->query), model_.rotated_input(a->key),
                 model_.rotated_input(a->gate), model_.rotated_input(a->value));
+            nvfp4_route(attention_output);
+            nvfp4_route(attention_projection);
             integer_route_pair(attention_projection, QType::Q4_G64_FP16, 7168, QType::Q5_G64_FP16,
                                7168, 5120);
             integer_route_pair(attention_projection, QType::T2_G128_FP16, 7168, QType::T2_G128_FP16,
@@ -309,6 +338,8 @@ public:
             ops::ProjectionWeights gdn_projection = ops::prepare_gdn_input_proj_weights(
                 model_.rotated_input(g.query), model_.rotated_input(g.key),
                 model_.rotated_input(g.value), model_.rotated_input(g.z));
+            nvfp4_route(gdn_output);
+            nvfp4_route(gdn_projection);
             integer_route_pair(gdn_projection, QType::Q4_G64_FP16, 4096, QType::Q5_G64_FP16, 12288,
                                5120);
             integer_route_pair(gdn_projection, QType::T2_G128_FP16, 4096, QType::T2_G128_FP16,
@@ -337,15 +368,18 @@ public:
         out.ffn                 = ffn(w.ffn);
         if (w.attention) {
             const AttentionWeights& a = *w.attention;
-            out.mixer                 = AttentionParameters{
+            AttentionParameters parameters{
                 ops::prepare_attn_input_proj_weights(
                     model_.rotated_input(a.query), model_.rotated_input(a.key),
                     model_.rotated_input(a.gate), model_.rotated_input(a.value)),
                 tensor(a.query_norm), tensor(a.key_norm), rotated_linear(a.output)};
+            nvfp4_route(parameters.projection);
+            nvfp4_route(parameters.output);
+            out.mixer = std::move(parameters);
         }
         if (w.gdn) {
             const GdnWeights& g = *w.gdn;
-            out.mixer           = GdnParameters{
+            GdnParameters parameters{
                 ops::prepare_gdn_input_proj_weights(model_.rotated_input(g.query),
                                                     model_.rotated_input(g.key),
                                                     model_.rotated_input(g.value),
@@ -357,6 +391,9 @@ public:
                 tensor(g.convolution),
                 tensor(g.norm),
                 rotated_linear(g.output)};
+            nvfp4_route(parameters.projection);
+            nvfp4_route(parameters.output);
+            out.mixer = std::move(parameters);
         }
         return out;
     }
@@ -401,15 +438,20 @@ public:
         }
         if (packable) {
             out.projection.packed = ops::prepare_linear_weight(inputs);
+            nvfp4_route(out.projection.packed);
         }
         if (model_.config().text.architecture == Architecture::Qwen3_5) {
             out.projection.rows = {linear(a.query), linear(a.key), linear(a.gate), linear(a.value)};
+            for (auto& row : *out.projection.rows) { nvfp4_route(row); }
         }
         out.query_norm  = tensor(a.query_norm);
         out.key_norm    = tensor(a.key_norm);
         out.output      = linear(a.output);
         out.ffn         = ffn(w.layer.ffn);
         out.output_head = head(w.output_head_use);
+        nvfp4_route(out.input_projection);
+        nvfp4_route(out.output);
+        nvfp4_route(out.output_head);
         return out;
     }
 
@@ -528,6 +570,7 @@ Parameters::Parameters(const Model& source) : model(source) {
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
     text.output_head     = prepare.head(w.text.output_head_use);
+    prepare.nvfp4_route(text.output_head);
     if (text.token_embedding.qtype == QType::T2_G128_FP16) {
         // A ternary checkpoint stores its token table rotated by the same hidden-width signs as
         // every 5120-wide input, the output head's among them; the table has no Use of its own.
@@ -577,6 +620,7 @@ Parameters::Parameters(const Model& source) : model(source) {
     if (w.proposal) {
         proposal =
             ProposalParameters{prepare.head(w.proposal->head), std::nullopt, w.proposal->rows};
+        if (w.mtp) { prepare.nvfp4_route(proposal->head); }
         if (w.proposal->token_ids) { proposal->token_ids = prepare.tensor(*w.proposal->token_ids); }
     }
 }

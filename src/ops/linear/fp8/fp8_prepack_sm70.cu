@@ -2,6 +2,7 @@
 #include "ops/linear/fp8/fp8_format.h"
 #include "core/arena.h"
 #include "core/device.h"
+#include <algorithm>
 #include <stdexcept>
 namespace ninfer::ops::detail {
 namespace {
@@ -19,17 +20,32 @@ bool fp8_qpn_prepack_eligible(const WeightGeometry& g) noexcept {
     return g.format==QType::FP8_E4M3FN_ROW_BF16 && g.layout==QuantLayout::RowScale &&
         g.shape.size()==2 && ((g.shape[0]==16384 && g.shape[1]==5120) ||
         (g.shape[0]==14336 && g.shape[1]==5120) || (g.shape[0]==5120 && g.shape[1]==6144) ||
-        (g.shape[0]==34816 && g.shape[1]==5120) || (g.shape[0]==5120 && g.shape[1]==17408));
+        (g.shape[0]==34816 && g.shape[1]==5120) || (g.shape[0]==5120 && g.shape[1]==17408) ||
+        fp8_qpn_head_shape(g.shape[0], g.shape[1]));
 }
 void fp8_prepack_qpn_sm70(Weight& w,cudaStream_t stream) {
     if(w.layout!=QuantLayout::RowScale || w.n%32 || w.k%128)
         throw std::invalid_argument("FP8 QPN prepack requires native N32 K128 parent");
-    const auto g=validate_fp8_weight(w,"FP8 QPN prepack");
-    DeviceBuffer scratch(std::size_t(g.code_plane_bytes));
-    const std::int64_t tuples=std::int64_t(w.n)*w.k/16;
-    prepack<<<unsigned((tuples+255)/256),256,0,stream>>>(static_cast<const std::uint8_t*>(w.qdata),static_cast<std::uint8_t*>(scratch.p),w.n,w.k);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaMemcpyAsync(const_cast<void*>(w.qdata),scratch.p,std::size_t(g.code_plane_bytes),cudaMemcpyDeviceToDevice,stream));
+    validate_fp8_weight(w,"FP8 QPN prepack");
+    // Each complete 32-row panel is independent. Bound scratch even when the vocabulary
+    // plane exceeds 1 GiB, and reuse it in stream order across batches of panels.
+    constexpr std::size_t scratch_limit = 32 * 1024 * 1024;
+    const std::size_t panel_bytes = std::size_t(w.k) * 32;
+    const int panels = w.n / 32;
+    const int batch = static_cast<int>(std::min<std::size_t>(
+        panels, std::max<std::size_t>(1, scratch_limit / panel_bytes)));
+    DeviceBuffer scratch(panel_bytes * batch);
+    auto* codes = static_cast<std::uint8_t*>(const_cast<void*>(w.qdata));
+    for (int first = 0; first < panels; first += batch) {
+        const int count = std::min(batch, panels - first);
+        const std::size_t bytes = panel_bytes * count;
+        const std::size_t tuples = bytes / 16;
+        auto* source = codes + std::size_t(first) * panel_bytes;
+        prepack<<<unsigned((tuples + 255) / 256), 256, 0, stream>>>(
+            source, static_cast<std::uint8_t*>(scratch.p), count * 32, w.k);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpyAsync(source, scratch.p, bytes, cudaMemcpyDeviceToDevice, stream));
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     w.layout=QuantLayout::VoltaQpnPrepacked;
 }

@@ -65,6 +65,10 @@ ninfer::EngineOptions hybrid_options(const char* artifact, ninfer::SpeculativeBa
                                      std::uint32_t kv_tokens, std::size_t host_bytes,
                                      std::uint32_t device_slots) {
     ninfer::EngineOptions options;
+    if (const char* policy = std::getenv("NINFER_HYBRID_V100_POLICY")) {
+        if (std::string_view(policy) == "ported") options.v100_kernels = ninfer::V100KernelPolicy::Ported;
+        else if (std::string_view(policy) != "native") throw std::invalid_argument("invalid NINFER_HYBRID_V100_POLICY");
+    }
     options.artifact_path        = artifact;
     options.max_context          = 4096;
     options.kv_capacity          = ninfer::KvCapacityPolicy::explicit_capacity(kv_tokens);

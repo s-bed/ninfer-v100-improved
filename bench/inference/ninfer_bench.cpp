@@ -160,6 +160,8 @@ int main(int argc, char** argv) {
         engine_options.speculative           = options.speculative;
         engine_options.use_cuda_graph        = options.use_cuda_graph;
         engine_options.prefill_a8            = options.prefill_a8;
+        engine_options.v100_kernels = options.v100_kernels;
+        engine_options.nvfp4_w4a8_int = options.nvfp4_w4a8_int;
         engine_options.prefill_cublas        = options.prefill_cublas;
         engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
         engine_options.expert_residency      = options.expert_residency;
@@ -176,6 +178,8 @@ int main(int argc, char** argv) {
         env.embedding_residency      = options.embedding_residency;
         env.fast_prefill_kernel      = options.fast_prefill_kernel;
         env.kv_cache                 = options.kv_cache;
+        env.v100_kernels             = options.v100_kernels;
+        env.nvfp4_w4a8_int           = options.nvfp4_w4a8_int;
         env.speculative              = options.speculative;
         env.use_cuda_graph           = options.use_cuda_graph;
         env.repetitions              = options.repetitions;

@@ -1,7 +1,9 @@
 #include "ops/common/v100_kernel_policy.h"
+#include "artifact/permute_row_split.h"
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
+#include "models/qwen3_5/execution/mtp.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/linear_add.h"
 #include "ops/op_tester.h"
@@ -17,9 +19,102 @@
 #include <string>
 #include <iostream>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace {
+int drafter_kv_panels() {
+    using namespace ninfer;
+    namespace qwen = models::qwen3_5;
+    namespace lt = test::linear;
+    constexpr int rows = 1024, k = 5120, width = 4;
+    constexpr std::array samples{0, 1, 31, 32, rows - 1, rows, rows + 1,
+                                 rows + 31, rows + 32, 2 * rows - 1};
+    auto host = lt::make_q8_g32_fp16_weight(2 * rows, k, 3729U);
+    DeviceBuffer weight_bytes(host.payload.size());
+    weight_bytes.copy_from_host(host.payload.data(), weight_bytes.bytes);
+    const WeightGeometry geometry = weight_geometry(
+        QType::Q8_G32_FP16, QuantLayout::RowSplit, std::array<std::uint64_t, 2>{2 * rows, k});
+    auto* payload = static_cast<std::byte*>(weight_bytes.p);
+    artifact::permute_row_split_to_panel(geometry, payload, nullptr);
+    WeightParent parent{geometry, payload, 1.0F};
+    parent.geometry.layout = QuantLayout::RowSplitPanel;
+    qwen::execution::MtpProjectionParameters parameters;
+    auto& parts = parameters.rows.emplace();
+    constexpr std::uint64_t elements = rows * k;
+    parts[1].weight = native_weight(WeightView{{rows, k}, {{&parent, 0, elements}}});
+    parts[3].weight = native_weight(WeightView{{rows, k}, {{&parent, elements, 2 * elements}}});
+
+    std::vector<std::uint16_t> x_bits(k * width);
+    std::vector<float> represented_x(x_bits.size());
+    for (std::size_t i = 0; i < x_bits.size(); ++i) {
+        x_bits[i] = test::f32_to_bf16(float(int((i * 13 + 9) % 47) - 23) / 64.0F);
+        represented_x[i] = test::bf16_to_f32(x_bits[i]);
+    }
+    DeviceBuffer x(x_bits.size() * 2), key(rows * width * 2), value(rows * width * 2);
+    x.copy_from_host(x_bits.data(), x.bytes);
+    Tensor input(x.p, DType::BF16, {k, width});
+    Tensor key_out(key.p, DType::BF16, {rows, width});
+    Tensor value_out(value.p, DType::BF16, {rows, width});
+    const qwen::AttentionConfig config{};
+    const auto capacity = qwen::execution::mtp_kv_workspace_bytes(parameters, config, 1, width);
+    WorkspaceArena workspace(std::max<std::size_t>(1, capacity));
+    qwen::execution::mtp_kv_projection(input, parameters, config, key_out, value_out, workspace,
+                                      nullptr);
+    const auto represented_w = test::quantized_weight::materialize_rows_fp32(host, samples);
+    std::vector<double> expected(samples.size() * width), actual(expected.size());
+    lt::cpu_linear_gemm_fp64(represented_w.data(), represented_x.data(), expected.data(),
+                            static_cast<int>(samples.size()), k, width);
+    const auto keys = test::from_device<std::uint16_t>(key, rows * width);
+    const auto values = test::from_device<std::uint16_t>(value, rows * width);
+    for (int token = 0; token < width; ++token) {
+        for (std::size_t i = 0; i < samples.size(); ++i) {
+            const int row = samples[i];
+            actual[std::size_t(token) * samples.size() + i] = test::bf16_to_f32(
+                row < rows ? keys[token * rows + row] : values[token * rows + row - rows]);
+        }
+    }
+    return test::verify_reduction("Volta MTP panel K/V", actual, expected,
+                                  {1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0});
+}
+
+int drafter_gemv() {
+    using namespace ninfer;
+    namespace lt = test::linear;
+    namespace st = test::linear_swiglu;
+    const bool enabled = ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Drafter);
+    constexpr lt::Invocation widths[] = {
+        {1}, {2}, {3}, {4}, {4, lt::CallForm::Policy, ops::LinearPolicy::A16Only, true}};
+    constexpr lt::Invocation fallback[] = {{5}};
+    int failures = 0;
+    for (bool panel : {false, true}) {
+        for (auto [n, k, generator] : {
+                 std::tuple{34816, 5120, &lt::make_q8_g32_fp16_weight},
+                 std::tuple{131072, 5120, &lt::make_q4_g64_fp16_weight}}) {
+            lt::ShapeCase cases{n, k, 3713U, lt::Comparison::SampledRows, true, widths};
+            cases.panel = panel;
+            cases.activation_signs = lt::ActivationSigns::CenteredWideRange;
+            const auto before = ops::v100_kernel_route_counts();
+            failures += lt::run_shape("Volta drafter GEMV", lt::ActivationCompute::A16,
+                                      generator, cases);
+            const auto after = ops::v100_kernel_route_counts();
+            if ((after.ported != before.ported) != enabled) ++failures;
+            cases.invocations = fallback;
+            failures += lt::run_shape("Volta drafter GEMV fallback", lt::ActivationCompute::A16,
+                                      generator, cases);
+            if (ops::v100_kernel_route_counts().ported != after.ported) ++failures;
+        }
+    }
+    constexpr int swiglu_widths[] = {1, 2, 3, 4, 5};
+    constexpr int graphs[] = {4, 5};
+    for (const auto format : {QType::Q4_G64_FP16, QType::Q8_G32_FP16}) {
+        failures += st::run_profile("Volta drafter GEMV SwiGLU",
+                                   {format, 34816, 5120, 17408, 3271U,
+                                    st::ActivationCompute::A16}, swiglu_widths, graphs);
+    }
+    return failures;
+}
+
 ninfer::test::quantized_weight::PackedWeight stacked(int n,int k,std::uint32_t seed) {
     auto p=ninfer::test::linear::make_nvfp4_weight(n,k,seed);
     p.payload.resize(p.weight_divisor_offset+8);
@@ -297,6 +392,8 @@ int main(int argc,char** argv) {
         ops::set_v100_kernel_policy(!native_packed);
         constexpr std::array<lt::Invocation,26> cases{{{1},{2},{3},{4},{5},{6},{7},{8},{9},{15},{16},{17},{31},{32},{33},{48},{63},{64},{65},{128},{256},{511},{512},{513},{4,lt::CallForm::Policy,ops::LinearPolicy::A16Only,true},{1,lt::CallForm::A16Convenience}}};
         int failures=down_staging_contract()+nan_propagation()+residual_output()+split_swiglu_outliers();
+        failures += drafter_gemv();
+        failures += drafter_kv_panels();
         failures+=lt::verify_workspace_envelopes(QType::NVFP4,34816,5120);
         failures+=lt::verify_workspace_envelopes(QType::NVFP4,5120,17408);
         for (bool packed : {false,true}) {

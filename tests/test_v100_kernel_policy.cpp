@@ -7,6 +7,7 @@
 int main(int argc, char** argv) {
     using namespace ninfer::ops;
     const bool ported = argc < 2 || std::string(argv[1]) != "native";
+    const bool w4a8 = argc > 1 && std::string(argv[1]) == "w4a8";
     int failures = 0;
     const auto check = [&](bool condition, const char* message) {
         if (!condition) {
@@ -14,6 +15,12 @@ int main(int argc, char** argv) {
             std::cerr << message << '\n';
         }
     };
+    if (argc > 1 && std::string(argv[1]) == "bad-mask") {
+        try { set_v100_kernel_policy(true); }
+        catch (const std::invalid_argument&) { return 0; }
+        std::cerr << "malformed candidate mask was accepted\n";
+        return 1;
+    }
     check(!v100_ported_kernels_enabled(), "default policy is not native");
     check(v100_kernel_cache_identity(false).empty(), "native changed the vendor cache identity");
     check(!v100_kernel_cache_identity(true).empty(), "ported policy shares native cache identity");
@@ -28,8 +35,29 @@ int main(int argc, char** argv) {
         catch (const std::invalid_argument&) { rejected = true; }
         check(rejected == (capability != 70), "ported architecture admission is incorrect");
     }
-    set_v100_kernel_policy(ported);
-    set_v100_kernel_policy(ported);
+    check(v100_kernel_cache_identity(true, true) != v100_kernel_cache_identity(true, false),
+          "W4A8 and A16 share persisted state");
+    bool invalid = false;
+    try { set_v100_kernel_policy(false, true); }
+    catch (const std::invalid_argument&) { invalid = true; }
+    check(invalid, "W4A8 accepted native execution");
+    set_v100_kernel_policy(ported, w4a8);
+    set_v100_kernel_policy(ported, w4a8);
+    check(v100_w4a8_enabled() == w4a8, "W4A8 option lost");
+    if (argc > 1 && std::string(argv[1]) == "flash-head") {
+        check(v100_candidate_route_enabled(V100CandidateRoute::Head) &&
+                  v100_candidate_route_enabled(V100CandidateRoute::Flash) &&
+                  !v100_candidate_route_enabled(V100CandidateRoute::Drafter) &&
+                  !v100_candidate_route_enabled(V100CandidateRoute::Gdn) &&
+                  v100_kernel_cache_identity(true).ends_with("-9"),
+              "partial route mask and cache identity disagree");
+    }
+    if (ported) {
+        bool immutable = false;
+        try { set_v100_kernel_policy(true, !w4a8); }
+        catch (const std::invalid_argument&) { immutable = true; }
+        check(immutable, "arithmetic changed after cache identity was fixed");
+    }
     check(v100_ported_kernels_enabled() == ported, "selected policy was not installed");
     record_v100_kernel_route(true);
     record_v100_kernel_route(true);

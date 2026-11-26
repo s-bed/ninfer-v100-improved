@@ -71,6 +71,8 @@ int main() {
     engine_options.device                                          = options.device;
     engine_options.max_context                                     = options.max_context;
     engine_options.max_concurrency                                 = 2;
+    engine_options.v100_kernels = ninfer::V100KernelPolicy::Ported;
+    engine_options.nvfp4_w4a8_int = true;
     engine_options.max_pending_requests                            = options.max_pending_requests;
     engine_options.pending_timeout_ms                              = options.pending_timeout_ms;
     engine_options.prefill_chunk                                   = options.prefill_chunk;
@@ -191,6 +193,9 @@ int main() {
                       "server thinking budget missing");
     failures += check(server.at("server").at("reasoning_loop") == "conclude",
                       "server reasoning-loop guard missing");
+    failures += check(server.at("engine").at("v100_kernels") == "ported" &&
+                      server.at("engine").at("nvfp4_w4a8_int") == true,
+                      "server_start lost the requested Volta arithmetic");
     failures += check(server.at("engine").at("kv_cache") == "fp8-e4m3-row256", "KV type missing");
     options.kv_cache        = ninfer::KvCacheStorage::Nvfp4Group16;
     engine_options.kv_cache = options.kv_cache;

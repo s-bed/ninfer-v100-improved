@@ -375,17 +375,18 @@ public:
                 ops::validate_v100_kernel_architecture(true, device.rank(rank).compute_capability());
             }
         }
-        ops::set_v100_kernel_policy(ported);
+        ops::set_v100_kernel_policy(ported, options.nvfp4_w4a8_int);
         runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                                     "v100 kernels: %s (host route selections include graph capture)",
                                     ported ? "ported" : "native");
         if (ported) {
             runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                "v100 route policy | qualified NVFP4: QPN T<=63, FP16 split MLP and "
-                "packed down staging T<=32, "
-                "CUTLASS T64..2047, native wide fallback | qualified FP8: packed FP16 QPN "
-                "T<=32, raw fused MLP T<=8, GDN CUTLASS T33..4096, native fallbacks | "
-                "head/embedding stay native");
+                "V100 candidate routes | head=%d drafter=%d gdn=%d flash=%d nvfp4-w4a8-int=%d",
+                ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Head),
+                ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Drafter),
+                ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Gdn),
+                ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Flash),
+                options.nvfp4_w4a8_int);
         }
         report_gpu_clock_floor(options, clock_floor);
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
@@ -509,9 +510,13 @@ public:
         const auto routes = ops::v100_kernel_route_counts();
         runtime::publish_diagnostic(
             options.diagnostic_observer, DiagnosticLevel::Info,
-            "v100 kernel route selections: ported=%llu fallback=%llu (graph replays not counted)",
+            "v100 kernel route selections: ported=%llu fallback=%llu head=%llu drafter=%llu gdn=%llu "
+            "flash=%llu w4a8_narrow=%llu w4a8_wide=%llu (graph replays not counted)",
             static_cast<unsigned long long>(routes.ported),
-            static_cast<unsigned long long>(routes.fallback));
+            static_cast<unsigned long long>(routes.fallback), static_cast<unsigned long long>(routes.head),
+            static_cast<unsigned long long>(routes.drafter), static_cast<unsigned long long>(routes.gdn),
+            static_cast<unsigned long long>(routes.flash), static_cast<unsigned long long>(routes.w4a8_narrow),
+            static_cast<unsigned long long>(routes.w4a8_wide));
     }
 
     void stop() noexcept {

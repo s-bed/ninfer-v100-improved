@@ -3,6 +3,7 @@
 #include "ops/common/v100_kernel_policy.h"
 #include "ops/common/math.cuh"
 #include "ops/linear/sm70/sm70_epilogue.cuh"
+#include "ops/linear/fp8/fp8_prepack_sm70.h"
 #include "ops/linear/fp8/fp8_prepack_sm70.cuh"
 #include "ops/linear/sm70/v100_fp8_qpn.cuh"
 #include <cuda_fp8.h>
@@ -16,7 +17,8 @@ bool packed_shape(int rows,int k,int tokens) {
     return tokens>=1 && tokens<=kQpnColumns &&
         ((rows==16384 && k==5120) || (rows==14336 && k==5120) ||
          (rows==5120 && k==6144) || (rows==34816 && k==5120) ||
-         (rows==5120 && k==17408));
+         (rows==5120 && k==17408) ||
+         (fp8_qpn_head_shape(rows, k) && v100_candidate_route_enabled(V100CandidateRoute::Head)));
 }
 bool raw_swiglu(int rows,int k,int tokens,ProjectionPurpose purpose) {
     return purpose==ProjectionPurpose::SwiGLU && rows==34816 && k==5120 && tokens>=1 && tokens<=8;
@@ -130,7 +132,9 @@ bool v100_fp8_project(const Activation& x,const Weight& w,std::span<const Destin
     if(destinations.empty()||destinations.size()>kMaxDestinations)return false;
     if(v100_fp8_cutlass_project(x,w,destinations,stream)){record_v100_kernel_route(true);return true;}
     if(!eligible(x,w) || w.layout!=QuantLayout::VoltaQpnPrepacked || !x.qpn_f16 || !packed_shape(w.n,w.k,x.tokens))return false;
-    project_qpn(x,w,destinations,stream);record_v100_kernel_route(true);return true;
+    project_qpn(x,w,destinations,stream);
+    if(w.n==248320 && w.k==5120) record_v100_selection(V100ObservedRoute::Head);
+    record_v100_kernel_route(true);return true;
 }
 bool v100_fp8_swiglu(const Activation& x,const Weight& gate,const Weight* up,Tensor& out,cudaStream_t stream) {
     const bool packed=gate.layout==QuantLayout::VoltaQpnPrepacked && x.qpn_f16 && packed_shape(gate.n,gate.k,x.tokens);

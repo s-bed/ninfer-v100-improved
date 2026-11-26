@@ -19,6 +19,17 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/sliding_window/launch.cu"
 )
 
+if(NINFER_ARCH_VOLTA)
+  set(_ninfer_volta_attention_dir "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache")
+  target_sources(ninfer_volta_kernels PRIVATE
+    "${_ninfer_volta_attention_dir}/volta_flash.cu"
+    "${_ninfer_volta_attention_dir}/volta_flash_bridge.cu")
+  set_source_files_properties("${_ninfer_volta_attention_dir}/volta_flash_bridge.cu"
+    TARGET_DIRECTORY ninfer_volta_kernels
+    PROPERTIES INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/llama_cpp_fattn"
+    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda;-diag-suppress=940>")
+endif()
+
 # The INT8-family small-T partial launch, one unit per query width, geometry and input. These units
 # carry more than half of the release's device code; Windows kernel-DLL builds link them into the
 # kernel DLL (src/ops/CMakeLists.txt) so that no PE image passes what the Windows loader maps. There

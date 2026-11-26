@@ -1,9 +1,12 @@
 #include "core/arena.h"
+#include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/common/device_route.h"
+#include "ops/common/device_tier.h"
+#include "ops/common/v100_kernel_policy.h"
 #include "ops/kv_cache/d256_profile.h"
 #include "ops/kv_cache_e8_root_host.h"
 #include "ops/kv_cache_lloyd4_oracle.h"
@@ -3283,7 +3286,7 @@ int run_batch_case(const Geometry& geometry, const CachePlan& plan, const BatchA
 }
 
 int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
-                   const BatchAttentionCase& test_case) {
+                   const BatchAttentionCase& test_case, bool expect_native_prompt = false) {
     validate_batch_case(test_case);
     const std::int32_t batch = static_cast<std::int32_t>(test_case.contexts.size());
 
@@ -3416,7 +3419,8 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
         verify_positions(label + " table rows unchanged", dtable_rows, test_case.table_rows);
     failures += dout.verify_guards((label + " output").c_str());
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
-    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+    const std::size_t expected_peak = expect_native_prompt ? 0 : workspace_bytes;
+    if (workspace.used() != 0 || workspace.peak_used() != expected_peak) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
     }
@@ -4826,6 +4830,199 @@ int run_softmax_attention_dflash2_tests() {
     failures += run_case_allowing_arch_skip("causal_softmax_attention DFlash2 verification",
                                             [] { return run_dflash2_cases(); });
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " causal_softmax_attention DFlash2\n";
+    return failures == 0 ? 0 : 1;
+}
+
+namespace {
+
+int run_concurrent_volta_flash_cases() {
+    constexpr int width = 1024;
+    constexpr auto storage = KvCacheStorage::BFloat16;
+    const Geometry& geometry = kGeometries[1];
+    const std::size_t q_elements = std::size_t(kHeadDim) * geometry.q_heads * width;
+    const std::size_t kv_elements = std::size_t(kHeadDim) * geometry.kv_heads * width;
+    const ops::CausalAttentionExecutionEnvelope exact{width, width};
+    const auto scratch_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
+        op_geometry(geometry), storage, exact, 1, width, width);
+    HostCache initial = make_cache(geometry, storage, width, 23906u);
+    std::fill(initial.k_bf16.begin(), initial.k_bf16.end(), 0);
+    std::fill(initial.v_fp16.begin(), initial.v_fp16.end(), 0);
+
+    DeviceContext append_device, read_device;
+    DeviceCache append_cache(initial, MappingPattern::Fragmented);
+    std::fill(initial.v_fp16.begin(), initial.v_fp16.end(), 0x4848u);
+    DeviceCache read_cache(initial, MappingPattern::Offset);
+    GuardedDeviceBuffer append_scratch(scratch_bytes), read_scratch(scratch_bytes);
+    WorkspaceArena append_arena({append_scratch.data(), append_scratch.bytes()});
+    WorkspaceArena read_arena({read_scratch.data(), read_scratch.bytes()});
+    GuardedDeviceBuffer append_q(q_elements * sizeof(std::uint16_t)), read_q(append_q.bytes());
+    GuardedDeviceBuffer key(kv_elements * sizeof(std::uint16_t)), value(key.bytes());
+    GuardedDeviceBuffer append_pos(width * sizeof(std::int32_t)), read_pos(append_pos.bytes());
+    GuardedDeviceBuffer append_output(append_q.bytes()), read_output(read_q.bytes());
+    GuardedDeviceBuffer table_row(sizeof(std::int32_t));
+    append_q.fill();
+    read_q.fill();
+    key.fill();
+    value.fill(0x3e);
+    table_row.fill();
+    std::vector<std::int32_t> positions(width);
+    std::iota(positions.begin(), positions.end(), 0);
+    append_pos.copy_from_host(positions.data(), append_pos.bytes());
+    read_pos.copy_from_host(positions.data(), read_pos.bytes());
+
+    Tensor aq(append_q.data(), DType::BF16, {kHeadDim, geometry.q_heads, width});
+    Tensor rq(read_q.data(), DType::BF16, {kHeadDim, geometry.q_heads, width});
+    Tensor k(key.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width});
+    Tensor v(value.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width});
+    Tensor ap(append_pos.data(), DType::I32, {width});
+    Tensor rp(read_pos.data(), DType::I32, {width});
+    Tensor row(table_row.data(), DType::I32, {1});
+    Tensor ao(append_output.data(), DType::BF16, {kHeadDim, geometry.q_heads, width});
+    Tensor ro(read_output.data(), DType::BF16, {kHeadDim, geometry.q_heads, width});
+
+    // Each live execution owns its stream, pages, and workspace. The first call appends an
+    // in-range plane while the read uses a BF16 plane needing the graph-safe native fallback.
+    ops::causal_softmax_attention(aq, k, v, ap, Tensor{}, row, op_geometry(geometry),
+                                  kAttentionScale, append_cache.batch_view(), exact, append_arena,
+                                  ao, append_device.stream);
+    ops::causal_softmax_attention_cached(rq, rp, op_geometry(geometry), kAttentionScale,
+                                         read_cache.view(), exact, read_arena, ro,
+                                         read_device.stream);
+    cuda_synchronize();
+    const auto verify_uniform = [&](const GuardedDeviceBuffer& output, std::uint16_t expected,
+                                    const char* label) {
+        const auto bits = copy_from_guarded<std::uint16_t>(output, q_elements);
+        if (std::all_of(bits.begin(), bits.end(), [expected](auto item) { return item == expected; })) {
+            return 0;
+        }
+        std::cerr << label << ": output differs from the uniform BF16 oracle\n";
+        return 1;
+    };
+    int failures = verify_uniform(append_output, 0x3e3eu, "concurrent Flash append");
+    failures += verify_uniform(read_output, 0x4848u, "concurrent native-range read");
+    append_output.fill();
+    ops::causal_softmax_attention_cached(aq, ap, op_geometry(geometry), kAttentionScale,
+                                         append_cache.view(), exact, append_arena, ao,
+                                         append_device.stream);
+    cuda_synchronize();
+    failures += verify_uniform(append_output, 0x3e3eu, "read after concurrent append");
+    failures += append_scratch.verify_guards("concurrent append workspace");
+    failures += read_scratch.verify_guards("concurrent read workspace");
+    return failures;
+}
+
+int run_volta_flash_boundaries() {
+    constexpr std::uint32_t cap = 200000;
+    constexpr int threshold = 1024;
+    const Geometry& geometry = kGeometries[1];
+    const int pages = (cap + 1 + kPagedKVPageSize - 1) / kPagedKVPageSize;
+    const std::size_t plane_bytes = std::size_t(pages) * kPagedKVPageSize * kHeadDim *
+                                    geometry.kv_heads * sizeof(std::uint16_t);
+    const std::size_t query_column = std::size_t(kHeadDim) * geometry.q_heads;
+    GuardedDeviceBuffer k(plane_bytes), v(plane_bytes);
+    GuardedDeviceBuffer q(query_column * threshold * sizeof(std::uint16_t));
+    GuardedDeviceBuffer out(q.bytes());
+    GuardedDeviceBuffer table(std::size_t(pages) * sizeof(std::int32_t));
+    GuardedDeviceBuffer positions(std::size_t(threshold) * sizeof(std::int32_t));
+    // Zero Q/K make attention the uniform mean. All V bits hold the same finite nonzero BF16
+    // value, using a repeated byte so the fixture can fill large device planes directly.
+    constexpr std::uint16_t value = 0x3e3e;
+    k.fill();
+    q.fill();
+    v.fill(0x3e);
+    std::vector<std::int32_t> indices(pages);
+    std::iota(indices.begin(), indices.end(), 0);
+    table.copy_from_host(indices.data(), table.bytes());
+    PagedKVLayerView cache;
+    cache.head_dim = kHeadDim;
+    cache.num_kv_heads = geometry.kv_heads;
+    cache.storage = KvCacheStorage::BFloat16;
+    cache.k_pages = Tensor(k.data(), DType::BF16,
+                           {kHeadDim, kPagedKVPageSize, geometry.kv_heads, pages});
+    cache.v_pages = Tensor(v.data(), DType::BF16,
+                           {kHeadDim, kPagedKVPageSize, geometry.kv_heads, pages});
+    cache.block_table = Tensor(table.data(), DType::I32, {pages});
+    // Startup can hold a broad envelope whose largest eligible exact call is at the cap.
+    const ops::CausalAttentionExecutionEnvelope planned{1, cap + 128};
+    const auto scratch_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
+        op_geometry(geometry), cache.storage, planned, 1, threshold, threshold);
+    if (scratch_bytes == 0) {
+        std::cerr << "Volta flash prompt did not reserve space for an exact legal call\n";
+        return 1;
+    }
+    GuardedDeviceBuffer scratch(scratch_bytes);
+    struct Boundary { std::uint32_t keys; int width; bool flash; };
+    const Boundary boundaries[] = {
+        {threshold - 1, threshold - 1, false},
+        {cap - 1, threshold, true},
+        {cap, threshold, true},
+        {cap + 1, threshold, false},
+    };
+    int failures = 0;
+    for (const auto& boundary : boundaries) {
+        const std::string label = "Volta flash boundary at T=" +
+                                  std::to_string(boundary.width) + " keys=" +
+                                  std::to_string(boundary.keys);
+        std::vector<std::int32_t> query_positions(boundary.width);
+        std::iota(query_positions.begin(), query_positions.end(),
+                  int(boundary.keys) - boundary.width);
+        positions.copy_from_host(query_positions.data(),
+                                 query_positions.size() * sizeof(std::int32_t));
+        out.fill();
+        const Tensor query(q.data(), DType::BF16, {kHeadDim, geometry.q_heads, boundary.width});
+        const Tensor pos(positions.data(), DType::I32, {boundary.width});
+        Tensor output(out.data(), DType::BF16, {kHeadDim, geometry.q_heads, boundary.width});
+        const ops::CausalAttentionExecutionEnvelope exact{boundary.keys, boundary.keys};
+        const auto exact_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
+            op_geometry(geometry), cache.storage, exact, 1, boundary.width, boundary.width);
+        WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+        ops::causal_softmax_attention_cached(query, pos, op_geometry(geometry), kAttentionScale,
+                                             cache, exact, workspace, output, nullptr);
+        cuda_synchronize();
+        const auto bits = copy_from_guarded<std::uint16_t>(out, query_column * boundary.width);
+        if (!std::all_of(bits.begin(), bits.end(), [](auto item) { return item == value; })) {
+            std::cerr << label << ": output differs from the uniform causal attention mean\n";
+            ++failures;
+        }
+        const auto expected_bytes = boundary.flash ? scratch_bytes : 0;
+        if (exact_bytes != expected_bytes || workspace.used() != 0 ||
+            workspace.peak_used() != expected_bytes) {
+            std::cerr << label << ": workspace query/execution mismatch\n";
+            ++failures;
+        }
+    }
+    return failures + scratch.verify_guards("Volta flash cap scratch") +
+           out.verify_guards("Volta flash cap output");
+}
+
+} // namespace
+
+int run_softmax_attention_volta_flash_tests() {
+    if (cuda_unavailable() || !ops::current_device_volta()) {
+        std::cout << "SKIP: Volta flash tests require a usable Volta device and image\n";
+        return 77;
+    }
+    ops::set_v100_kernel_policy(true);
+    if (!ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Flash)) {
+        throw std::logic_error("Volta flash candidate is disabled");
+    }
+    constexpr KvCacheStorage storage = KvCacheStorage::BFloat16;
+    int failures = run_a1_case(kGeometries[0], storage, {1024, 63, 1087, 23901u},
+                               MappingPattern::Fragmented);
+    failures += run_a3_case(kGeometries[1], storage, {1025, 129, 1154, 23902u, false, true},
+                            MappingPattern::Offset);
+    AttentionCase out_of_range{1024, 31, 1055, 23903u, false, true, 131072.0f};
+    out_of_range.key_beyond_fp16 = true;
+    failures += run_a1_case(kGeometries[1], storage, out_of_range, MappingPattern::Identity);
+    // The exact envelopes reach the wide route while the live-prefix mask keeps the paged path.
+    failures += run_batch_case(kGeometries[1], storage,
+                               {1024, {1024}, {73}, {1}, MappingPattern::Fragmented, 23904u},
+                               true);
+    failures += run_batch_case(kGeometries[1], storage,
+                               {1024, {1024}, {0}, {0}, MappingPattern::Offset, 23905u}, true);
+    failures += run_concurrent_volta_flash_cases();
+    failures += run_volta_flash_boundaries();
+    std::cout << (failures == 0 ? "PASS" : "FAIL") << " Volta flash prompt\n";
     return failures == 0 ? 0 : 1;
 }
 

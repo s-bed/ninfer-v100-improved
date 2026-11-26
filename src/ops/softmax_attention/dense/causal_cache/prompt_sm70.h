@@ -29,7 +29,8 @@ namespace ninfer::ops::detail {
 // The cached form: K/V are already in the pages of `cache`.
 void causal_attention_prompt_sm70_launch(const Tensor& q, const Tensor& positions, float scale,
                                          const PagedKVLayerView& cache, Tensor& out,
-                                         cudaStream_t stream);
+                                         cudaStream_t stream,
+                                         const std::uint32_t* required = nullptr);
 
 // One row of a batched view (after its K/V were appended): `table_rows[0]` selects its table, and
 // a non-null `valid_columns` limits the queries to its first valid_columns[0] columns (the rest
@@ -37,6 +38,7 @@ void causal_attention_prompt_sm70_launch(const Tensor& q, const Tensor& position
 void causal_attention_prompt_sm70_launch(const Tensor& q, const Tensor& positions,
                                          const Tensor& valid_columns, const Tensor& table_rows,
                                          float scale, const PagedKVBatchLayerView& cache,
-                                         Tensor& out, cudaStream_t stream);
+                                         Tensor& out, cudaStream_t stream,
+                                         const std::uint32_t* required = nullptr);
 
 } // namespace ninfer::ops::detail

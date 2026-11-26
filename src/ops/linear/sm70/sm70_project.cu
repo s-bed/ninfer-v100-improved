@@ -2,7 +2,9 @@
 
 #include "core/device.h"
 #include "ops/common/v100_kernel_policy.h"
+#include "ops/linear/sm70/v100_drafter_gemv.h"
 #include "ops/linear/sm70/v100_qpn.h"
+#include "ops/linear/sm70/v100_w4a8.h"
 #include "ops/linear/sm70/v100_fp8.h"
 #include "core/layout.h"
 #include "ops/common/math.cuh"
@@ -166,9 +168,19 @@ bool covers(const Weight& w, std::int32_t tokens) {
     return enabled() && tokens >= 1 && covered_format(w.qtype, w.k) && dequantizable(w);
 }
 
+bool w4a8_allowed(LinearPolicy policy) {
+    return policy == LinearPolicy::AllowNvfp4Int8 && v100_w4a8_enabled() && enabled();
+}
+
 std::size_t covered_bytes(QType format, std::int32_t max_rows, std::int32_t k,
                           std::int32_t min_tokens, std::int32_t max_tokens, LinearPolicy policy,
                           ProjectionPurpose purpose) {
+    if (format == QType::NVFP4 && w4a8_allowed(policy)) {
+        const auto narrow = std::min(max_tokens, cublas_min_tokens() - 1);
+        const auto codes = narrow >= min_tokens ? w4a8_workspace_bytes(k, narrow) : 0;
+        const auto wide = takes(max_tokens) ? workspace_bytes(max_rows, k, max_tokens) : 0;
+        return std::max(codes, wide);
+    }
     std::size_t bytes = 0;
     if (small_takes(min_tokens)) {
         bytes = small_workspace_bytes(k, std::min(max_tokens, cublas_min_tokens() - 1));
@@ -184,7 +196,14 @@ std::size_t covered_bytes(QType format, std::int32_t max_rows, std::int32_t k,
 
 Activation prepare_for(const Tensor& x, std::int32_t max_rows, WorkspaceArena& workspace,
                        cudaStream_t stream, QType format, bool integer, ProjectionPurpose purpose,
-                       QuantLayout source_layout) {
+                       QuantLayout source_layout, LinearPolicy policy) {
+    if (format == QType::NVFP4 && w4a8_allowed(policy)) {
+        auto out = takes(x.ne[1]) ? prepare(x, max_rows, workspace, stream)
+                                  : w4a8_prepare(x, workspace, stream);
+        out.nvfp4_w4a8 = true;
+        out.max_rows = max_rows;
+        return out;
+    }
     if (takes(x.ne[1])) {
         auto out = prepare(x,max_rows,workspace,stream);
         out.purpose = purpose;
@@ -236,6 +255,14 @@ void project_direct_chunks(const Tensor& input,const Weight& w,
 
 void project_for(const Activation& x, const Weight& w, std::span<const Destination> destinations,
                  cudaStream_t stream) {
+    if (v100_drafter_gemv_project(x, w, destinations, stream)) return;
+    if (x.nvfp4_w4a8) {
+        record_v100_selection(x.codes ? V100ObservedRoute::W4A8Narrow : V100ObservedRoute::W4A8Wide);
+        if (x.codes != nullptr) { w4a8_project(x, w, destinations, stream); }
+        else { project(x, w, destinations, stream); }
+        record_v100_kernel_route(true);
+        return;
+    }
     if (v100_fp8_project(x,w,destinations,stream)) return;
     if (v100_qpn_project(x,w,destinations,stream)) return;
     record_v100_kernel_route(false);
@@ -250,6 +277,14 @@ void project_for(const Activation& x, const Weight& w, std::span<const Destinati
 
 void swiglu_for(const Activation& x, const Weight& gate, const Weight* up, Tensor& out,
                 cudaStream_t stream) {
+    if (v100_drafter_gemv_swiglu(x, gate, up, out, stream)) return;
+    if (x.nvfp4_w4a8) {
+        record_v100_selection(x.codes ? V100ObservedRoute::W4A8Narrow : V100ObservedRoute::W4A8Wide);
+        if (x.codes != nullptr) { w4a8_swiglu(x, gate, up, out, stream); }
+        else { swiglu(x, gate, up, out, stream); }
+        record_v100_kernel_route(true);
+        return;
+    }
     if (v100_fp8_swiglu(x,gate,up,out,stream)) return;
     if (v100_qpn_swiglu(x,gate,up,out,stream)) return;
     record_v100_kernel_route(false);
