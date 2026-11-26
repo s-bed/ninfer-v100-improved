@@ -116,7 +116,7 @@ __device__ __forceinline__ void accumulate_row(const Activation& x, const Weight
         for (int c = 0; c < Columns; ++c) {
             if (token + c >= x.tokens) { break; }
             const auto offset = static_cast<std::size_t>(token + c) * w.k + g * 16;
-            const float scale = x.code_scales[offset / 32];
+            const float scale = x.w4a8_scales[offset / 32];
             if (scale < 0.0F) {
                 float partial = 0.0F;
                 #pragma unroll
@@ -126,7 +126,7 @@ __device__ __forceinline__ void accumulate_row(const Activation& x, const Weight
                 }
                 sum[c] += partial;
             } else {
-                const int4 bytes = *reinterpret_cast<const int4*>(x.codes + offset);
+                const int4 bytes = *reinterpret_cast<const int4*>(x.w4a8_codes + offset);
                 int dot = __dp4a(bytes.x, packed[0], 0);
                 dot = __dp4a(bytes.y, packed[1], dot);
                 dot = __dp4a(bytes.z, packed[2], dot);
@@ -174,13 +174,17 @@ __global__ void multiply(Activation x, Weight gate, Weight up, RowFactor up_fact
     }
 }
 
+bool w4a8_eligible_weight(const Activation& x, const Weight& w) {
+    return x.w4a8_codes != nullptr && x.w4a8_scales != nullptr && x.bf16 != nullptr &&
+           x.tokens >= 1 && x.tokens <= kW4A8MaxTokens && w.qtype == QType::NVFP4 &&
+           w.k == x.k && w.n > 0 && w.qdata != nullptr && w.scales != nullptr &&
+           (w.layout == QuantLayout::VoltaQpnPrepacked ||
+            w.layout == QuantLayout::BlockScaleK16M128x4);
+}
+
 template <bool Fused>
 void launch(const Activation& x, const Weight& w, const Weight& up, int up_first, int rows,
             DestinationEpilogue epilogue, __nv_bfloat16* output, cudaStream_t stream) {
-    if (w.qtype != QType::NVFP4 || up.qtype != w.qtype || up.layout != w.layout ||
-        (w.layout != QuantLayout::VoltaQpnPrepacked && w.layout != QuantLayout::BlockScaleK16M128x4)) {
-        throw std::invalid_argument("Volta W4A8 requires matching NVFP4 weight planes");
-    }
     const RowFactor factor = row_factor(up);
     const auto issue = [&]<int Columns, bool Packed>() {
         multiply<Columns, Packed, Fused><<<dim3((rows + kWarps-1)/kWarps, (x.tokens + Columns-1)/Columns),
@@ -208,8 +212,10 @@ std::size_t w4a8_workspace_bytes(int k, int tokens) {
 
 Activation w4a8_prepare(const Tensor& x, WorkspaceArena& workspace, cudaStream_t stream) {
     Activation a;
-    if (x.dtype != DType::BF16 || !x.is_contiguous() || x.ne[0] % 64 || x.ne[2]!=1 || x.ne[3]!=1) {
-        throw std::invalid_argument("Volta W4A8 needs a contiguous BF16 matrix with K divisible by 64");
+    if (x.dtype != DType::BF16 || x.data == nullptr || !x.is_contiguous() || x.ne[0] <= 0 ||
+        x.ne[0] % 64 || x.ne[1] < 1 || x.ne[1] > kW4A8MaxTokens || x.ne[2] != 1 || x.ne[3] != 1) {
+        throw std::invalid_argument(
+            "Volta W4A8 needs a contiguous BF16 [K, 1..4] matrix with K divisible by 64");
     }
     a.bf16 = static_cast<const __nv_bfloat16*>(x.data);
     a.tokens = x.ne[1];
@@ -220,13 +226,14 @@ Activation w4a8_prepare(const Tensor& x, WorkspaceArena& workspace, cudaStream_t
     quantize<<<dim3((a.k / 32 + kWarps - 1) / kWarps, a.tokens), dim3(32, kWarps), 0, stream>>>(
         a.bf16, a.k / 32, codes, scales);
     CUDA_CHECK(cudaGetLastError());
-    a.codes = codes;
-    a.code_scales = scales;
+    a.w4a8_codes = codes;
+    a.w4a8_scales = scales;
     return a;
 }
 
-void w4a8_project(const Activation& x, const Weight& w, std::span<const Destination> destinations,
+bool w4a8_project(const Activation& x, const Weight& w, std::span<const Destination> destinations,
                   cudaStream_t stream) {
+    if (!w4a8_eligible_weight(x, w)) { return false; }
     if (destinations.empty() || destinations.size() > kMaxDestinations) {
         throw std::invalid_argument("invalid W4A8 projection destinations");
     }
@@ -234,14 +241,25 @@ void w4a8_project(const Activation& x, const Weight& w, std::span<const Destinat
     epilogue.factor = row_factor(w);
     for (const auto& d : destinations) { epilogue.set[epilogue.count++] = d; }
     launch<false>(x, w, w, 0, w.n, epilogue, nullptr, stream);
+    return true;
 }
 
-void w4a8_swiglu(const Activation& x, const Weight& gate, const Weight* up, Tensor& out,
+bool w4a8_swiglu(const Activation& x, const Weight& gate, const Weight* up, Tensor& out,
                  cudaStream_t stream) {
+    const int rows = out.ne[0];
+    const bool joined = up == nullptr;
+    if (!w4a8_eligible_weight(x, gate) || out.dtype != DType::BF16 || out.data == nullptr ||
+        rows <= 0 || out.ne[1] != x.tokens ||
+        (joined ? gate.n != 2 * rows
+                : (!w4a8_eligible_weight(x, *up) || up->layout != gate.layout || gate.n != rows ||
+                   up->n != rows))) {
+        return false;
+    }
     DestinationEpilogue epilogue;
     epilogue.factor = row_factor(gate);
-    launch<true>(x, gate, up ? *up : gate, up ? 0 : out.ne[0], out.ne[0], epilogue,
+    launch<true>(x, gate, joined ? gate : *up, joined ? rows : 0, rows, epilogue,
                  static_cast<__nv_bfloat16*>(out.data), stream);
+    return true;
 }
 
 } // namespace ninfer::ops::detail::sm70

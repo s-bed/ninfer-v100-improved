@@ -1,4 +1,4 @@
-// Adapted from JimmyMax/ninfer-v100 ec1d53a9 (Apache-2.0). See third_party/llama_cpp_fattn.
+// Adapted from JimmyMax/ninfer-v100 ec1d53a9 (Apache-2.0). See third_party/ggml-quants.
 #include "ops/softmax_attention/dense/causal_cache/volta_flash.h"
 
 #include "core/device.h"
@@ -153,6 +153,7 @@ const std::uint32_t* volta_flash_prompt_launch(
     const int width = q.ne[2];
     const int kv_heads = cache.num_kv_heads;
     record_v100_selection(V100ObservedRoute::Flash);
+    record_v100_kernel_route(true);
     const Scratch scratch = allocate(workspace, q_heads, kv_heads, visible_keys);
     const auto* rows = table_rows == nullptr ? nullptr
                                             : static_cast<const std::int32_t*>(table_rows->data);
@@ -161,9 +162,11 @@ const std::uint32_t* volta_flash_prompt_launch(
         gather<Geometry::ModelKVHeads>(cache, rows, visible_keys, scratch, stream);
     });
 
-    const int keys = padded_keys(visible_keys);
     for (int begin = 0; begin < width; begin += kVoltaFlashQueryBlock) {
         const int tokens = std::min(width - begin, kVoltaFlashQueryBlock);
+        // Live positions are sequential with max(p + 1) <= visible_keys, so queries in
+        // [begin, begin + tokens) never attend past visible_keys - width + begin + tokens.
+        const int block_keys = padded_keys(visible_keys - width + begin + tokens);
         const int rows = ((tokens + 7) / 8) * 8;
         const auto offset = static_cast<std::int64_t>(begin) * q_heads * kHeadDim;
         const int blocks = tokens * q_heads;
@@ -173,13 +176,13 @@ const std::uint32_t* volta_flash_prompt_launch(
         convert_query<<<blocks, kHeadDim, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data) + offset, query, scratch.native_required);
         causal_mask<<<rows, 256, 0, stream>>>(
-            static_cast<const std::int32_t*>(positions.data) + begin, tokens, mask, keys);
+            static_cast<const std::int32_t*>(positions.data) + begin, tokens, mask, block_keys);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaMemsetAsync(output, 0, std::size_t(blocks) * kHeadDim * sizeof(float),
                                    stream));
         volta_flash_mma_launch(query, static_cast<const half*>(scratch.keys.data),
                                static_cast<const half*>(scratch.values.data), mask, output,
-                               scratch.stream_partials, q_heads, tokens, keys, scale, stream);
+                               scratch.stream_partials, q_heads, tokens, block_keys, scale, stream);
         convert_output<<<blocks, kHeadDim, 0, stream>>>(
             output, static_cast<__nv_bfloat16*>(out.data) + offset);
     }

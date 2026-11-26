@@ -7,7 +7,9 @@
 namespace ninfer::ops {
 
 // Selected before weight materialization and fixed for the lifetime of the process: changing
-// it would invalidate prepared weights, plans and captured CUDA Graphs.
+// it would invalidate prepared weights, plans and captured CUDA Graphs. Drafter gates the
+// narrow (T=1..4) Volta Q4/Q8 RowSplit and RowSplitPanel GEMV/SwiGLU route across eligible
+// projections (MTP projections/proposal head and any Q4/Q8 projection on a ported model).
 [[nodiscard]] bool v100_ported_kernels_enabled() noexcept;
 enum class V100CandidateRoute : std::uint8_t { Head = 1, Drafter = 2, Gdn = 4, Flash = 8 };
 [[nodiscard]] bool v100_candidate_route_enabled(V100CandidateRoute route) noexcept;

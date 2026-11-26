@@ -199,14 +199,17 @@ def grade_tasks(records: dict, cases: dict, generation: list[dict]) -> dict:
 
 
 def compare(kv: str, name: str, streams: dict, cases: dict,
-            control: tuple[dict, dict], candidate: tuple[dict, dict]) -> dict:
+            control: tuple[dict | None, dict], candidate: tuple[dict | None, dict]) -> dict:
     control_nll, control_grade = control
     candidate_nll, candidate_grade = candidate
+    documents = [] if control_nll is None or candidate_nll is None else [
+        {"id": key, "domain": row["domain"], "tokens": 8192,
+         "control_mean_nll": control_nll[key],
+         "candidate_mean_nll": candidate_nll[key]} for key, row in streams.items()
+    ]
     return {
         "comparison": name, "kv_dtype": kv,
-        "documents": [{"id": key, "domain": row["domain"], "tokens": 8192,
-                       "control_mean_nll": control_nll[key],
-                       "candidate_mean_nll": candidate_nll[key]} for key, row in streams.items()],
+        "documents": documents,
         "tasks": [{"id": key, "domain": row["domain"], "cluster": cluster(row),
                    "control": control_grade[key]["correct"],
                    "candidate": candidate_grade[key]["correct"]} for key, row in cases.items()],
@@ -238,8 +241,11 @@ def run(args: argparse.Namespace) -> None:
             probe = probes["baseline" if arm == "baseline" else "candidate"]
             arithmetic = "w4a8" if arm == "w4a8" else "a16"
             records = {}
-            for mode, jobs, context in (("score", score_jobs, "4096"),
-                                        ("generate", generation_jobs, "8192")):
+            # W4A8 quantizes narrow decode/verify widths (T<=4) only; 2,048-token CausalScoring
+            # chunks execute zero w4a8_narrow calls and would produce a vacuous zero NLL delta.
+            phases = (("generate", generation_jobs, "8192"),) if arm == "w4a8" else (
+                ("score", score_jobs, "4096"), ("generate", generation_jobs, "8192"))
+            for mode, jobs, context in phases:
                 stem = args.output / f"{kv}-{arm}-{mode}"
                 command = [str(probe), mode, str(artifact), str(jobs), str(stem.with_suffix(".jsonl")),
                            "0", context, kv, arithmetic]
@@ -247,10 +253,13 @@ def run(args: argparse.Namespace) -> None:
                 dump(manifest, metadata)
                 log = stem.with_suffix(".log")
                 records[mode] = run_probe(command, log, env, args.timeout)
-                if mode == "generate" and arm != "baseline":
-                    selections = metadata.setdefault("w4a8_narrow_selections", {})
-                    selections[f"{kv}-{arm}"] = check_w4a8_decode(log, arm == "w4a8")
-            nll = score_documents(records["score"], windows)
+                if arm != "baseline":
+                    if mode == "generate":
+                        selections = metadata.setdefault("w4a8_narrow_selections", {})
+                        selections[f"{kv}-{arm}"] = check_w4a8_decode(log, arm == "w4a8")
+                    else:
+                        check_w4a8_decode(log, False)
+            nll = None if arm == "w4a8" else score_documents(records["score"], windows)
             grades = grade_tasks(records["generate"], cases, generation)
             dump(args.output / f"{kv}-{arm}-grades.json", grades)
             results[arm] = nll, grades

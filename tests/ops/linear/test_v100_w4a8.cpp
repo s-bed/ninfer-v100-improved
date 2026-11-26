@@ -44,9 +44,19 @@ int quantization() {
     const auto a = sm::w4a8_prepare(operand, workspace, nullptr);
     std::array<signed char, k*t> codes;
     std::array<float, k*t/32> scales;
-    CUDA_CHECK(cudaMemcpy(codes.data(), a.codes, sizeof(codes), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(scales.data(), a.code_scales, sizeof(scales), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(codes.data(), a.w4a8_codes, sizeof(codes), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(scales.data(), a.w4a8_scales, sizeof(scales), cudaMemcpyDeviceToHost));
     int errors = scratch.verify_guards("W4A8 quantizer");
+    {
+        DeviceBuffer wide_x(k * (sm::kW4A8MaxTokens + 1) * 2);
+        Tensor wide_operand(wide_x.p, DType::BF16, {k, sm::kW4A8MaxTokens + 1});
+        WorkspaceArena wide_ws(sm::w4a8_workspace_bytes(k, sm::kW4A8MaxTokens + 1));
+        bool rejected = false;
+        try {
+            (void)sm::w4a8_prepare(wide_operand, wide_ws, nullptr);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) { ++errors; }
+    }
     for (int column = 0; column < t; ++column) {
         const float factor = std::ldexp(1.0F, column);
         if (scales[column*4] != factor || scales[column*4+1] != 0 ||
@@ -111,7 +121,7 @@ int projection(Operation op, int k, const std::vector<int>& parts, bool packed,
     int failures = 0;
     DeviceContext device;
     for (int t : widths) {
-        const bool narrow = t < sm::cublas_min_tokens();
+        const bool narrow = t <= sm::kW4A8MaxTokens;
         std::vector<std::uint16_t> xbits(std::size_t(k)*t);
         std::vector<float> xref(xbits.size());
         for (std::size_t g = 0; g < xbits.size(); g += 32) {
@@ -201,6 +211,65 @@ int projection(Operation op, int k, const std::vector<int>& parts, bool packed,
     }
     return failures;
 }
+
+int mixed_operand_fallbacks() {
+    constexpr int rows = 128, k = 512, t = 3;
+    auto gate_host = test::linear::make_nvfp4_weight(rows, k, 501U);
+    auto up_host = test::linear::make_nvfp4_weight(rows, k, 503U);
+    auto q8_host = test::linear::make_q8_g32_fp16_weight(rows, k, 509U);
+    DeviceBuffer gate_bytes(gate_host.payload.size()), up_bytes(up_host.payload.size()),
+        q8_bytes(q8_host.payload.size());
+    gate_bytes.copy_from_host(gate_host.payload.data(), gate_bytes.bytes);
+    up_bytes.copy_from_host(up_host.payload.data(), up_bytes.bytes);
+    q8_bytes.copy_from_host(q8_host.payload.data(), q8_bytes.bytes);
+    auto gate = gate_host.device_weight(gate_bytes.p);
+    const auto up = up_host.device_weight(up_bytes.p);
+    const auto q8 = q8_host.device_weight(q8_bytes.p);
+    ops::detail::nvfp4_prepack_qpn_sm70(gate); // gate is VoltaQpnPrepacked, up stays BlockScale
+
+    std::vector<std::uint16_t> xbits(std::size_t(k) * t);
+    std::vector<float> xref(xbits.size());
+    for (std::size_t i = 0; i < xbits.size(); ++i) {
+        xbits[i] = test::f32_to_bf16(float(int((i * 11 + 5) % 41) - 20) / 64.0F);
+        xref[i] = test::bf16_to_f32(xbits[i]);
+    }
+    DeviceBuffer x(xbits.size() * 2), out_swiglu(std::size_t(rows) * t * 2),
+        out_q8(std::size_t(rows) * t * 2);
+    x.copy_from_host(xbits.data(), x.bytes);
+    Tensor input(x.p, DType::BF16, {k, t});
+    Tensor swiglu_tensor(out_swiglu.p, DType::BF16, {rows, t});
+    WorkspaceArena ws(std::max<std::size_t>(
+        256, sm::covered_bytes(QType::NVFP4, rows, k, t, t, policy)));
+    const auto activation = sm::prepare_for(
+        input, rows, ws, nullptr, QType::NVFP4, false, sm::ProjectionPurpose::Generic, gate.layout,
+        policy);
+    int failures = 0;
+    const auto before = ops::v100_kernel_route_counts();
+    // Mismatched split SwiGLU layouts decline W4A8 cleanly and run the BF16 direct small-T route.
+    sm::swiglu_for(activation, gate, &up, swiglu_tensor, nullptr);
+    // A non-NVFP4 sibling in a split projection declines W4A8 cleanly as well.
+    const sm::Destination dest{static_cast<__nv_bfloat16*>(out_q8.p), rows, 0, 0, rows, false,
+                               nullptr};
+    sm::project_for(activation, q8, {&dest, 1}, nullptr);
+    test::cuda_synchronize();
+    const auto after = ops::v100_kernel_route_counts();
+    if (after.w4a8_narrow != before.w4a8_narrow || after.w4a8_wide != before.w4a8_wide) {
+        ++failures;
+    }
+
+    std::vector<std::int32_t> all_rows(rows);
+    for (int r = 0; r < rows; ++r) { all_rows[r] = r; }
+    const auto q8_ref = test::quantized_weight::materialize_rows_fp32(q8_host, all_rows);
+    std::vector<double> expected_q8(std::size_t(rows) * t), got_q8(expected_q8.size());
+    test::linear::cpu_linear_gemm_fp64(q8_ref.data(), xref.data(), expected_q8.data(), rows, k, t);
+    const auto actual_q8 = test::from_device<std::uint16_t>(out_q8, expected_q8.size());
+    for (std::size_t i = 0; i < actual_q8.size(); ++i) {
+        got_q8[i] = test::bf16_to_f32(actual_q8[i]);
+    }
+    failures += test::verify_reduction("W4A8 mixed-format fallback", got_q8, expected_q8,
+                                       {1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0});
+    return failures;
+}
 } // namespace
 
 int main() {
@@ -208,9 +277,9 @@ int main() {
     try {
         ops::set_v100_kernel_policy(true,true);
         const int crossover = sm::cublas_min_tokens();
-        const std::array widths{1,2,3,4,5,crossover-1,crossover,crossover+1};
-        const std::array fused{1,4,crossover-1,crossover};
-        int failures = quantization() + extreme_zero_product();
+        const std::array widths{1,2,3,4,5,32,33,crossover-1,crossover,crossover+1};
+        const std::array fused{1,4,5,32,crossover-1,crossover};
+        int failures = quantization() + extreme_zero_product() + mixed_operand_fallbacks();
         for (bool packed : {false,true}) {
             failures += projection(Operation::Linear,512,{256},packed,widths,true);
             failures += projection(Operation::Residual,17408,{5120},packed,fused);

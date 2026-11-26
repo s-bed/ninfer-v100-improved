@@ -11,11 +11,14 @@ explicit rollback. Ported requires sm_70 on every selected device. The option is
 startup because it affects prepared weights, captured graphs and persisted prefix state.
 
 On Qwen3.5-core models, `--v100-kernels ported --nvfp4-w4a8-int` permits eligible NVFP4
-projections to quantize each token’s activations in groups of 32. Wide calls use the Volta FP16
-route. This option changes arithmetic independently of `--kv-dtype`. A16 and W4A8 have distinct
-prefix-cache identities, as does each candidate route mask. Use separate persistence paths for
-paired runs. Shutdown logs include selections for the FP8 head, drafter, GDN, Flash Attention,
-and narrow/wide W4A8. The host counts dispatch and graph capture; graph replays reuse them.
+projections at `T <= 4` (decode and up to MTP3 verification) to quantize each token's
+activations in groups of 32. Wider calls (`T >= 5`) use the single-pass Volta FP16 Tensor Core
+routes (QPN, CUTLASS and cuBLAS). This option changes arithmetic independently of `--kv-dtype`.
+A16 and W4A8 have distinct prefix-cache identities, as does each candidate route mask. Use
+separate persistence paths for paired runs. Shutdown logs include selections for the FP8 head,
+drafter (narrow `T=1..4` Q4/Q8 `RowSplit`/`RowSplitPanel` projections and SwiGLU), GDN, Flash
+Attention, and narrow/wide W4A8. The host counts dispatch and graph capture; graph replays reuse
+them.
 
 For qualification, `NINFER_V100_CANDIDATES` accepts `none` or a comma-separated subset of
 `head,drafter,gdn,flash`. The default for explicit `ported` is all four. Automatic promotion

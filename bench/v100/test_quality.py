@@ -69,17 +69,17 @@ class QualityTest(unittest.TestCase):
             self.assertEqual(Path(artifact), self.root / "model.ninfer")
             self.assertEqual(context, "4096" if mode == "score" else "8192")
             self.assertEqual(env["NINFER_V100_CANDIDATES"], quality.CANDIDATES)
-            if mode == "generate" and Path(binary).name == "candidate-probe":
-                count = 1000 if arithmetic == "w4a8" else 0
+            if Path(binary).name == "candidate-probe":
+                count = 1000 if (mode == "generate" and arithmetic == "w4a8") else 0
                 log.write_text(f"v100 route selections: w4a8_narrow={count} w4a8_wide=0\n")
             records = {}
             for job in quality.read_jsonl(Path(jobs).read_bytes()):
                 row = {"id": job["id"], "mode": mode, "k": 0}
                 if mode == "score":
+                    self.assertNotEqual(arithmetic, "w4a8")
                     first = job["first_target"]
                     row.update(first_target=first, input_tokens=len(job["tokens"]),
-                               logprobs=[-2.01 if arithmetic == "w4a8" else -2.0] *
-                               (len(job["tokens"]) - first))
+                               logprobs=[-2.0] * (len(job["tokens"]) - first))
                 else:
                     row.update(content="reply", tokens=[3], reused_tokens=0, drafted_tokens=0,
                                accepted_tokens=0)
@@ -94,17 +94,19 @@ class QualityTest(unittest.TestCase):
                 patch.object(quality, "grade", return_value={"correct": True}):
             quality.run(args)
 
-        self.assertEqual(len(calls), 12)
+        self.assertEqual(len(calls), 10)
         self.assertEqual(Counter(arm for arm, _, _, _ in calls),
-                         {"baseline-probe": 4, "candidate-probe": 8})
+                         {"baseline-probe": 4, "candidate-probe": 6})
         report = json.loads((output / "quality-evidence.json").read_bytes())
         self.assertEqual(len(report["comparisons"]), 4)
         for row in report["comparisons"]:
             self.assertEqual(len(row["tasks"]), 384)
-            self.assertEqual(len(row["documents"]), 16)
-            self.assertEqual(row["documents"][0]["control_mean_nll"], 2.0)
-            self.assertAlmostEqual(row["documents"][0]["candidate_mean_nll"],
-                                   2.01 if row["comparison"] == "w4a8" else 2.0)
+            if row["comparison"] == "w4a8":
+                self.assertEqual(row["documents"], [])
+            else:
+                self.assertEqual(len(row["documents"]), 16)
+                self.assertEqual(row["documents"][0]["control_mean_nll"], 2.0)
+                self.assertAlmostEqual(row["documents"][0]["candidate_mean_nll"], 2.0)
         self.assertEqual(len({entry["cluster"] for entry in report["comparisons"][0]["tasks"]}),
                          120)
 

@@ -97,6 +97,10 @@ int main(int argc, char** argv) {
     opts.kv_cache = expected_kv;
     opts.context_cache.enabled = false;
 #ifdef NINFER_V100_QUALITY_W4A8
+    if (mode == "score" && arithmetic == "w4a8") {
+        throw std::invalid_argument(
+            "w4a8 applies only to narrow generation (T<=4), not chunked score mode");
+    }
     opts.nvfp4_w4a8_int = arithmetic == "w4a8";
 #else
     if (arithmetic == "w4a8") { throw std::invalid_argument("probe lacks W4A8 support"); }

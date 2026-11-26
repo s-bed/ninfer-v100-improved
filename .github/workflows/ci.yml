@@ -213,6 +213,10 @@ jobs:
           "VCPKG_ROOT=$deps" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "VCPKG_TARGET_TRIPLET=x64-windows" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "CURL_ROOT_DIR=$($curl.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if ('${{ matrix.build.archs }}'.Split(';') -contains '70') {
+            python .github/scripts/install-cutlass.py
+            if ($LASTEXITCODE -ne 0) { throw 'CUTLASS header install failed' }
+          }
       # vcvars64 writes its environment into its own cmd process only: carry it into the later steps.
       - name: Visual Studio 2022 environment
         shell: pwsh

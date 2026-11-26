@@ -89,3 +89,6 @@ repro/
 
 # WebUI releases unpacked by scripts/fetch-webui.sh for -DNINFER_WEBUI_DIR.
 third_party/webui/
+
+# Pinned CUTLASS headers unpacked by .github/scripts/install-cutlass.py for sm_70 builds.
+third_party/cutlass/

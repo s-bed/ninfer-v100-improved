@@ -2,12 +2,16 @@
 #include "artifact/binder.h"
 #include "artifact/fixture.h"
 #include "artifact/formats.h"
+#include "artifact/permute_row_split.h"
 #include "artifact/views.h"
+#include "core/arena.h"
 #include "core/device.h"
 #include "core/weight_view.h"
 #include "core/vmm.h"
+#include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/load/bindings.h"
 #include "ops/common/v100_kernel_policy.h"
+#include "ops/op_tester.h"
 #include "ops/linear/fp8/fp8_prepack_sm70.h"
 #include "ops/linear/fp8/fp8_format.h"
 
@@ -580,6 +584,91 @@ int gpu_head_materialization() {
     verify();
     return 0;
 }
+
+int gpu_mtp_kv_panels() {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || !count || !ops::current_device_volta()) {
+        return 77;
+    }
+    constexpr int rows = 1024, k = 5120, width = 4;
+    constexpr std::array<int, 10> samples{0, 1, 31, 32, rows - 1, rows, rows + 1,
+                                          rows + 31, rows + 32, 2 * rows - 1};
+    const WeightGeometry geometry = weight_geometry(
+        QType::Q8_G32_FP16, QuantLayout::RowSplit, std::array<std::uint64_t, 2>{2 * rows, k});
+    std::vector<std::byte> host(geometry.bytes, std::byte{0});
+    std::vector<std::int8_t> codes(std::size_t(2 * rows) * k);
+    std::vector<float> scales(std::size_t(2 * rows) * (k / 32));
+    for (int r = 0; r < 2 * rows; ++r) {
+        for (int c = 0; c < k; ++c) {
+            const auto code = static_cast<std::int8_t>((r * 7 + c * 3) % 63 - 31);
+            codes[std::size_t(r) * k + c] = code;
+            host[std::size_t(r) * k + c] = static_cast<std::byte>(static_cast<std::uint8_t>(code));
+        }
+        for (int g = 0; g < k / 32; ++g) {
+            // Exact power-of-two FP16 scales in [1/64, 1/8].
+            const int exp = 15 - 6 + ((r + g) % 4);
+            const auto f16 = static_cast<std::uint16_t>(exp << 10);
+            put_word(host, geometry.scale_offset + (std::size_t(r) * (k / 32) + g) * 2, f16, 2);
+            scales[std::size_t(r) * (k / 32) + g] = std::ldexp(1.0F, exp - 15);
+        }
+    }
+
+    DeviceBuffer weight_bytes(host.size());
+    weight_bytes.copy_from_host(host.data(), weight_bytes.bytes);
+    auto* payload = static_cast<std::byte*>(weight_bytes.p);
+    ar::permute_row_split_to_panel(geometry, payload, nullptr);
+    WeightParent parent{geometry, payload, 1.0F};
+    parent.geometry.layout = QuantLayout::RowSplitPanel;
+    q::execution::MtpProjectionParameters parameters;
+    auto& parts = parameters.rows.emplace();
+    constexpr std::uint64_t elements = std::uint64_t(rows) * k;
+    parts[1].weight = native_weight(WeightView{{rows, k}, {{&parent, 0, elements}}});
+    parts[3].weight = native_weight(WeightView{{rows, k}, {{&parent, elements, 2 * elements}}});
+
+    std::vector<std::uint16_t> x_bits(std::size_t(k) * width);
+    std::vector<double> represented_x(x_bits.size());
+    for (std::size_t i = 0; i < x_bits.size(); ++i) {
+        x_bits[i] = test::f32_to_bf16(float(int((i * 13 + 9) % 47) - 23) / 64.0F);
+        represented_x[i] = test::bf16_to_f32(x_bits[i]);
+    }
+    DeviceBuffer x(x_bits.size() * 2), key(std::size_t(rows) * width * 2),
+        value(std::size_t(rows) * width * 2);
+    x.copy_from_host(x_bits.data(), x.bytes);
+    Tensor input(x.p, DType::BF16, {k, width});
+    Tensor key_out(key.p, DType::BF16, {rows, width});
+    Tensor value_out(value.p, DType::BF16, {rows, width});
+    const q::AttentionConfig config{};
+    const auto capacity = q::execution::mtp_kv_workspace_bytes(parameters, config, 1, width);
+    WorkspaceArena workspace(std::max<std::size_t>(1, capacity));
+    const auto before = ops::v100_kernel_route_counts();
+    q::execution::mtp_kv_projection(input, parameters, config, key_out, value_out, workspace,
+                                    nullptr);
+    const auto after = ops::v100_kernel_route_counts();
+    const bool expect_drafter =
+        ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Drafter);
+    require((after.drafter > before.drafter) == expect_drafter,
+            "MTP panel K/V projection did not honor its Drafter candidate policy");
+
+    std::vector<double> expected(samples.size() * width, 0.0), actual(samples.size() * width);
+    const auto keys = test::from_device<std::uint16_t>(key, std::size_t(rows) * width);
+    const auto values = test::from_device<std::uint16_t>(value, std::size_t(rows) * width);
+    for (int token = 0; token < width; ++token) {
+        for (std::size_t i = 0; i < samples.size(); ++i) {
+            const int row = samples[i];
+            double sum = 0.0;
+            for (int c = 0; c < k; ++c) {
+                const double w = double(codes[std::size_t(row) * k + c]) *
+                                 double(scales[std::size_t(row) * (k / 32) + c / 32]);
+                sum += w * represented_x[std::size_t(token) * k + c];
+            }
+            expected[std::size_t(token) * samples.size() + i] = sum;
+            actual[std::size_t(token) * samples.size() + i] = test::bf16_to_f32(
+                row < rows ? keys[token * rows + row] : values[token * rows + row - rows]);
+        }
+    }
+    return test::verify_reduction("Volta MTP panel K/V", actual, expected,
+                                  {1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0});
+}
 }
 
 int main(int argc,char** argv) {
@@ -596,8 +685,9 @@ int main(int argc,char** argv) {
         cpu_qpn_geometry_factory();
         cpu_packed_metadata();
         if (gpu) {
-            const int status = gpu_materialization();
-            return status != 0 ? status : gpu_head_materialization();
+            int status = gpu_materialization();
+            if (status == 0) { status = gpu_head_materialization(); }
+            return status != 0 ? status : gpu_mtp_kv_panels();
         }
         std::cout<<"PASS FP8 model-owned complete-group selection and placement requests\n";
         return 0;

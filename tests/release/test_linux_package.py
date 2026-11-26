@@ -109,8 +109,7 @@ class LinuxPackageTest(unittest.TestCase):
         self.repo = self.root / 'repo'
         self.cuda = self.root / 'cuda'
         self.build = self.repo / 'build'
-        for directory in ('scripts', 'docs', 'docker', 'third_party/llama_cpp_fattn',
-                          'build/portable/backends/cuda13'):
+        for directory in ('scripts', 'docs', 'docker', 'build/portable/backends/cuda13',):
             (self.repo / directory).mkdir(parents=True)
         for directory in ('bin', 'lib64/stubs'):
             (self.cuda / directory).mkdir(parents=True)
@@ -129,8 +128,6 @@ class LinuxPackageTest(unittest.TestCase):
             'CMAKE_CUDA_ARCHITECTURES:STRING=75;120a\nNINFER_SHARED_RUNTIME:BOOL=ON\n')
         for name in ('LICENSE', 'docs/release-archive-linux.md', 'scripts/run.sh', 'scripts/download-model.sh'):
             (self.repo / name).write_text('fixture')
-        shutil.copy2(ROOT / 'third_party/llama_cpp_fattn/LICENSE',
-                     self.repo / 'third_party/llama_cpp_fattn/LICENSE')
         (self.build / 'generated').mkdir()
         (self.build / 'generated/ninfer_build_id.h').write_text(
             '#define NINFER_BUILD_ID "aaaaaaaaa"\n#define NINFER_VERSION "2026-10-23.2"\n')
@@ -198,8 +195,6 @@ class LinuxPackageTest(unittest.TestCase):
             self.assertTrue(archive.getmember(prefix + '/ninfer').isfile())
             self.assertTrue(archive.getmember(prefix + '/backends/cuda13/libninfer-runtime.so').isfile())
             self.assertIn(prefix + '/Dockerfile', names)
-            self.assertEqual(archive.extractfile(prefix + '/LICENSE-llama-cpp-fattn.txt').read(),
-                             (ROOT / 'third_party/llama_cpp_fattn/LICENSE').read_bytes())
             info = json.load(archive.extractfile(prefix + '/BUILD-INFO.json'))
             self.assertEqual(info['architectures'], ['75', '120a'])
             self.assertEqual(info['version'], '2026-10-23.2')

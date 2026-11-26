@@ -236,8 +236,15 @@ class InputsAndCommands(unittest.TestCase):
                 qualify.check_route_selections(treatment, {"ported": 1, "fallback": 0})
             legacy = qualify.Run("controls", "int8", 3, 1, qualify.OLD_NATIVE)
             qualify.check_route_selections(legacy, {"ported": 0, "fallback": 0})
+            qualify.check_route_selections(legacy, {"ported": 0, "fallback": 42})
+            native = qualify.Run("controls", "int8", 3, 1, qualify.NATIVE)
+            native_counts = dict.fromkeys(qualify.CANDIDATES + qualify.W4A8_COUNTERS, 0)
+            native_counts.update(ported=0, fallback=128)
+            qualify.check_route_selections(native, native_counts)
             with self.assertRaisesRegex(RuntimeError, "native control"):
-                qualify.check_route_selections(legacy, {"ported": 1, "fallback": 0})
+                qualify.check_route_selections(legacy, {"ported": 1, "fallback": 42})
+            with self.assertRaisesRegex(RuntimeError, "native control"):
+                qualify.check_route_selections(native, dict(native_counts, head=1))
             path.write_text("[info] v100 kernel route selections: ported=32 fallback=5\n",
                             encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "expected one final"):
@@ -291,10 +298,20 @@ class InputsAndCommands(unittest.TestCase):
                           "candidate_mean_nll": 1.501} for i in range(16)]
             tasks = [{"id": f"t{i:03d}", "cluster": f"case-{i // 4}", "candidate": True,
                       "control": True} for i in range(384)]
-            comparisons = [dict(comparison=mode, kv_dtype=kv, documents=documents, tasks=tasks)
-                           for mode in ("a16", "w4a8") for kv in ("int8", "bf16")]
+            comparisons = [
+                dict(comparison=mode, kv_dtype=kv,
+                     documents=[] if mode == "w4a8" else documents, tasks=tasks)
+                for mode in ("a16", "w4a8") for kv in ("int8", "bf16")
+            ]
             qualify.dump(path, {"source": "paired raw records", "comparisons": comparisons})
-            self.assertTrue(all(item["status"] == "pass" for item in qualify.quality(path)))
+            gates = qualify.quality(path)
+            self.assertEqual(len(gates), 6)
+            self.assertTrue(all(item["status"] == "pass" for item in gates))
+            vacuous = [dict(comparison=mode, kv_dtype=kv, documents=documents, tasks=tasks)
+                       for mode in ("a16", "w4a8") for kv in ("int8", "bf16")]
+            qualify.dump(path, {"source": "paired raw records", "comparisons": vacuous})
+            with self.assertRaisesRegex(ValueError, "vacuous"):
+                qualify.quality(path)
             documents[0]["tokens"] -= 1
             qualify.dump(path, {"source": "paired raw records", "comparisons": comparisons})
             self.assertEqual(qualify.quality(path)[0]["status"], "open")

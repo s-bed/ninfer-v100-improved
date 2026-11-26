@@ -34,6 +34,7 @@ struct StartupEvent;
 struct StartupObserver;
 
 // ninfer/engine_options.h
+enum class V100KernelPolicy : std::uint8_t;
 struct KvCapacityPolicy;
 struct SpeculativeOptions;
 enum class DiagnosticLevel : std::uint8_t;

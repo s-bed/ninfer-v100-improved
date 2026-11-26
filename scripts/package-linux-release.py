@@ -211,7 +211,6 @@ def main():
     (package / 'packages/multi.txt').write_text(''.join(f'{p}\n' for p in sorted(packages)))
     for source, destination in (
         (repo / 'LICENSE', 'LICENSE'),
-        (repo / 'third_party/llama_cpp_fattn/LICENSE', 'LICENSE-llama-cpp-fattn.txt'),
         (repo / 'docs/release-archive-linux.md', 'README.md'),
         (repo / 'scripts/run.sh', 'run.sh'), (repo / 'scripts/download-model.sh', 'download-model.sh'),
     ):

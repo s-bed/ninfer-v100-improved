@@ -73,6 +73,9 @@ struct Activation {
     const std::int8_t* codes      = nullptr;
     const float* code_scales      = nullptr;
     const std::int32_t* code_sums = nullptr;
+    // The narrow NVFP4 W4A8 route's group-32 quantized form (v100_w4a8.h), separate from T2.
+    const std::int8_t* w4a8_codes = nullptr;
+    const float* w4a8_scales      = nullptr;
 };
 
 // Workspace of prepare() for parents of at most `max_rows` rows.
@@ -91,8 +94,9 @@ void project(const Activation& x, const Weight& w, std::span<const Destination> 
 void swiglu(const Activation& x, const Weight& gate, const Weight* up, Tensor& out,
             cudaStream_t stream);
 
-// Narrow NVFP4 activation quantization needs both the per-operand permission and the
-// process policy that owns the corresponding weights, workspaces and prefix state.
+// Narrow NVFP4 activation quantization reads weights once across up to four columns (decode and
+// MTP3 verification); wider calls keep the single-pass FP16 QPN and CUTLASS routes.
+inline constexpr std::int32_t kW4A8MaxTokens = 4;
 [[nodiscard]] bool w4a8_allowed(LinearPolicy policy);
 
 // --- Both sm_70 routes ------------------------------------------------------------------------

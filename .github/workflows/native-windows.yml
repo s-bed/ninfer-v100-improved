@@ -156,6 +156,10 @@ jobs:
         env:
           ARCHS: ${{ inputs.archs }}
         run: |
+          if ($env:ARCHS -split ';' -contains '70') {
+            python .github/scripts/install-cutlass.py
+            if ($LASTEXITCODE -ne 0) { throw 'CUTLASS header install failed' }
+          }
           & .\.vcpkg\bootstrap-vcpkg.bat -disableMetrics
           if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
           $dependencyFamily = ''

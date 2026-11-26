@@ -42,7 +42,7 @@ ninfer_add_test(ninfer_qwen3_5_loading_test
 # CPU-only model-owned FP8 request selection; GPU upload/resume is explicitly scoped.
 ninfer_add_test(ninfer_v100_fp8_loading_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_v100_fp8_loading.cpp"
-  LIBRARIES ninfer_model_loading TEST_ARGS ported)
+  LIBRARIES ninfer_model_loading ninfer_model_runtime TEST_ARGS ported)
 add_test(NAME ninfer_v100_fp8_loading_native_test
   COMMAND ninfer_v100_fp8_loading_test native)
 add_test(NAME ninfer_v100_fp8_loading_gpu_test

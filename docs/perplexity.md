@@ -8,8 +8,10 @@ Only Text weights and resources are loaded; Vision and speculative components ar
 ## Volta arithmetic
 
 On a Tesla V100, `--v100-kernels native|ported` selects the startup policy. Native is the
-default. With `ported`, `--nvfp4-w4a8-int` enables group-32 activation quantization for
-eligible narrow NVFP4 projections. KV storage is chosen independently with `--kv-dtype`.
+default. `--nvfp4-w4a8-int` is accepted with `ported` for CLI symmetry, but like
+`--mlp-a8-decode` it is inert during causal scoring: narrow W4A8 applies only at `T <= 4`
+(decode and MTP verification), whereas `ninfer-perplexity` scores wide prefill chunks on the
+Volta FP16 route (`w4a8_narrow=0`). KV storage is chosen independently with `--kv-dtype`.
 The Engine logs the selected policy at startup and route counts at shutdown.
 [V100 qualification and controls](../bench/v100/QUALIFICATION.md)
 

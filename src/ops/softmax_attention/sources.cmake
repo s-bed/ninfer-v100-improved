@@ -26,7 +26,8 @@ if(NINFER_ARCH_VOLTA)
     "${_ninfer_volta_attention_dir}/volta_flash_bridge.cu")
   set_source_files_properties("${_ninfer_volta_attention_dir}/volta_flash_bridge.cu"
     TARGET_DIRECTORY ninfer_volta_kernels
-    PROPERTIES INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/llama_cpp_fattn"
+    PROPERTIES INCLUDE_DIRECTORIES
+      "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/include;${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src"
     COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda;-diag-suppress=940>")
 endif()
 

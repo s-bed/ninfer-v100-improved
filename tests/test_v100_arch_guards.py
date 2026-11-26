@@ -82,7 +82,7 @@ def main() -> None:
     for name, markers in (
         ("v100_qpn.cu", (r"bool\s+v100_qpn_project\s*\([^;{}]*\)\s*\{",)),
         ("v100_cutlass.cu", (r"V100 CUTLASS GEMM failed",)),
-        ("v100_w4a8.cu", (r"void\s+w4a8_project\s*\([^;{}]*\)\s*\{",)),
+        ("v100_w4a8.cu", (r"bool\s+w4a8_project\s*\([^;{}]*\)\s*\{",)),
         ("v100_drafter_gemv.cu", (r"bool\s+v100_drafter_gemv_project\s*\([^;{}]*\)\s*\{",)),
         ("v100_fp8.cu", (r"bool\s+v100_fp8_project\s*\([^;{}]*\)\s*\{",
                          r"void\s+fp8_volta_qpn_gemm_kernel\s*\(")),
@@ -108,7 +108,7 @@ def main() -> None:
     if not args.cutlass:
         print("NOTE: CUTLASS host/sm_70 expansion skipped without a cached CUTLASS path")
     attention = source / "src/ops/softmax_attention/dense/causal_cache"
-    vendor = source / "third_party/llama_cpp_fattn"
+    ggml = source / "third_party/ggml-quants"
     for name, definition in (
         ("volta_flash.cu", "volta_flash_prompt_launch"),
         ("volta_flash_bridge.cu", "volta_flash_mma_launch"),
@@ -116,7 +116,8 @@ def main() -> None:
         marker = rf"\b{definition}\s*\([^;{{}}]*\)\s*\{{"
         for architecture in (None, 700, 750, 860):
             defines = [] if architecture is None else [f"-D__CUDA_ARCH__={architecture}"]
-            expanded = run(base + ["-I", str(vendor), "-DNINFER_TIER_VOLTA=1"] + defines +
+            expanded = run(base + ["-I", str(ggml / "include"), "-I", str(ggml / "src"),
+                                   "-DNINFER_TIER_VOLTA=1"] + defines +
                            ["-E", "-P", str(attention / name)])
             present = re.search(marker, expanded) is not None
             assert present is (architecture in (None, 700)), (name, architecture)

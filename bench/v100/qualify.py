@@ -150,7 +150,7 @@ def check_route_selections(run: Run, counts: dict[str, int], *, smoke: bool = Fa
     if not run.arm.baseline and not named <= counts.keys():
         raise RuntimeError("candidate binary did not emit all named route counters")
     if not run.arm.ported:
-        if any(counts.values()):
+        if any(value for key, value in counts.items() if key != "fallback"):
             raise RuntimeError("native control selected a Volta ported route")
         return
     if counts["ported"] == 0:
@@ -941,7 +941,12 @@ def quality_pair(evidence: dict, gate: dict) -> list[dict]:
     if len({row["id"] for row in documents}) != len(documents) or \
             len({row["id"] for row in tasks}) != len(tasks):
         raise ValueError("duplicate streams or tasks in quality evidence")
-    if len(documents) != 16 or any(row["tokens"] != 8192 for row in documents):
+    if gate["comparison"] == "w4a8":
+        if documents:
+            raise ValueError(
+                "w4a8 is narrow decode/verify-only (T<=4); chunked causal scoring is vacuous"
+            )
+    elif len(documents) != 16 or any(row["tokens"] != 8192 for row in documents):
         return [dict(gate, status="open", reason="quality needs 16 matched frozen streams of 8,192 targets")]
     if len(tasks) != 384:
         return [dict(gate, status="open", reason="quality needs 384 matched graded task pairs")]
@@ -952,13 +957,15 @@ def quality_pair(evidence: dict, gate: dict) -> list[dict]:
         clusters.setdefault(task["cluster"], []).append(task)
     if len(clusters) < 2:
         raise ValueError("quality task grades must retain the original fixture clusters")
-    measures = {
-        "perplexity": ([(row["candidate_mean_nll"], row["control_mean_nll"], row["tokens"])
-                        for row in documents], math.expm1, .005),
-        "accuracy": ([(sum(row["candidate"] for row in group) / len(group),
-                       sum(row["control"] for row in group) / len(group), len(group))
-                      for group in clusters.values()], float, .02),
-    }
+    measures = {}
+    if gate["comparison"] != "w4a8":
+        measures["perplexity"] = (
+            [(row["candidate_mean_nll"], row["control_mean_nll"], row["tokens"])
+             for row in documents], math.expm1, .005)
+    measures["accuracy"] = (
+        [(sum(row["candidate"] for row in group) / len(group),
+          sum(row["control"] for row in group) / len(group), len(group))
+         for group in clusters.values()], float, .02)
     out = []
     for case, (samples, transform, margin) in measures.items():
         stats = paired_bootstrap(samples, transform=transform)

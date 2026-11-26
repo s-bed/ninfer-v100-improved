@@ -10,7 +10,8 @@ directories, and test persistence files.
 ## Start on the test host
 
 Use Linux, CUDA **12.9**, a supported C++ compiler, Ninja, CMake, Python 3.11, the project’s
-FFmpeg/curl development packages and CUTLASS **4.4.2**. Reserve one idle V100. Keep the
+FFmpeg/curl development packages and CUTLASS **4.4.2** (pre-cached or staged with
+`python3.11 .github/scripts/install-cutlass.py`). Reserve one idle V100. Keep the
 baseline checkout clean at `42d8d03ffe7ac9e9c5cd1cb227a195c099a03f88`.
 From a local clone of `s-bed/ninfer-v100-improved`, fetch the published candidate and create
 two detached worktrees. Record the candidate SHA before starting the campaign.
@@ -129,8 +130,8 @@ support INT8 KV. [Donor deployment and INT8 trial](https://github.com/RodrigoR78
 | Row-scaled FP8 | Packed eligible body projections already stage FP16 and repair out-of-range BF16 columns. | Extend to the 248,320 × 5,120 head, vet physical-weight consumers and bound packing scratch. |
 | MTP | Existing Q4/Q8 projections and optimized proposal head. | Streaming one to four token columns, including compatible panel consumers, with the previous five-column route. The Op selects by format, layout and width, so another Q4/Q8 projection in an explicitly ported model can also use it. |
 | GDN prefill | The device profile already chooses two-stage or chunked execution. | Compare the donor recurrent choice at each measured geometry and width with both existing routes. |
-| Causal attention | Paged Volta attention serves BF16 and INT8. | Correct the donor BF16 V conversion and 256-key scratch rounding, then test single-sequence BF16 dense prefill with sequential visibility. INT8 keeps its profiled attention route. |
-| NVFP4 | Our ported A16 handles both packed and stored weights and has its own wide crossover. | Explicit W4A8 uses per-token group-32 activation scales for eligible narrow projections and the existing wide FP16 route. Measure quality independently in each KV format. |
+| Causal attention | Paged Volta attention serves BF16 and INT8. | Correct the donor BF16 V conversion and 256-key scratch rounding, clamp per-1024-query-block causal key extents, and test single-sequence BF16 dense prefill with sequential visibility. INT8 keeps its profiled attention route. |
+| NVFP4 | Our ported A16 handles both packed and stored weights and has its own wide crossover. | Explicit W4A8 uses per-token group-32 activation scales for eligible narrow (`T <= 4`, decode and MTP3 verify) projections and the single-pass Volta FP16 QPN/CUTLASS/cuBLAS routes at `T >= 5`. Measure quality independently in each KV format. |
 
 At the 200,000-key boundary, the Flash launcher rounds to 200,192 keys. The calculated K/V,
 mask and Q/output buffers total 1,221 MiB at 24/4 heads and 814 MiB at 16/2 heads, plus
@@ -155,7 +156,8 @@ Check the packed FP8 head at real 27B width against independently decoded weight
 projection oracle. Include row scales, partial tiles and BF16 values outside normal FP16 range.
 The loading test uses a sparse `248320 × 5120` parent to check exact device and artifact bytes
 at separated panels across load and suspend/resume. It keeps the test's explicit Host payload
-small and also checks the full-geometry text/MTP head and tied embedding selection.
+small, checks the full-geometry text/MTP head and tied embedding selection, and verifies Q8
+`RowSplitPanel` MTP K/V projection against the FP64 oracle under `--gpu`.
 Cover the drafter's Q4/Q8 projection and SwiGLU paths at T=1–4 and their boundary fallback. Cover
 NVFP4 W4A8's activation quantization and observable rounding independently. Check exact packed
 layout transforms and workspace bounds, plus ordinary execution and Graph capture/replay.
@@ -338,21 +340,24 @@ python3.11 "$CANDIDATE/bench/v100/quality.py" \
 
 The probe uses the same frozen prompt token IDs and task order in each arm, with greedy sampling,
 seed 1729, no speculation or prefix reuse, and the established exact, JSON and code graders.
-Scoring uses 16 streams with 8,192 targets each, a 4,096-token context and 2,048-token stride.
-All 384 tasks use their original cluster labels and output budgets. The W4A8 generation arm
-must record a narrow W4A8 selection. The run directory retains commands, route counts, fixture
-and job hashes, probe hashes, raw log probabilities, answers, and grade reasons.
+A16 scoring uses 16 streams with 8,192 targets each, a 4,096-token context and 2,048-token stride;
+because W4A8 quantizes narrow (`T <= 4`) projections only and chunked `CausalScoring` executes zero
+`w4a8_narrow` calls, W4A8 omits the vacuous scoring pass and `qualify.py` rejects `w4a8` score
+records if supplied. All 384 tasks use their original cluster labels and output budgets. The W4A8
+generation arm must record a narrow W4A8 selection. The run directory retains commands, route
+counts, fixture and job hashes, probe hashes, raw log probabilities, answers, and grade reasons.
 Missing or incomplete inputs leave `status.json` open and produce no quality evidence.
 
 Pass `$RESULTS/manual-quality/quality-evidence.json` as `--quality-evidence`. It contains a `source`
 link to the run manifest and four `comparisons` covering `comparison` values `a16` and `w4a8`
-crossed with `kv_dtype` values `int8` and `bf16`. Each comparison contains `documents` with
-`id`, `domain`, `tokens`, `control_mean_nll` and `candidate_mean_nll`, plus `tasks` with `id`,
-`domain`, `cluster` and Boolean `control` and `candidate` grades. Here the A16 control is
-refreshed main and the W4A8 control is candidate A16. The gate bootstraps whole paired streams
-and fixture clusters using 20,000 replicates and seed 1729. All eight two-sided 99.1667% intervals
-must fit within ±0.5% relative perplexity and ±2 percentage points accuracy. Review per-domain
-effects and discordant grades with the aggregate intervals.
+crossed with `kv_dtype` values `int8` and `bf16`. Each `a16` comparison contains `documents` with
+`id`, `domain`, `tokens`, `control_mean_nll` and `candidate_mean_nll`, while `w4a8` carries an empty
+`documents` list; all four carry `tasks` with `id`, `domain`, `cluster` and Boolean `control` and
+`candidate` grades. Here the A16 control is refreshed main and the W4A8 control is candidate A16.
+The gate bootstraps whole paired streams and fixture clusters using 20,000 replicates and seed
+1729. All six two-sided 99.1667% intervals (two `a16` perplexity intervals and four `a16`/`w4a8`
+accuracy intervals) must fit within ±0.5% relative perplexity and ±2 percentage points accuracy.
+Review per-domain effects and discordant grades with the aggregate intervals.
 
 ## Production-equivalent cache and promotion checks
 

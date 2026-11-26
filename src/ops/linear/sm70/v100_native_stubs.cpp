@@ -16,11 +16,11 @@ std::size_t w4a8_workspace_bytes(int,int) { return 0; }
 Activation w4a8_prepare(const Tensor&,WorkspaceArena&,cudaStream_t) {
     throw std::logic_error("Volta W4A8 needs an sm_70 build");
 }
-void w4a8_project(const Activation&,const Weight&,std::span<const Destination>,cudaStream_t) {
-    throw std::logic_error("Volta W4A8 needs an sm_70 build");
+bool w4a8_project(const Activation&,const Weight&,std::span<const Destination>,cudaStream_t) {
+    return false;
 }
-void w4a8_swiglu(const Activation&,const Weight&,const Weight*,Tensor&,cudaStream_t) {
-    throw std::logic_error("Volta W4A8 needs an sm_70 build");
+bool w4a8_swiglu(const Activation&,const Weight&,const Weight*,Tensor&,cudaStream_t) {
+    return false;
 }
 void set_v100_wide_backend_mma_for_benchmark(bool mma) {
     if (mma) throw std::invalid_argument("V100 MMA benchmark needs an sm_70 build");
