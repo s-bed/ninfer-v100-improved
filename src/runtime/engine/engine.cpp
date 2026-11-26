@@ -800,7 +800,8 @@ std::string Engine::token_bytes(TokenId token) const {
     return impl_->frontend().token_bytes(token);
 }
 
-std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target) {
+std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target,
+                                        std::uint32_t max_scored_width) {
     nvtx::ScopedRange score_range(nvtx::Name::Score, nvtx::Category::Scoring,
                                   static_cast<std::uint64_t>(tokens.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
@@ -819,11 +820,15 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
     std::vector<float> result  = std::visit(
         [&](auto& core) -> std::vector<float> {
             using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::Qwen4ExpCore>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::Gemma4Core>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::FlintCore>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::DeepSeekV41Core>>) {
+            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                return core->score(std::move(prompt.impl_->value), first_target, max_scored_width);
+            } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::Qwen4ExpCore>> ||
+                                 std::is_same_v<CoreState, std::unique_ptr<Impl::Gemma4Core>> ||
+                                 std::is_same_v<CoreState, std::unique_ptr<Impl::FlintCore>> ||
+                                 std::is_same_v<CoreState, std::unique_ptr<Impl::DeepSeekV41Core>>) {
+                if (max_scored_width != 0) {
+                    throw std::invalid_argument("limiting scored width requires a Qwen3.5-core model");
+                }
                 return core->score(std::move(prompt.impl_->value), first_target);
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");

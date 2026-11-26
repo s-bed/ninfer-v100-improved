@@ -52,7 +52,7 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
         if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
         if (tokens <= 16) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
         // A single-row copy verification reaches 64 columns through the materialized route.
-        if (tokens <= 64) { return {Nvfp4GdnConvScheduleId::Materialized}; }
+        if (tokens <= kNvfp4GdnA16MaxWidth) { return {Nvfp4GdnConvScheduleId::Materialized}; }
         // Same limit and same consequence as nvfp4_linear_swiglu's -- see the note there.
         // This one is normally unreachable because the SwiGLU throws first, so a reader
         // who lands here has fixed that one and needs to know this is the next wall.

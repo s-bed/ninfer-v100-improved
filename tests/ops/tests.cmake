@@ -420,3 +420,9 @@ ninfer_add_op_test(ninfer_v100_fp8_snapshot_test STANDALONE
 ninfer_add_op_test(ninfer_v100_fp8_record_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj_conv_record.cpp"
   LIBRARIES ninfer_ops TEST_ARGS --v100-fp8)
+add_test(NAME ninfer_v100_w4a8_gdn_snapshot_test
+  COMMAND ninfer_v100_fp8_snapshot_test --v100-w4a8)
+add_test(NAME ninfer_v100_w4a8_gdn_record_test
+  COMMAND ninfer_v100_fp8_record_test --v100-w4a8)
+set_tests_properties(ninfer_v100_w4a8_gdn_snapshot_test ninfer_v100_w4a8_gdn_record_test
+  PROPERTIES SKIP_RETURN_CODE 77)

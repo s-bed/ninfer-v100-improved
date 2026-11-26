@@ -8,11 +8,12 @@ Only Text weights and resources are loaded; Vision and speculative components ar
 ## Volta arithmetic
 
 On a Tesla V100, `--v100-kernels native|ported` selects the startup policy. Native is the
-default. `--nvfp4-w4a8-int` is accepted with `ported` for CLI symmetry, but like
-`--mlp-a8-decode` it is inert during causal scoring: narrow W4A8 applies only at `T <= 4`
-(decode and MTP verification), whereas `ninfer-perplexity` scores wide prefill chunks on the
-Volta FP16 route (`w4a8_narrow=0`). KV storage is chosen independently with `--kv-dtype`.
-The Engine logs the selected policy at startup and route counts at shutdown.
+default. On Qwen3.5-core models, `--v100-kernels ported --nvfp4-w4a8-int` scores the target
+suffix in groups of four predictors so eligible NVFP4 projections exercise narrow W4A8.
+Unscored window context uses the ordinary prefill schedule. Use `--v100-kernels ported --score-width 4`
+for the matched A16 control and keep `--kv-dtype` identical. Smaller widths
+from one through three are also supported. Check the shutdown counter `w4a8_narrow` for a
+positive selection on the W4A8 arm. The report records the arithmetic policy and scoring width.
 [V100 qualification and controls](../bench/v100/QUALIFICATION.md)
 
 ## Run the fixed corpus

@@ -4920,16 +4920,16 @@ int run_volta_flash_boundaries() {
                                     geometry.kv_heads * sizeof(std::uint16_t);
     const std::size_t query_column = std::size_t(kHeadDim) * geometry.q_heads;
     GuardedDeviceBuffer k(plane_bytes), v(plane_bytes);
-    GuardedDeviceBuffer q(query_column * threshold * sizeof(std::uint16_t));
+    GuardedDeviceBuffer q(query_column * (threshold + 1) * sizeof(std::uint16_t));
     GuardedDeviceBuffer out(q.bytes());
     GuardedDeviceBuffer table(std::size_t(pages) * sizeof(std::int32_t));
-    GuardedDeviceBuffer positions(std::size_t(threshold) * sizeof(std::int32_t));
-    // Zero Q/K make attention the uniform mean. All V bits hold the same finite nonzero BF16
-    // value, using a repeated byte so the fixture can fill large device planes directly.
-    constexpr std::uint16_t value = 0x3e3e;
+    GuardedDeviceBuffer positions(std::size_t(threshold + 1) * sizeof(std::int32_t));
+    // The FP64 oracle is a uniform mean. The BF16 value 784 is representable in FP16, but a
+    // long unnormalized PV sum overflows FP16. Repeated bytes initialize the large plane directly.
+    constexpr std::uint16_t value = 0x4444;
     k.fill();
     q.fill();
-    v.fill(0x3e);
+    v.fill(0x44);
     std::vector<std::int32_t> indices(pages);
     std::iota(indices.begin(), indices.end(), 0);
     table.copy_from_host(indices.data(), table.bytes());
@@ -4991,6 +4991,47 @@ int run_volta_flash_boundaries() {
             ++failures;
         }
     }
+
+    // The first query block ends at key 1023. The first key in the next block
+    // contributes to the last query alone and requires a larger padded key extent.
+    constexpr int width = threshold + 1;
+    v.fill();
+    std::vector<std::uint16_t> terminal(kHeadDim);
+    std::vector<std::uint16_t> expected_last(query_column);
+    const int group = geometry.q_heads / geometry.kv_heads;
+    for (int head = 0; head < geometry.kv_heads; ++head) {
+        for (int d = 0; d < kHeadDim; ++d) {
+            const float magnitude = float((head + 1) * (1 + d % 8) * 32);
+            const float value = d < kHeadDim / 2 ? magnitude : -magnitude;
+            terminal[d] = f32_to_bf16(value);
+            for (int q_head = head * group; q_head < (head + 1) * group; ++q_head) {
+                expected_last[q_head * kHeadDim + d] = f32_to_bf16(value / float(width));
+            }
+        }
+        const auto offset = paged_index(kHeadDim, geometry, threshold / kPagedKVPageSize,
+                                        head, threshold, 0) * sizeof(std::uint16_t);
+        v.copy_from_host(terminal.data(), terminal.size() * sizeof(std::uint16_t), offset);
+    }
+    std::vector<std::int32_t> query_positions(width);
+    std::iota(query_positions.begin(), query_positions.end(), 0);
+    positions.copy_from_host(query_positions.data(), positions.bytes());
+    const Tensor query(q.data(), DType::BF16, {kHeadDim, geometry.q_heads, width});
+    const Tensor pos(positions.data(), DType::I32, {width});
+    Tensor output(out.data(), DType::BF16, {kHeadDim, geometry.q_heads, width});
+    WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+    const auto before = ops::v100_kernel_route_counts().flash;
+    ops::causal_softmax_attention_cached(query, pos, op_geometry(geometry), kAttentionScale,
+                                         cache, {width, width}, workspace, output, nullptr);
+    cuda_synchronize();
+    const auto bits = copy_from_guarded<std::uint16_t>(out, query_column * width);
+    const auto last = bits.begin() + static_cast<std::ptrdiff_t>(query_column * threshold);
+    if (ops::v100_kernel_route_counts().flash != before + 1 ||
+        !std::all_of(bits.begin(), last, [](auto item) { return item == 0; }) ||
+        !std::equal(last, bits.end(), expected_last.begin())) {
+        std::cerr << "Volta flash: incorrect causal mean at the second query block\n";
+        ++failures;
+    }
+
     return failures + scratch.verify_guards("Volta flash cap scratch") +
            out.verify_guards("Volta flash cap output");
 }

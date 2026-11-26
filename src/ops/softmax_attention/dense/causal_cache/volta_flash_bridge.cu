@@ -5,7 +5,9 @@
 #include "ops/softmax_attention/dense/causal_cache/volta_flash_bridge.h"
 #include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
 
+#define GGML_NINFER_QWEN_VOLTA_FATTN
 #include "ggml-cuda/fattn-mma-f16.cuh"
+#undef GGML_NINFER_QWEN_VOLTA_FATTN
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -21,7 +23,8 @@ namespace ninfer::ops::detail {
 namespace {
 
 constexpr int kDKQ = 256;
-constexpr int kDV  = 256;
+constexpr int kDV  = kVoltaFlashValueShard;
+constexpr int kValueShards = kDKQ / kDV;
 
 inline void check_cuda(cudaError_t status, const char* what) {
     if (status != cudaSuccess) {
@@ -113,7 +116,8 @@ FlashLaunchConfig flash_launch_config() {
         const std::size_t shared_mask =
             std::size_t(P::kNcols1) * (c.nbatch_fa / 2 + 4) * sizeof(half2);
         const std::size_t shared_combine =
-            std::size_t(c.nwarps) * cols_per_warp * (nbatch_combine + 4) * sizeof(half2);
+            std::size_t(c.nwarps) * cols_per_warp *
+            (ggml_cuda_fattn_mma_pv_words(nbatch_combine) + 4) * sizeof(half2);
         const std::size_t shared_KV = nstages <= 1 ? shared_KV_1stage : shared_KV_2stage;
 
         c.nbytes_shared = std::max(shared_combine, Q_in_reg
@@ -153,7 +157,8 @@ void launch_flash_block(const float* q_f32, const half* k_f16, const half* v_f16
 
     const int ntiles_x     = (tokens + kNcols1 - 1) / kNcols1;
     const int ntiles_z_gqa = (kGroup + kNcols2 - 1) / kNcols2;
-    const int ntiles_dst   = ntiles_x * ntiles_z_gqa * kKVHeads;
+    const int ntiles_shard = ntiles_x * ntiles_z_gqa * kKVHeads;
+    const int ntiles_dst   = ntiles_shard * kValueShards;
     const int ntiles_KV    = (n_kv + c.nbatch_fa - 1) / c.nbatch_fa;
 
     const int max_blocks = c.blocks_per_sm * c.nsm;
@@ -170,20 +175,23 @@ void launch_flash_block(const float* q_f32, const half* k_f16, const half* v_f16
     const std::int32_t nb02 = kDKQ * sizeof(float);
     const std::int32_t nb11 = kDKQ * kKVHeads * sizeof(half);
     const std::int32_t nb12 = kDKQ * sizeof(half);
+    const std::int32_t nb23 = kDV * sizeof(half);
     const std::int32_t nb31 = mask_stride * sizeof(half);
 
     const uint3 ne01_fd = init_fastdiv_values(tokens);
 
+    // Use the vendor sequence axis for the two value shards. Zero strides share Q, K and the
+    // mask. Independent CTAs repeat QK and retain only 128 PV accumulators per lane.
     flash_attn_ext_f16<kDKQ, kDV, kNcols1, kNcols2, false, false, false>
         <<<blocks_num, block_dim, c.nbytes_shared, stream>>>(
             reinterpret_cast<const char*>(q_f32), reinterpret_cast<const char*>(k_f16),
             reinterpret_cast<const char*>(v_f16), reinterpret_cast<const char*>(mask), nullptr,
             nullptr, dst, dst_meta, scale, 0.0f, 1.0f, 1.0f, /*n_head_log2=*/16u, 0.0f, kDKQ,
-            ne01_fd, kQHeads, 1, nb01, nb02, 0, kDKQ, n_kv, kKVHeads, 1, nb11, nb12, 0, nb11, nb12,
-            0, tokens, 1, 1, nb31, 0, 0);
+            ne01_fd, kQHeads, kValueShards, nb01, nb02, 0, kDKQ, n_kv, kKVHeads, kValueShards,
+            nb11, nb12, 0, nb11, nb12, nb23, tokens, 1, 1, nb31, 0, 0);
 
     if (nblocks % ntiles_dst == 0 && nblocks > ntiles_dst) {
-        const uint3 fd0 = init_fastdiv_values(ntiles_x * ntiles_z_gqa * kKVHeads);
+        const uint3 fd0 = init_fastdiv_values(ntiles_shard);
         const uint3 fd1 = init_fastdiv_values(ntiles_x * ntiles_z_gqa);
         const uint3 fd2 = init_fastdiv_values(ntiles_x);
 
@@ -194,8 +202,7 @@ void launch_flash_block(const float* q_f32, const half* k_f16, const half* v_f16
     } else if (ntiles_dst % nblocks != 0) {
         const int total_work = ntiles_KV * ntiles_dst;
 
-        const uint3 fd_k_j_z_ne12 =
-            init_fastdiv_values(ntiles_KV * ntiles_x * ntiles_z_gqa * kKVHeads);
+        const uint3 fd_k_j_z_ne12 = init_fastdiv_values(ntiles_KV * ntiles_shard);
         const uint3 fd_k_j_z = init_fastdiv_values(ntiles_KV * ntiles_x * ntiles_z_gqa);
         const uint3 fd_k_j   = init_fastdiv_values(ntiles_KV * ntiles_x);
         const uint3 fd_k     = init_fastdiv_values(ntiles_KV);
@@ -208,25 +215,20 @@ void launch_flash_block(const float* q_f32, const half* k_f16, const half* v_f16
 }
 
 template <typename Geometry>
-std::size_t meta_elements_impl(std::int32_t tokens) {
-    using P                    = VoltaFlashParams<Geometry>;
-    const FlashLaunchConfig c  = flash_launch_config<Geometry>();
-    const int ntiles_x         = (tokens + P::kNcols1 - 1) / P::kNcols1;
-    const int ntiles_dst       = ntiles_x * ((P::kGroup + P::kNcols2 - 1) / P::kNcols2) * P::kKVHeads;
-    const int max_blocks       = c.blocks_per_sm * c.nsm;
-    // Upper bound: the launch never uses more blocks than this.
-    const int nblocks = std::max(max_blocks, ntiles_dst);
-    return static_cast<std::size_t>(nblocks) * P::kNcols * (2 + kDV / 2);
+std::size_t meta_elements_impl() {
+    const FlashLaunchConfig c = flash_launch_config<Geometry>();
+    const std::size_t blocks = std::size_t(c.blocks_per_sm) * c.nsm;
+    return blocks * VoltaFlashParams<Geometry>::kNcols * (2 + kDV / 2);
 }
 
 } // namespace
 
-std::size_t volta_flash_meta_elements(std::int32_t q_heads, std::int32_t tokens) {
+std::size_t volta_flash_meta_elements(std::int32_t q_heads) {
     if (q_heads == CausalD256H24Kv4::ModelQHeads) {
-        return meta_elements_impl<CausalD256H24Kv4>(tokens);
+        return meta_elements_impl<CausalD256H24Kv4>();
     }
     if (q_heads == CausalD256H16Kv2::ModelQHeads) {
-        return meta_elements_impl<CausalD256H16Kv2>(tokens);
+        return meta_elements_impl<CausalD256H16Kv2>();
     }
     throw std::invalid_argument("volta flash llama: unsupported Q head geometry");
 }

@@ -211,10 +211,14 @@ def main():
     (package / 'packages/multi.txt').write_text(''.join(f'{p}\n' for p in sorted(packages)))
     for source, destination in (
         (repo / 'LICENSE', 'LICENSE'),
+        (repo / 'third_party/ggml-quants/LICENSE', 'LICENSE-ggml.txt'),
         (repo / 'docs/release-archive-linux.md', 'README.md'),
         (repo / 'scripts/run.sh', 'run.sh'), (repo / 'scripts/download-model.sh', 'download-model.sh'),
     ):
         shutil.copy2(source, package / destination)
+    if '70' in arches:
+        cutlass_license = repo / 'third_party/licenses/cutlass-4.4.2.txt'
+        shutil.copy2(cutlass_license, package / 'LICENSE-cutlass.txt')
     distro = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
                   if '=' in line)
     if distro.get('ID', '').strip('"') == 'debian' and distro.get('VERSION_ID', '').strip('"') == '13':

@@ -15,6 +15,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -105,7 +106,7 @@ int projection(Operation op, int k, const std::vector<int>& parts, bool packed,
         std::fill_n(host.payload.begin()+host.scale_plane_offset, host.scale_plane_bytes, 0x40);
         const float divisor = 1;
         std::memcpy(host.payload.data()+host.weight_divisor_offset, &divisor, sizeof(divisor));
-    } else {
+    } else if (op != Operation::Gdn) {
         // Two serialized source factors in one parent, sampled across the row boundary.
         const std::array<float,2> divisors{0.375F,1.25F};
         host.payload.resize(host.weight_divisor_offset+sizeof(divisors));
@@ -216,15 +217,15 @@ int mixed_operand_fallbacks() {
     constexpr int rows = 128, k = 512, t = 3;
     auto gate_host = test::linear::make_nvfp4_weight(rows, k, 501U);
     auto up_host = test::linear::make_nvfp4_weight(rows, k, 503U);
-    auto q8_host = test::linear::make_q8_g32_fp16_weight(rows, k, 509U);
+    auto t2_host = test::linear::make_t2_g128_fp16_weight(rows, k, 509U);
     DeviceBuffer gate_bytes(gate_host.payload.size()), up_bytes(up_host.payload.size()),
-        q8_bytes(q8_host.payload.size());
+        t2_bytes(t2_host.payload.size());
     gate_bytes.copy_from_host(gate_host.payload.data(), gate_bytes.bytes);
     up_bytes.copy_from_host(up_host.payload.data(), up_bytes.bytes);
-    q8_bytes.copy_from_host(q8_host.payload.data(), q8_bytes.bytes);
+    t2_bytes.copy_from_host(t2_host.payload.data(), t2_bytes.bytes);
     auto gate = gate_host.device_weight(gate_bytes.p);
     const auto up = up_host.device_weight(up_bytes.p);
-    const auto q8 = q8_host.device_weight(q8_bytes.p);
+    const auto t2 = t2_host.device_weight(t2_bytes.p);
     ops::detail::nvfp4_prepack_qpn_sm70(gate); // gate is VoltaQpnPrepacked, up stays BlockScale
 
     std::vector<std::uint16_t> xbits(std::size_t(k) * t);
@@ -234,7 +235,7 @@ int mixed_operand_fallbacks() {
         xref[i] = test::bf16_to_f32(xbits[i]);
     }
     DeviceBuffer x(xbits.size() * 2), out_swiglu(std::size_t(rows) * t * 2),
-        out_q8(std::size_t(rows) * t * 2);
+        out_t2(std::size_t(rows) * t * 2);
     x.copy_from_host(xbits.data(), x.bytes);
     Tensor input(x.p, DType::BF16, {k, t});
     Tensor swiglu_tensor(out_swiglu.p, DType::BF16, {rows, t});
@@ -247,10 +248,10 @@ int mixed_operand_fallbacks() {
     const auto before = ops::v100_kernel_route_counts();
     // Mismatched split SwiGLU layouts decline W4A8 cleanly and run the BF16 direct small-T route.
     sm::swiglu_for(activation, gate, &up, swiglu_tensor, nullptr);
-    // A non-NVFP4 sibling in a split projection declines W4A8 cleanly as well.
-    const sm::Destination dest{static_cast<__nv_bfloat16*>(out_q8.p), rows, 0, 0, rows, false,
+    // A T2 sibling must not mistake the W4A8 activation plane for its own integer format.
+    const sm::Destination dest{static_cast<__nv_bfloat16*>(out_t2.p), rows, 0, 0, rows, false,
                                nullptr};
-    sm::project_for(activation, q8, {&dest, 1}, nullptr);
+    sm::project_for(activation, t2, {&dest, 1}, nullptr);
     test::cuda_synchronize();
     const auto after = ops::v100_kernel_route_counts();
     if (after.w4a8_narrow != before.w4a8_narrow || after.w4a8_wide != before.w4a8_wide) {
@@ -259,23 +260,38 @@ int mixed_operand_fallbacks() {
 
     std::vector<std::int32_t> all_rows(rows);
     for (int r = 0; r < rows; ++r) { all_rows[r] = r; }
-    const auto q8_ref = test::quantized_weight::materialize_rows_fp32(q8_host, all_rows);
-    std::vector<double> expected_q8(std::size_t(rows) * t), got_q8(expected_q8.size());
-    test::linear::cpu_linear_gemm_fp64(q8_ref.data(), xref.data(), expected_q8.data(), rows, k, t);
-    const auto actual_q8 = test::from_device<std::uint16_t>(out_q8, expected_q8.size());
-    for (std::size_t i = 0; i < actual_q8.size(); ++i) {
-        got_q8[i] = test::bf16_to_f32(actual_q8[i]);
+    const auto gate_ref = test::quantized_weight::materialize_rows_fp32(gate_host, all_rows);
+    const auto up_ref = test::quantized_weight::materialize_rows_fp32(up_host, all_rows);
+    const auto t2_ref = test::quantized_weight::materialize_rows_fp32(t2_host, all_rows);
+    const auto elements = std::size_t(rows) * t;
+    std::vector<double> expected_gate(elements), expected_up(elements), got_swiglu(elements);
+    std::vector<double> expected_t2(elements), got_t2(elements);
+    test::linear::cpu_linear_gemm_fp64(gate_ref.data(), xref.data(), expected_gate.data(), rows, k, t);
+    test::linear::cpu_linear_gemm_fp64(up_ref.data(), xref.data(), expected_up.data(), rows, k, t);
+    test::linear::cpu_linear_gemm_fp64(t2_ref.data(), xref.data(), expected_t2.data(), rows, k, t);
+    const auto actual_swiglu = test::from_device<std::uint16_t>(out_swiglu, elements);
+    const auto actual_t2 = test::from_device<std::uint16_t>(out_t2, elements);
+    for (std::size_t i = 0; i < elements; ++i) {
+        const double gate_value = expected_gate[i];
+        expected_gate[i] = gate_value / (1.0 + std::exp(-gate_value)) * expected_up[i];
+        got_swiglu[i] = test::bf16_to_f32(actual_swiglu[i]);
+        got_t2[i] = test::bf16_to_f32(actual_t2[i]);
     }
-    failures += test::verify_reduction("W4A8 mixed-format fallback", got_q8, expected_q8,
+    failures += test::verify_reduction("W4A8 mixed-layout fallback", got_swiglu, expected_gate,
+                                       {1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0});
+    failures += test::verify_reduction("W4A8 mixed-format fallback", got_t2, expected_t2,
                                        {1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0});
     return failures;
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (!test::linear::cuda_available() || !sm::enabled()) return 77;
     try {
         ops::set_v100_kernel_policy(true,true);
+        if (argc == 2 && std::string_view(argv[1]) == "--mixed-fallback-only") {
+            return mixed_operand_fallbacks() == 0 ? 0 : 1;
+        }
         const int crossover = sm::cublas_min_tokens();
         const std::array widths{1,2,3,4,5,32,33,crossover-1,crossover,crossover+1};
         const std::array fused{1,4,5,32,crossover-1,crossover};

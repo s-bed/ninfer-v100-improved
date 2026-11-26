@@ -250,6 +250,23 @@ class InputsAndCommands(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "expected one final"):
                 qualify.route_selections(path)
 
+    def test_incompatible_native_cache_probe_allows_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            log = folder / "server.log"
+            qualify.dump(folder / "startup.json", {"engine": {"v100_kernels": "native"}})
+            qualify.dump(folder / "gpu-memory.json", {"samples": []})
+            run = qualify.Run("cache", "int8", 3, 1, qualify.NATIVE)
+            record = ("[info] v100 kernel route selections: ported={ported} fallback=128 "
+                      "head=0 drafter=0 gdn=0 flash=0 w4a8_narrow=0 w4a8_wide=0 "
+                      "(graph replays not counted)\n")
+            log.write_text(record.format(ported=0), encoding="utf-8")
+            observed = qualify.trials_evidence(folder, run, smoke=True)
+            self.assertEqual(observed["route_selections"]["fallback"], 128)
+            log.write_text(record.format(ported=1), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "native control selected"):
+                qualify.trials_evidence(folder, run, smoke=True)
+
     def test_cache_capacity_is_shared_and_changed_media_has_reuse_ceiling(self):
         records = [{"phase": "capacity", "kv": "int8", "arm": arm.name, "status": "ok",
                     "engine": {"kv_capacity": size}} for arm, size in
@@ -300,18 +317,22 @@ class InputsAndCommands(unittest.TestCase):
                       "control": True} for i in range(384)]
             comparisons = [
                 dict(comparison=mode, kv_dtype=kv,
-                     documents=[] if mode == "w4a8" else documents, tasks=tasks)
+                     score_mode="score-narrow" if mode == "w4a8" else "score",
+                     documents=documents, tasks=tasks)
                 for mode in ("a16", "w4a8") for kv in ("int8", "bf16")
             ]
             qualify.dump(path, {"source": "paired raw records", "comparisons": comparisons})
             gates = qualify.quality(path)
-            self.assertEqual(len(gates), 6)
+            self.assertEqual(len(gates), 8)
             self.assertTrue(all(item["status"] == "pass" for item in gates))
-            vacuous = [dict(comparison=mode, kv_dtype=kv, documents=documents, tasks=tasks)
-                       for mode in ("a16", "w4a8") for kv in ("int8", "bf16")]
-            qualify.dump(path, {"source": "paired raw records", "comparisons": vacuous})
-            with self.assertRaisesRegex(ValueError, "vacuous"):
-                qualify.quality(path)
+            narrow = comparisons[2]
+            qualify.dump(path, {"source": "paired raw records", "comparisons": [dict(narrow, score_mode="score")]})
+            gates = qualify.quality(path)
+            self.assertIn("quality needs matched score-narrow evidence", [item.get("reason") for item in gates])
+            regressed = [dict(item, candidate_mean_nll=1.51) for item in documents]
+            qualify.dump(path, {"source": "paired raw records", "comparisons": [dict(narrow, documents=regressed)]})
+            gate = next(item for item in qualify.quality(path) if item.get("case") == "perplexity")
+            self.assertEqual((gate["comparison"], gate["kv"], gate["status"]), ("w4a8", "int8", "fail"))
             documents[0]["tokens"] -= 1
             qualify.dump(path, {"source": "paired raw records", "comparisons": comparisons})
             self.assertEqual(qualify.quality(path)[0]["status"], "open")

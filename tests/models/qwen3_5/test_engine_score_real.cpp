@@ -21,7 +21,11 @@ int run() {
     options.artifact_path = artifact;
     options.purpose       = ninfer::EnginePurpose::CausalScoring;
     options.max_context   = 2048;
+#if defined(NINFER_SM8X_COMPAT)
+    options.kv_cache      = ninfer::KvCacheStorage::BFloat16;
+#else
     options.kv_cache      = ninfer::KvCacheStorage::Fp8E4M3Row256;
+#endif
     ninfer::Engine engine(options);
     const auto& effective = engine.options();
     if (effective.max_concurrency != 1 || effective.prefill_chunk != 1024 ||
@@ -29,7 +33,7 @@ int run() {
         effective.kv_capacity.explicit_tokens != effective.max_context ||
         effective.context_cache.enabled ||
         effective.speculative.backend != ninfer::SpeculativeBackend::None ||
-        effective.kv_cache != ninfer::KvCacheStorage::Fp8E4M3Row256) {
+        effective.kv_cache != options.kv_cache) {
         std::cerr << "causal scoring options were not normalized correctly\n";
         return 1;
     }
@@ -67,6 +71,19 @@ int run() {
             std::cerr << "a repeated score window inherited prior State/KV\n";
             return 1;
         }
+    }
+    // Stop the warmup at predictor 128, then score two groups of four and one tail.
+    // Truncating immediately after the first group must give exactly its four probabilities.
+    std::vector<ninfer::TokenId> short_window(tokens.begin(), tokens.begin() + 138);
+    const auto narrow = engine.score_tokens(short_window, 129, 4);
+    short_window.resize(133);
+    const auto first_group = engine.score_tokens(short_window, 129, 4);
+    if (narrow.size() != 9 || first_group.size() != 4 ||
+        !std::all_of(narrow.begin(), narrow.end(),
+                     [](float x) { return std::isfinite(x) && x <= 0; }) ||
+        !std::equal(first_group.begin(), first_group.end(), narrow.begin())) {
+        std::cerr << "narrow causal scoring changed the target range or its first group\n";
+        return 1;
     }
     std::cout << "OK causal_score_real\n";
     return 0;

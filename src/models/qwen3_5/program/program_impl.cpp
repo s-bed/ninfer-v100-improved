@@ -753,8 +753,8 @@ ProgramImpl::~ProgramImpl() noexcept {
     }
 }
 
-std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
-                                             std::uint32_t first_target) {
+std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t first_target,
+                                             std::uint32_t max_scored_width) {
     if (!causal_scoring || !score_hidden || !score_logprobs_host ||
         workspace_plan.causal_score == 0) {
         throw std::logic_error("Program was not constructed for causal scoring");
@@ -799,7 +799,9 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
     std::vector<float> output;
     output.reserve(token_count_size - first_target);
     std::vector<TokenId> staged_targets;
-    staged_targets.reserve(kCausalScoreTile);
+    const auto score_tile = max_scored_width == 0 ? kCausalScoreTile
+                                                  : std::min(max_scored_width, kCausalScoreTile);
+    staged_targets.reserve(score_tile);
     std::uint32_t staged_columns = 0;
 
     try {
@@ -820,7 +822,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
         const std::int32_t state_slot = state_store->physical_slot(*state);
         const auto flush              = [&] {
             if (staged_columns == 0) { return; }
-            if (staged_columns != staged_targets.size() || staged_columns > kCausalScoreTile) {
+            if (staged_columns != staged_targets.size() || staged_columns > score_tile) {
                 throw std::logic_error("causal score staging has an invalid shape");
             }
             work.reset();
@@ -849,7 +851,13 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
 
         std::uint32_t cursor = 0;
         while (cursor < predictor_count) {
-            const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
+            std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
+            if (max_scored_width != 0) {
+                // Finish the unscored context before selecting the narrower predictor schedule.
+                const auto limit = cursor < scored_predictor_begin ? scored_predictor_begin - cursor
+                                                                   : max_scored_width;
+                nominal = std::min(nominal, limit);
+            }
             execution::PrefillContext schedule_state{
                 {device, parameters, work, state_images->linear(0), nullptr, io, prefill_hidden,
                  prefill_chunk, proposal_head, stage_runtime.get(), rope_yarn, fast_prefill_kernel,
@@ -881,7 +889,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             std::uint32_t selected = std::max(chunk_begin, scored_predictor_begin);
             while (selected < cursor) {
                 const std::uint32_t available = cursor - selected;
-                const std::uint32_t room      = kCausalScoreTile - staged_columns;
+                const std::uint32_t room      = score_tile - staged_columns;
                 const std::uint32_t count     = std::min(available, room);
                 Tensor source =
                     prefill_hidden.slice(1, static_cast<std::int32_t>(selected - chunk_begin),
@@ -895,7 +903,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 }
                 selected += count;
                 staged_columns += count;
-                if (staged_columns == kCausalScoreTile) { flush(); }
+                if (staged_columns == score_tile) { flush(); }
             }
         }
         flush();

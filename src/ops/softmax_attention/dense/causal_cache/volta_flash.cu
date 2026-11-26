@@ -39,7 +39,7 @@ struct Scratch {
 template <class Allocator>
 Scratch allocate(Allocator& arena, int q_heads, int kv_heads, int visible_keys) {
     const int keys = padded_keys(visible_keys);
-    const std::size_t partials = volta_flash_meta_elements(q_heads, kVoltaFlashQueryBlock);
+    const std::size_t partials = volta_flash_meta_elements(q_heads);
     return {
         arena.alloc(DType::FP16, {kHeadDim, kv_heads, keys}),
         arena.alloc(DType::FP16, {kHeadDim, kv_heads, keys}),
@@ -112,8 +112,11 @@ __global__ void causal_mask(const std::int32_t* positions, int tokens, half* mas
 }
 
 __global__ void convert_output(const float* staged, __nv_bfloat16* out) {
+    const std::int64_t shard_row =
+        (static_cast<std::int64_t>(threadIdx.x / kVoltaFlashValueShard) * gridDim.x +
+         blockIdx.x) * kVoltaFlashValueShard;
     const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    out[index] = __float2bfloat16_rn(staged[index]);
+    out[index] = __float2bfloat16_rn(staged[shard_row + threadIdx.x % kVoltaFlashValueShard]);
 }
 
 template <int KVHeads>

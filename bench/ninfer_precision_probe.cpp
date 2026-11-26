@@ -28,8 +28,13 @@ int main(int argc, char** argv) {
   try {
     if (argc == 2 && std::string(argv[1]) == "--help") {
 #ifdef NINFER_V100_FROZEN_QUALITY
-        std::cout << "ninfer-v100-quality-probe score|generate ARTIFACT JOBS OUT 0 CONTEXT "
-                     "int8|bf16 a16|w4a8\n";
+        std::cout << "ninfer-v100-quality-probe "
+#ifdef NINFER_V100_QUALITY_W4A8
+                     "score|score-narrow|generate ARTIFACT JOBS OUT 0 CONTEXT int8|bf16 a16|w4a8\n"
+                     "score-narrow caps scored projections at four columns. Use score-narrow for W4A8.\n";
+#else
+                     "score|generate ARTIFACT JOBS OUT 0 CONTEXT int8|bf16 a16\n";
+#endif
 #else
         std::cout << "precision-probe tokenize RESOURCES JOBS OUT | score|generate|native ARTIFACT JOBS OUT [K] [CONTEXT]\n";
 #endif
@@ -37,8 +42,13 @@ int main(int argc, char** argv) {
     }
     if (argc < 5) throw std::invalid_argument("missing arguments");
     std::string mode = argv[1];
+    const bool narrow_scoring = mode == "score-narrow";
+    const bool scoring = mode == "score" || narrow_scoring;
+#ifndef NINFER_V100_QUALITY_W4A8
+    if (narrow_scoring) throw std::invalid_argument("probe lacks narrow scoring support");
+#endif
 #ifdef NINFER_V100_FROZEN_QUALITY
-    if (argc != 9 || (mode != "score" && mode != "generate") || std::string(argv[5]) != "0") {
+    if (argc != 9 || (!scoring && mode != "generate") || std::string(argv[5]) != "0") {
         throw std::invalid_argument("expected frozen quality probe settings; see --help");
     }
     const std::string kv = argv[7];
@@ -72,7 +82,7 @@ int main(int argc, char** argv) {
     }
     ninfer::EngineOptions opts;
     opts.artifact_path=argv[2];
-    opts.purpose=mode=="score" ? ninfer::EnginePurpose::CausalScoring : ninfer::EnginePurpose::Generation;
+    opts.purpose=scoring ? ninfer::EnginePurpose::CausalScoring : ninfer::EnginePurpose::Generation;
     opts.max_context=argc>6 ? std::stoul(argv[6]) : 8192;
     opts.kv_capacity=ninfer::KvCapacityPolicy::explicit_capacity(opts.max_context);
     opts.kv_cache=ninfer::KvCacheStorage::Int8Group64;
@@ -98,8 +108,7 @@ int main(int argc, char** argv) {
     opts.context_cache.enabled = false;
 #ifdef NINFER_V100_QUALITY_W4A8
     if (mode == "score" && arithmetic == "w4a8") {
-        throw std::invalid_argument(
-            "w4a8 applies only to narrow generation (T<=4), not chunked score mode");
+        throw std::invalid_argument("W4A8 scoring requires score-narrow");
     }
     opts.nvfp4_w4a8_int = arithmetic == "w4a8";
 #else
@@ -125,8 +134,14 @@ int main(int argc, char** argv) {
         else unsetenv("NINFER_PRECISION_OBSERVER");
         if (job.contains("forced_tokens")) setenv("NINFER_PRECISION_FORCED",job["forced_tokens"].dump().c_str(),1);
         else unsetenv("NINFER_PRECISION_FORCED");
-        if (mode=="score") {
-          auto probs=engine.score_tokens(ids,job.at("first_target"));
+        if (scoring) {
+          const auto first_target = job.at("first_target").get<std::uint32_t>();
+#ifdef NINFER_V100_QUALITY_W4A8
+          constexpr std::uint32_t kNarrowScoreWidth = 4;
+          auto probs = engine.score_tokens(ids, first_target, narrow_scoring ? kNarrowScoreWidth : 0U);
+#else
+          auto probs = engine.score_tokens(ids, first_target);
+#endif
           for(float probability:probs) if(!std::isfinite(probability)) throw std::runtime_error("non-finite target-token log probability");
           result["logprobs"]=probs;
           result["first_target"]=job.at("first_target");

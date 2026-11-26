@@ -55,6 +55,7 @@ struct Options {
     std::optional<std::filesystem::path> output;
     std::uint32_t context     = 4096;
     std::uint32_t stride      = 2048;
+    std::uint32_t score_width = 0;
     bool disjoint             = false;
     int device                = 0;
     // Qwen3.8-Flash-Next: a pipeline over several devices, host-resident experts and their
@@ -125,8 +126,8 @@ std::string usage_text() {
            "       (--no-prefill-a8 is the opposite: scoring runs the prefill phase, so this is\n"
            "        how the integer prefill routes' perplexity cost is measured)\n"
            "       [--v100-kernels native|ported] [--nvfp4-w4a8-int]\n"
-           "       (--nvfp4-w4a8-int is inert here: narrow T<=4 decode/verify only, while\n"
-           "        scoring runs wide prefill chunks on the Volta FP16 route)\n"
+           "       [--score-width N]       cap Qwen3.5-core scored predictor and head batches\n"
+           "       (--nvfp4-w4a8-int defaults to width 4; use the same width for an A16 control)\n"
            "       [--prefill-cublas [--no-prefill-cublas-projections]] [--fast-prefill-kernel]\n"
            "       (--prefill-cublas scores through the cuBLAS prefill route, which is how its\n"
            "        perplexity cost is measured; the projections flag keeps the attention and GDN\n"
@@ -173,6 +174,11 @@ Options parse_options(int argc, char** argv) {
             out.context = parse_integer<std::uint32_t>(value("--context"), "context");
         } else if (option == "--stride") {
             out.stride = parse_integer<std::uint32_t>(value("--stride"), "stride");
+        } else if (option == "--score-width") {
+            out.score_width = parse_integer<std::uint32_t>(value("--score-width"), "score-width");
+            if (out.score_width == 0 || out.score_width > 1024) {
+                usage_error("--score-width must be in [1,1024]");
+            }
         } else if (option == "--disjoint") {
             out.disjoint = true;
         } else if (option == "--device") {
@@ -312,6 +318,10 @@ Options parse_options(int argc, char** argv) {
     }
     ninfer::product::check_tensor_split(out.tensor_split, out.devices.size(), out.tensor_parallel);
     ninfer::product::validate_v100_options(out.v100_kernels, out.nvfp4_w4a8_int);
+    if (out.nvfp4_w4a8_int) {
+        if (out.score_width > 4) { usage_error("--nvfp4-w4a8-int needs --score-width in [1,4]"); }
+        if (out.score_width == 0) { out.score_width = 4; }
+    }
     ninfer::product::check_tensor_attention(out.tensor_attention, out.tensor_parallel);
     return out;
 }
@@ -524,7 +534,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             const Clock::time_point window_started = Clock::now();
             std::vector<float> logprobs;
             try {
-                logprobs = engine.score_tokens(std::move(input), window.first_target);
+                logprobs = engine.score_tokens(std::move(input), window.first_target, options.score_width);
             } catch (const std::exception& error) {
                 throw std::runtime_error("scoring " + stream.source.id + " window " +
                                          std::to_string(window_index) + " failed: " + error.what());
@@ -629,7 +639,10 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"stride_tokens", options.disjoint ? options.context : options.stride},
           {"windows", options.disjoint ? "disjoint" : "sliding"},
           {"prefill_chunk_tokens", 1024},
-          {"score_tile_tokens", 1024},
+          {"score_tile_tokens", options.score_width == 0 ? 1024U : options.score_width},
+          {"v100_kernels", engine.options().v100_kernels == ninfer::V100KernelPolicy::Ported
+                               ? "ported" : "native"},
+          {"nvfp4_w4a8_int", engine.options().nvfp4_w4a8_int},
           {"kv_dtype", kv_name(kv)}}},
         {"timing",
          {{"load_seconds", load.load_seconds},

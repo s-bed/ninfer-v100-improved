@@ -726,8 +726,8 @@ public:
                                                       const PreparedPromptData& prompt) const;
     [[nodiscard]] std::uint32_t matched_prefix_tokens(const SharedPrefixHandle& owner,
                                                       const PreparedPromptData& prompt) const;
-    [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&& prompt,
-                                                  std::uint32_t first_target);
+    [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&& prompt, std::uint32_t first_target,
+                                                  std::uint32_t max_scored_width);
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPromptData& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,

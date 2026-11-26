@@ -92,6 +92,10 @@ ninfer_add_op_test(ninfer_linear_stq_test
 ninfer_add_op_test(ninfer_v100_w4a8_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_v100_w4a8.cpp"
   LIBRARIES ninfer_linear_test_support)
+add_test(NAME ninfer_v100_w4a8_mixed_fallback_test
+  COMMAND ninfer_v100_w4a8_test --mixed-fallback-only)
+set_tests_properties(ninfer_v100_w4a8_mixed_fallback_test PROPERTIES
+  SKIP_RETURN_CODE 77 ENVIRONMENT "NINFER_SM70_CUBLAS_MIN=1")
 
 ninfer_add_op_test(ninfer_v100_port_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_v100_port.cpp"

@@ -1463,6 +1463,25 @@ namespace ggml_cuda_mma {
 #endif // defined(VOLTA_MMA_AVAILABLE)
     }
 
+    // NInfer: Volta PV uses row-major V fragments and FP32 accumulators.
+    static __device__ __forceinline__ void mma(
+            tile<32, 8, float> & D, const tile<32, 4, half2> & A, const tile<8, 4, half2, DATA_LAYOUT_J_MAJOR_MIRRORED> & B) {
+#if defined(VOLTA_MMA_AVAILABLE)
+        const int * Axi = (const int *) A.x;
+        const int * Bxi = (const int *) B.x;
+#pragma unroll
+        for (int i = 0; i < 4; i += 2) {
+            asm("mma.sync.aligned.m8n8k4.row.row.f32.f16.f16.f32 "
+                "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, {%10, %11}, {%0, %1, %2, %3, %4, %5, %6, %7};"
+                : "+f"(D.x[0]), "+f"(D.x[1]), "+f"(D.x[2]), "+f"(D.x[3]), "+f"(D.x[4]), "+f"(D.x[5]), "+f"(D.x[6]), "+f"(D.x[7])
+                : "r"(Axi[i]), "r"(Axi[i + 1]), "r"(Bxi[i]), "r"(Bxi[i + 1]));
+        }
+#else
+        GGML_UNUSED_VARS(D, A, B);
+        NO_DEVICE_CODE;
+#endif // defined(VOLTA_MMA_AVAILABLE)
+    }
+
     static __device__ __forceinline__ void mma(
             tile<16, 16, half2, DATA_LAYOUT_I_MAJOR> & D, const tile<32,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED> & A,
             const tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED> & B) {

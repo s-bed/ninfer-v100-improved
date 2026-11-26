@@ -20,7 +20,11 @@ from ninfer_precision_grade import grade  # noqa: E402
 
 
 KV_TYPES = ("int8", "bf16")
-ARMS = ("baseline", "a16", "w4a8")
+ARM_PHASES = {
+    "baseline": ("score", "generate"),
+    "a16": ("score", "score-narrow", "generate"),
+    "w4a8": ("score-narrow", "generate"),
+}
 TASK_COUNTS = {
     "tool_json": 128, "code": 96, "arithmetic": 64,
     "retrieval_en": 32, "retrieval_zh": 32, "history": 32,
@@ -150,7 +154,7 @@ def run_probe(command: list[str], output: Path, env: dict, timeout: int) -> dict
     return index(read_jsonl(path.read_bytes()), str(path))
 
 
-def check_w4a8_decode(log: Path, enabled: bool) -> int:
+def check_w4a8_route(log: Path, enabled: bool) -> int:
     reports = re.findall(r"\bw4a8_narrow=(\d+)\s+w4a8_wide=(\d+)",
                          log.read_text(encoding="utf-8", errors="replace"))
     if len(reports) != 1:
@@ -161,14 +165,14 @@ def check_w4a8_decode(log: Path, enabled: bool) -> int:
     return narrow
 
 
-def score_documents(records: dict, windows: list[dict]) -> dict:
+def score_documents(records: dict, windows: list[dict], mode: str) -> dict:
     if records.keys() != {job["id"] for job in windows}:
         raise ValueError("causal scoring did not return every frozen window")
     totals = defaultdict(list)
     for job in windows:
         row = records[job["id"]]
         logprobs = row.get("logprobs", [])
-        if ("error" in row or row.get("mode") != "score" or row.get("k") != 0 or
+        if ("error" in row or row.get("mode") != mode or row.get("k") != 0 or
                 row.get("first_target") != job["first_target"] or
                 row.get("input_tokens") != len(job["tokens"]) or
                 len(logprobs) != job["target_end"] - job["target_begin"] or
@@ -198,18 +202,16 @@ def grade_tasks(records: dict, cases: dict, generation: list[dict]) -> dict:
     return grades
 
 
-def compare(kv: str, name: str, streams: dict, cases: dict,
-            control: tuple[dict | None, dict], candidate: tuple[dict | None, dict]) -> dict:
+def compare(kv: str, name: str, score_mode: str, streams: dict, cases: dict,
+            control: tuple[dict, dict], candidate: tuple[dict, dict]) -> dict:
     control_nll, control_grade = control
     candidate_nll, candidate_grade = candidate
-    documents = [] if control_nll is None or candidate_nll is None else [
-        {"id": key, "domain": row["domain"], "tokens": 8192,
-         "control_mean_nll": control_nll[key],
-         "candidate_mean_nll": candidate_nll[key]} for key, row in streams.items()
-    ]
     return {
         "comparison": name, "kv_dtype": kv,
-        "documents": documents,
+        "score_mode": score_mode,
+        "documents": [{"id": key, "domain": row["domain"], "tokens": 8192,
+                       "control_mean_nll": control_nll[key],
+                       "candidate_mean_nll": candidate_nll[key]} for key, row in streams.items()],
         "tasks": [{"id": key, "domain": row["domain"], "cluster": cluster(row),
                    "control": control_grade[key]["correct"],
                    "candidate": candidate_grade[key]["correct"]} for key, row in cases.items()],
@@ -237,34 +239,31 @@ def run(args: argparse.Namespace) -> None:
     comparisons = []
     for kv in KV_TYPES:
         results = {}
-        for arm in ARMS:
+        for arm, phases in ARM_PHASES.items():
             probe = probes["baseline" if arm == "baseline" else "candidate"]
             arithmetic = "w4a8" if arm == "w4a8" else "a16"
-            records = {}
-            # W4A8 quantizes narrow decode/verify widths (T<=4) only; 2,048-token CausalScoring
-            # chunks execute zero w4a8_narrow calls and would produce a vacuous zero NLL delta.
-            phases = (("generate", generation_jobs, "8192"),) if arm == "w4a8" else (
-                ("score", score_jobs, "4096"), ("generate", generation_jobs, "8192"))
-            for mode, jobs, context in phases:
+            for mode in phases:
+                jobs, context = (generation_jobs, "8192") if mode == "generate" else (score_jobs, "4096")
                 stem = args.output / f"{kv}-{arm}-{mode}"
                 command = [str(probe), mode, str(artifact), str(jobs), str(stem.with_suffix(".jsonl")),
                            "0", context, kv, arithmetic]
                 metadata["commands"].append(command)
                 dump(manifest, metadata)
                 log = stem.with_suffix(".log")
-                records[mode] = run_probe(command, log, env, args.timeout)
+                records = run_probe(command, log, env, args.timeout)
                 if arm != "baseline":
-                    if mode == "generate":
-                        selections = metadata.setdefault("w4a8_narrow_selections", {})
-                        selections[f"{kv}-{arm}"] = check_w4a8_decode(log, arm == "w4a8")
-                    else:
-                        check_w4a8_decode(log, False)
-            nll = None if arm == "w4a8" else score_documents(records["score"], windows)
-            grades = grade_tasks(records["generate"], cases, generation)
-            dump(args.output / f"{kv}-{arm}-grades.json", grades)
-            results[arm] = nll, grades
-        comparisons.append(compare(kv, "a16", streams, cases, results["baseline"], results["a16"]))
-        comparisons.append(compare(kv, "w4a8", streams, cases, results["a16"], results["w4a8"]))
+                    selections = metadata.setdefault("w4a8_narrow_selections", {})
+                    selections[f"{kv}-{arm}-{mode}"] = check_w4a8_route(log, arm == "w4a8")
+                if mode == "generate":
+                    grades = grade_tasks(records, cases, generation)
+                    dump(args.output / f"{kv}-{arm}-grades.json", grades)
+                    results[arm, mode] = grades
+                else:
+                    results[arm, mode] = score_documents(records, windows, mode)
+        for mode, control, candidate in (("score", "baseline", "a16"), ("score-narrow", "a16", "w4a8")):
+            comparisons.append(compare(kv, candidate, mode, streams, cases,
+                (results[control, mode], results[control, "generate"]),
+                (results[candidate, mode], results[candidate, "generate"])))
     dump(manifest, metadata)
     if file_identity(artifact) != artifact_identity or any(
             hash_file(path) != probe_identities[name]["sha256"] for name, path in probes.items()):

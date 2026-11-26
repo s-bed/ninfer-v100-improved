@@ -16,9 +16,12 @@ The flash-attention kernel (`ggml-cuda/fattn-mma-f16.cuh` with `fattn-common.cuh
 `cp-async.cuh`, same base commit) runs Gemma 4's prompt attention (head widths 256 and 512)
 through `src/ops/linear/gguf/ggml_fattn.cu` and Qwen3.5's Volta BF16 prompt attention (head width
 256) through `src/ops/softmax_attention/dense/causal_cache/volta_flash_bridge.cu`, both launched
-without ggml's backend context. `ggml_cuda_fattn_mma_get_config_volta` adds 32- and 64-column
-`256/256` entries (`nbatch_combine = 64`) instead of falling through to Ampere's `nbatch_combine =
-128`. The combine-loop barrier in `fattn-mma-f16.cuh` includes the exact condition from upstream
+without ggml's backend context. The Qwen bridge enables its own 32- and 64-column `256/128`
+Volta configurations and FP32 PV accumulation, including the shared-memory combine path. It
+uses the kernel's sequence axis for two 128-feature value shards, repeating QK with shared Q
+and K buffers to stay within Volta's per-thread register limit. Gemma's bridge uses the base
+configuration table.
+The combine-loop barrier in `fattn-mma-f16.cuh` includes the exact condition from upstream
 [`1bb2b9fcbe85c35c4e3b787e1c868ef05ca702f3`](https://github.com/ggml-org/llama.cpp/commit/1bb2b9fcbe85c35c4e3b787e1c868ef05ca702f3)
 (PR #30103). It synchronizes before reusing the shared combine tile when
 `nbatch_combine != DKQ/2`, including the Turing 512-wide 16/32-column configurations.

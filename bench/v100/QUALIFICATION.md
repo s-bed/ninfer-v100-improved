@@ -11,7 +11,9 @@ directories, and test persistence files.
 
 Use Linux, CUDA **12.9**, a supported C++ compiler, Ninja, CMake, Python 3.11, the project’s
 FFmpeg/curl development packages and CUTLASS **4.4.2** (pre-cached or staged with
-`python3.11 .github/scripts/install-cutlass.py`). Reserve one idle V100. Keep the
+`python3.11 "$CANDIDATE/.github/scripts/install-cutlass.py" --destination "$CUTLASS"`).
+Reserve one idle V100. If multiple GPUs are visible, set `CUDA_VISIBLE_DEVICES` to the reserved
+V100's UUID so it is device zero for every stage. Keep the
 baseline checkout clean at `42d8d03ffe7ac9e9c5cd1cb227a195c099a03f88`.
 From a local clone of `s-bed/ninfer-v100-improved`, fetch the published candidate and create
 two detached worktrees. Record the candidate SHA before starting the campaign.
@@ -63,23 +65,27 @@ fatbinary compression. It checks that the Volta launch files emit sm_70 machine 
 that the shared dispatcher emits both sm_70 and sm_75. It checks the non-Volta `75`
 compilation database for excluded Volta sources and compiles the native stubs. After a memory-pressure failure, rerun
 `run_v100 build --jobs 4`; Ninja resumes the same build directories. `correctness`
-includes Compute Sanitizer on the 200,000-key Flash Attention boundary. `gdn` times
+includes Compute Sanitizer on the 200,000-key Flash Attention boundary and a real-artifact
+BF16 scoring test for the four-column predictor cap, its tail and prefix consistency. `gdn` times
 16/32 and 16/48 across prompt widths from 15 to 2,048 under the profiled, recurrent,
 forced two-stage and forced legacy routes. Select production GDN cutovers only where those
 measurements and numerical evidence justify them. `quality` validates the frozen manifests
 and runs both scoring and task grading; `performance` reads its paired observations.
 Inspect failed and skipped rows before continuing dependent stages. Independent evidence
-can still be collected after an open fixture gate. `report.json` lists every stage attempt,
-unrun stages and the remaining release review. `workloads.csv` gives one row per measured request and configuration plus separate rows for failed, inconclusive and skipped gates. Keep each attempt directory with the report.
+can still be collected after an open fixture gate. `report` inventories every stage attempt in
+`report.json`, along with unrun stages and the remaining release review. Read the actual paired
+decisions in `performance-*/observations/summary.json`. `workloads.csv` gives one row per measured
+request and configuration plus separate rows for failed, inconclusive and skipped gates. Keep each
+attempt directory with the report, and attach any direct `qualify.py` outputs separately.
 
 ## Implementation-host evidence
 
-The complete Linux sm_70 Release build linked its normal apps, tests, benchmarks and frozen
+On the initial candidate (`9aa71394`), the complete Linux sm_70 Release build linked its
+normal apps, tests, benchmarks and frozen
 quality probe under CUDA 12.9.86, CUTLASS 4.4.2 and GCC 13.4. Thirteen focused CPU CTests
 passed, covering admission of the V100 policy, cache identities, architecture guards, CLI
 and Serve options, request logging, cache configuration/index and the native/ported loading
-rules. The Python 3.11.9 handoff suite passed 25 tests. The Linux package suite ran 13
-tests with two dependency-dependent skips. The mixed `70;75` build linked the production
+rules. The mixed `70;75` build linked the production
 server and its `--help` exposed both V100 options. On a configured sm_86 Release tree the handoff
 source-exclusion check passed and the real native stub compiled.
 
@@ -97,6 +103,12 @@ all 118 host registrations from the sm_70-only build. The shared dispatcher cont
 sm_70 and sm_75 device images. The complete sm_70 build also exposed a missing source in
 the multi-GPU probe target. That probe now links its existing peer-preflight implementation
 and requires a CUDA driver to run.
+
+On the reviewed implementation, 26 Python 3.11 handoff tests and three CUTLASS installer
+tests passed. The Linux packaging suite ran 14 tests with two platform-tool skips. The
+revised Qwen Flash kernel and the shared GGUF attention compiled with CUDA 12.9. The new
+four-column likelihood gate requires real W4A8 selections during scoring and generation.
+The fallback controls accept native work while checking for leaked ported selections.
 
 All V100 numerical, inference, capacity, cache, quality and performance results are pending.
 The two real DFlash2 regression tests also require the separate compatible artifact
@@ -133,6 +145,13 @@ support INT8 KV. [Donor deployment and INT8 trial](https://github.com/RodrigoR78
 | Causal attention | Paged Volta attention serves BF16 and INT8. | Correct the donor BF16 V conversion and 256-key scratch rounding, clamp per-1024-query-block causal key extents, and test single-sequence BF16 dense prefill with sequential visibility. INT8 keeps its profiled attention route. |
 | NVFP4 | Our ported A16 handles both packed and stored weights and has its own wide crossover. | Explicit W4A8 uses per-token group-32 activation scales for eligible narrow (`T <= 4`, decode and MTP3 verify) projections and the single-pass Volta FP16 QPN/CUTLASS/cuBLAS routes at `T >= 5`. Measure quality independently in each KV format. |
 
+The Qwen Flash route splits 256 value features between two groups of CTAs to accumulate
+the probability–value product in FP32. Each group repeats the query–key product. CUDA 12.9
+assembly used 254 registers per thread for 24/4 heads and 242 for 16/2, with zero spill
+loads or stores in either kernel. Measure the net effect at 33K and check the independent
+oracle on large values and across both output halves. The shared Gemma and Flint GGUF
+attention uses its original schedule. Exercise it with `ninfer_gguf_flash_attention_test`.
+
 At the 200,000-key boundary, the Flash launcher rounds to 200,192 keys. The calculated K/V,
 mask and Q/output buffers total 1,221 MiB at 24/4 heads and 814 MiB at 16/2 heads, plus
 stream partials and alignment. The Program reuses its workspace across Ops. Measure the
@@ -148,7 +167,7 @@ route uncovered. A route that skipped or never dispatched remains open.
 
 ~~~bash
 NINFER_OP_REPORT_STATS=1 ctest --test-dir "$CANDIDATE_BUILD" --output-on-failure \
-  -R '^ninfer_(v100_(port|native_packed|w4a8|fp8.*|drafter.*|gdn.*)|gated_delta_net.*|softmax_attention.*|linear_(q4|q8)_(a16|a8int)|linear_swiglu_(q4_a16|q8_a16|nvfp4))_test$'
+  -R '^ninfer_(v100_(port|native_packed|w4a8.*|fp8.*|gdn.*)|gated_delta_net(_two_stage)?|gguf_flash_attention|softmax_attention(_volta_flash|_int8_prompt)?|linear_(q4|q8)_(a16|a8int)|linear_swiglu_(q4_a16|q8_a16|nvfp4))_test$'
 ~~~
 
 Use the candidate's targeted cases and [Op qualification rules](../../docs/maintainer/op-development.md).
@@ -340,23 +359,24 @@ python3.11 "$CANDIDATE/bench/v100/quality.py" \
 
 The probe uses the same frozen prompt token IDs and task order in each arm, with greedy sampling,
 seed 1729, no speculation or prefix reuse, and the established exact, JSON and code graders.
-A16 scoring uses 16 streams with 8,192 targets each, a 4,096-token context and 2,048-token stride;
-because W4A8 quantizes narrow (`T <= 4`) projections only and chunked `CausalScoring` executes zero
-`w4a8_narrow` calls, W4A8 omits the vacuous scoring pass and `qualify.py` rejects `w4a8` score
-records if supplied. All 384 tasks use their original cluster labels and output budgets. The W4A8
-generation arm must record a narrow W4A8 selection. The run directory retains commands, route
-counts, fixture and job hashes, probe hashes, raw log probabilities, answers, and grade reasons.
-Missing or incomplete inputs leave `status.json` open and produce no quality evidence.
+Both scoring comparisons use 16 streams with 8,192 targets each, a 4,096-token context and
+2,048-token stride. Refreshed main and candidate A16 use ordinary `score` for the A16 comparison.
+The W4A8 comparison runs candidate A16 and candidate W4A8 through `score-narrow`, capping
+scored projections at four token columns after the unscored context so the scored suffix exercises
+the eligible W4A8 route. All 384 tasks use their original cluster labels and output budgets.
+Both W4A8 scoring and generation must report narrow W4A8 selections. The run directory retains
+commands, route counts, fixture and job hashes, probe hashes, raw log probabilities, answers, and
+grade reasons. Missing or incomplete inputs leave `status.json` open and produce no quality
+evidence. The `quality` stage collects observations. The `performance` stage evaluates intervals.
 
 Pass `$RESULTS/manual-quality/quality-evidence.json` as `--quality-evidence`. It contains a `source`
 link to the run manifest and four `comparisons` covering `comparison` values `a16` and `w4a8`
-crossed with `kv_dtype` values `int8` and `bf16`. Each `a16` comparison contains `documents` with
-`id`, `domain`, `tokens`, `control_mean_nll` and `candidate_mean_nll`, while `w4a8` carries an empty
-`documents` list; all four carry `tasks` with `id`, `domain`, `cluster` and Boolean `control` and
-`candidate` grades. Here the A16 control is refreshed main and the W4A8 control is candidate A16.
-The gate bootstraps whole paired streams and fixture clusters using 20,000 replicates and seed
-1729. All six two-sided 99.1667% intervals (two `a16` perplexity intervals and four `a16`/`w4a8`
-accuracy intervals) must fit within ±0.5% relative perplexity and ±2 percentage points accuracy.
+crossed with `kv_dtype` values `int8` and `bf16`. Each comparison states its `score_mode` and
+contains `documents` with `id`, `domain`, `tokens`, `control_mean_nll` and `candidate_mean_nll`,
+plus `tasks` with `id`, `domain`, `cluster` and Boolean `control` and `candidate` grades. The gate
+bootstraps whole paired streams and fixture clusters using 20,000 replicates and seed 1729. All
+eight two-sided 99.1667% intervals must fit within ±0.5% relative perplexity and ±2 percentage
+points accuracy.
 Review per-domain effects and discordant grades with the aggregate intervals.
 
 ## Production-equivalent cache and promotion checks

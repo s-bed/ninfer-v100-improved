@@ -35,6 +35,8 @@ def stage(destination: Path) -> Path:
     destination = destination.resolve()
     if verify_tree(destination):
         return destination
+    if destination.exists() and (not destination.is_dir() or any(destination.iterdir())):
+        raise ValueError(f"Choose an empty destination or a CUTLASS {TAG} tree: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="cutlass-stage-", dir=destination.parent) as tmp:
         work = Path(tmp)
@@ -61,9 +63,14 @@ def stage(destination: Path) -> Path:
         extracted = work / "cutlass-4.4.2"
         if not verify_tree(extracted):
             raise RuntimeError("Extracted CUTLASS archive is missing expected headers")
-        if destination.exists():
-            shutil.rmtree(destination)
-        extracted.replace(destination)
+        try:
+            if destination.is_dir():
+                destination.rmdir()  # Accept an empty pre-created directory.
+            extracted.rename(destination)
+        except OSError:
+            # A concurrent install may have published the complete tree first.
+            if not verify_tree(destination):
+                raise
     return destination
 
 

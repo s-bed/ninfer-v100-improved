@@ -22,6 +22,8 @@ struct Nvfp4GdnConvPlan {
     Nvfp4GdnConvScheduleId schedule;
 };
 
+inline constexpr std::int32_t kNvfp4GdnA16MaxWidth = 64;
+
 Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t tokens,
                                              std::int32_t batch_size);
 

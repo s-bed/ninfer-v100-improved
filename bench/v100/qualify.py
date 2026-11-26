@@ -936,17 +936,15 @@ def quality(path: Path | None) -> list[dict]:
 
 
 def quality_pair(evidence: dict, gate: dict) -> list[dict]:
+    mode = "score-narrow" if gate["comparison"] == "w4a8" else "score"
+    if evidence.get("score_mode") != mode:
+        return [dict(gate, status="open", reason=f"quality needs matched {mode} evidence")]
     documents = evidence["documents"]
     tasks = evidence["tasks"]
     if len({row["id"] for row in documents}) != len(documents) or \
             len({row["id"] for row in tasks}) != len(tasks):
         raise ValueError("duplicate streams or tasks in quality evidence")
-    if gate["comparison"] == "w4a8":
-        if documents:
-            raise ValueError(
-                "w4a8 is narrow decode/verify-only (T<=4); chunked causal scoring is vacuous"
-            )
-    elif len(documents) != 16 or any(row["tokens"] != 8192 for row in documents):
+    if len(documents) != 16 or any(row["tokens"] != 8192 for row in documents):
         return [dict(gate, status="open", reason="quality needs 16 matched frozen streams of 8,192 targets")]
     if len(tasks) != 384:
         return [dict(gate, status="open", reason="quality needs 384 matched graded task pairs")]
@@ -957,15 +955,13 @@ def quality_pair(evidence: dict, gate: dict) -> list[dict]:
         clusters.setdefault(task["cluster"], []).append(task)
     if len(clusters) < 2:
         raise ValueError("quality task grades must retain the original fixture clusters")
-    measures = {}
-    if gate["comparison"] != "w4a8":
-        measures["perplexity"] = (
-            [(row["candidate_mean_nll"], row["control_mean_nll"], row["tokens"])
-             for row in documents], math.expm1, .005)
-    measures["accuracy"] = (
-        [(sum(row["candidate"] for row in group) / len(group),
-          sum(row["control"] for row in group) / len(group), len(group))
-         for group in clusters.values()], float, .02)
+    measures = {
+        "perplexity": ([(row["candidate_mean_nll"], row["control_mean_nll"], row["tokens"])
+                        for row in documents], math.expm1, .005),
+        "accuracy": ([(sum(row["candidate"] for row in group) / len(group),
+                       sum(row["control"] for row in group) / len(group), len(group))
+                      for group in clusters.values()], float, .02),
+    }
     out = []
     for case, (samples, transform, margin) in measures.items():
         stats = paired_bootstrap(samples, transform=transform)

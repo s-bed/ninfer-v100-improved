@@ -66,7 +66,7 @@ bool v100_w4a8_enabled() noexcept {
 
 std::string v100_kernel_cache_identity(bool ported, bool w4a8) {
     if (!ported) { return {}; }
-    return std::string(";v100-kernels=decode-prefill-r1-") + (w4a8 ? "w4a8-" : "a16-") +
+    return std::string(";v100-kernels=decode-prefill-r2-") + (w4a8 ? "w4a8-" : "a16-") +
            std::to_string(candidate_mask());
 }
 

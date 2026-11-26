@@ -16,7 +16,7 @@ from xml.etree import ElementTree
 BASE = "42d8d03ffe7ac9e9c5cd1cb227a195c099a03f88"
 STAGES = ("preflight", "build", "cpu", "correctness", "gdn", "quality", "performance", "report")
 CPU = r"^ninfer_(v100_arch_guard|v100_kernel_policy.*|v100_fp8_loading(_native)?|serve_options|request_log|cli_options|prefix_cache_index|context_cache_defaults)_test$"
-GPU = r"^ninfer_(v100_(port|native_packed|w4a8|fp8.*|gdn.*)|gated_delta_net(_two_stage)?|softmax_attention(_volta_flash|_int8_prompt)?|linear_(q4|q8)_(a16|a8int)|linear_swiglu_(q4_a16|q8_a16|nvfp4))_test$"
+GPU = r"^ninfer_(v100_(port|native_packed|w4a8.*|fp8.*|gdn.*)|gated_delta_net(_two_stage)?|gguf_flash_attention|softmax_attention(_volta_flash|_int8_prompt)?|linear_(q4|q8)_(a16|a8int)|linear_swiglu_(q4_a16|q8_a16|nvfp4))_test$"
 VOLTA_LEAVES = ("v100_cutlass.cu", "v100_drafter_gemv.cu", "v100_fp8.cu", "v100_fp8_cutlass.cu",
                 "v100_qpn.cu", "v100_w4a8.cu", "volta_flash.cu", "volta_flash_bridge.cu")
 MIXED_DISPATCHER = "sm70_project.cu"
@@ -221,8 +221,9 @@ def run_stage(s):
     elif a.stage == "correctness":
         for name, dest in (("baseline",old),("candidate",new)):
             s.ctest(name+"-ops",dest,GPU,dict(os.environ,NINFER_OP_REPORT_STATS="1"))
-        s.ctest("flash-suspend",new,"^ninfer_qwen3_5_volta_flash_suspend_real_test$",
-                dict(os.environ,NINFER_TEST_ARTIFACT=str(a.artifact)))
+        real_env = dict(os.environ, NINFER_TEST_ARTIFACT=str(a.artifact))
+        s.ctest("flash-suspend",new,"^ninfer_qwen3_5_volta_flash_suspend_real_test$",real_env)
+        s.ctest("score-real",new,"^ninfer_qwen3_5_score_real_test$",real_env)
         dflash = os.environ.get("NINFER_TEST_V100_DFLASH2_ARTIFACT")
         if dflash:
             s.ctest("dflash2-fused-heads",new,r"^ninfer_qwen3_5_v100_dflash2_(full|optimized)_real_test$")
@@ -236,7 +237,7 @@ def run_stage(s):
         for kv in ("int8","bf16"):
             for scenario in ("restore-exact-mtp","interleaved","full-pool","persist","vision"):
                 s.ctest(f"cache-{kv}-{scenario}",new,"^ninfer_qwen3_5_hybrid_prefix_real_test$",
-                        dict(os.environ,NINFER_HYBRID_V100_POLICY="ported",NINFER_TEST_ARTIFACT=str(a.artifact),
+                        dict(real_env,NINFER_HYBRID_V100_POLICY="ported",
                              NINFER_HYBRID_KV_DTYPE=kv,
                              NINFER_HYBRID_REAL_SCENARIO=scenario))
     elif a.stage == "gdn":

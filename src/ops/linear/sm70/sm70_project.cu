@@ -281,9 +281,11 @@ void project_for(const Activation& x, const Weight& w, std::span<const Destinati
     record_v100_kernel_route(false);
     if (x.codes != nullptr && w.qtype == QType::T2_G128_FP16) {
         integer_project(x, w, destinations, stream);
-    } else if (takes(x.tokens)) {
+    } else if (x.w4a8_codes == nullptr && takes(x.tokens)) {
         project(x, w, destinations, stream);
     } else {
+        // A declined narrow W4A8 call still has its raw BF16 input, even when a tuning override
+        // would send an ordinary A16 call of this width through the wide prepared route.
         small_project(x, w, destinations, stream);
     }
 }
@@ -307,7 +309,7 @@ void swiglu_for(const Activation& x, const Weight& gate, const Weight* up, Tenso
     record_v100_kernel_route(false);
     if (x.codes != nullptr && gate.qtype == QType::T2_G128_FP16) {
         integer_swiglu(x, gate, up, out, stream);
-    } else if (takes(x.tokens)) {
+    } else if (x.w4a8_codes == nullptr && takes(x.tokens)) {
         swiglu(x, gate, up, out, stream);
     } else {
         small_swiglu(x, gate, up, out, stream);
