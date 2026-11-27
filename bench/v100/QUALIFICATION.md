@@ -1,11 +1,56 @@
 # Tesla V100 qualification
 
-Qualify the candidate against the ported server from main at 42d8d03f. Keep native as the
-production default while the INT8 and BF16 gates are open. Record the candidate
+Qualify the candidate against the ported server from main at 42d8d03f. The product defaults to
+native. Select `--v100-kernels ported` explicitly for a qualified deployment profile. Record the candidate
 commit or tree, the build flags, and the exact V100 used. Use the same physical GPU, driver,
 power limit, application clocks, ECC, CUDA toolkit, and artifact for every pair. Follow the
 GPU host's operating procedure for securing an idle card. Use separate build trees, log
 directories, and test persistence files.
+
+## November 27 qualification and release decision
+
+Candidate `650af973818a03a5e85a46ac6df4534204610e2e` passed for **A16 with INT8 KV** against
+ported `42d8d03ffe7ac9e9c5cd1cb227a195c099a03f88`. Use `--v100-kernels ported --kv-dtype int8`
+with a new persistent cache path. The measured Linux Tesla PG500-216 V100 had 32,768 MiB,
+ECC enabled, a 150 W power limit, 1,260/1,107 MHz application clocks and driver 580.178.04.
+The build used CUDA 12.9.41 and CUTLASS 4.4.2. The model was the Qwen3.8-27B NVFP4 v3 artifact
+with MTP and the optimized proposal head, SHA-256
+`74d2c57145e6ff11d1d2faa79594477f9bc903a611af1fb20218189fbbb77d82`.
+
+| INT8 workload | Paired change | 95% interval |
+|---|---:|---:|
+| A16 MTP3 decode geometric mean | +13.57% | +13.49% to +13.67% |
+| A16 MTP3 33K prefill | +2.18% | +2.03% to +2.34% |
+| A16 warm-turn TTFT reduction | +0.86% | +0.67% to +1.08% |
+| A16 pressure-replay summed TTFT reduction | +1.48% | +1.42% to +1.56% |
+| W4A8 MTP3 decode geometric mean vs candidate A16 | −40.75% | −41.07% to −40.40% |
+| W4A8 code decode vs candidate A16 | −43.88% | −44.18% to −43.55% |
+
+Every individual A16 cold workload passed. The two GDN geometries (16/32 and 16/48) favored
+recurrent execution at the measured widths from 64 through 2,048. The numerical and concurrent
+dispatch checks passed, and Compute Sanitizer reported zero errors at 200,000 keys. Both INT8
+arithmetic policies passed the frozen quality margins. A16 lost two of 384 grades. W4A8 exercised
+both scoring and generation and failed the speed gate. Keep it disabled. BF16 KV is outside
+this deployment decision. The optional DFlash2 integration check lacked its separate artifact.
+
+All 16 cache arms matched the 47 frozen pressure requests. The warm turn and restart reused
+90,778 of 90,787 tokens. Explicit native rollback matched baseline token IDs, and changed media,
+concurrent admission and incompatible-cache rejection passed. Automatic capacity was 278,272
+tokens on both builds in the non-vision capacity probe, with a 31,392 MiB peak. The archived
+vision deployment used context 253,952, chunk 4,096, 256 MiB of KV headroom, a 20 GiB host cache
+and four device snapshots. Both builds resolved to 271,296 tokens, admitted a 253,802-token cold
+request and restored the exact 1,207-token frontier. Candidate peak was 32,042 MiB, a 2 MiB
+reduction. The initial deployment probe used the runner's larger default headroom and missed the
+capacity floor. The archived-settings replay passed. The initial INT8 exact-restore and persistence
+assertions reproduced on both native controls and passed on the candidate at the fixed test chunk.
+
+The host evidence root is `bench-runs/v100-pr3-650af973-20261126` under the NInfer runtime root.
+`decision-review.json` records the scoped verdict. `paired-comparisons.csv` gives the workload
+estimates and intervals, `workloads.csv` and `report.json` inventory individual observations and
+attempts, and `performance-reference-001/observations/summary.json` records the corrected
+deployment replay. The hosted CUDA 12.9.2 and 13.4.3 multiarchitecture build jobs reached their
+five-hour build limits before CTest. Local sm_70, mixed sm_70/sm_75 and non-Volta build checks
+completed on the qualification host.
 
 ## Start on the test host
 
@@ -110,7 +155,7 @@ revised Qwen Flash kernel and the shared GGUF attention compiled with CUDA 12.9.
 four-column likelihood gate requires real W4A8 selections during scoring and generation.
 The fallback controls accept native work while checking for leaked ported selections.
 
-All V100 numerical, inference, capacity, cache, quality and performance results are pending.
+The November 27 qualification above records the subsequent V100 results.
 The two real DFlash2 regression tests also require the separate compatible artifact
 documented below. No route has been promoted on the strength of a host build.
 

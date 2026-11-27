@@ -10,6 +10,11 @@ The sm_70 build accepts `--v100-kernels native|ported`. Native is the default an
 explicit rollback. Ported requires sm_70 on every selected device. The option is fixed at
 startup because it affects prepared weights, captured graphs and persisted prefix state.
 
+The Linux Tesla V100 Qwen3.8-27B NVFP4 deployment qualified on November 27 uses
+`--v100-kernels ported --kv-dtype int8` with A16, MTP3, and the optimized proposal head.
+Start with a new prefix-cache path when switching builds. The INT8 W4A8 speed gate failed.
+[Measured workloads and deployment settings](../bench/v100/QUALIFICATION.md#november-27-qualification-and-release-decision)
+
 On Qwen3.5-core models, `--v100-kernels ported --nvfp4-w4a8-int` permits eligible NVFP4
 projections at `T <= 4` (decode and up to MTP3 verification) to quantize each token's
 activations in groups of 32. Wider calls (`T >= 5`) use the single-pass Volta FP16 Tensor Core

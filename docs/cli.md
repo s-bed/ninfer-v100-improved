@@ -361,6 +361,7 @@ default. With `ported`, `--nvfp4-w4a8-int` enables group-32 activation quantizat
 eligible narrow (`T <= 4`, decode and MTP3 verification) NVFP4 projections while wider calls
 keep the single-pass Volta FP16 Tensor Core routes. KV storage is chosen independently with
 `--kv-dtype`. The Engine logs the selected policy at startup and route counts at shutdown.
+[Qualified INT8 deployment profile](../bench/v100/QUALIFICATION.md#november-27-qualification-and-release-decision)
 [V100 qualification and controls](../bench/v100/QUALIFICATION.md)
 
 ## CUDA synchronization
