@@ -78,6 +78,8 @@ struct BenchOptions {
     int device            = 0;
     bool use_cuda_graph   = true;
     bool prefill_a8       = true;
+    ninfer::V100KernelPolicy v100_kernels = ninfer::V100KernelPolicy::Native;
+    bool nvfp4_w4a8_int = false;
     bool prefill_cublas   = false;
     bool prefill_cublas_projections = true;
     bool profile_measured = false;
@@ -106,6 +108,8 @@ struct Stats {
 };
 
 struct BenchEnvironment {
+    V100KernelPolicy v100_kernels = V100KernelPolicy::Native;
+    bool nvfp4_w4a8_int = false;
     std::string gpu_name;
     std::string cuda_runtime_version;
     std::string cuda_driver_version;

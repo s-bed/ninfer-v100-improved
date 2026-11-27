@@ -180,7 +180,8 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     out += ";interpolation=" + std::to_string(options.rope_scaling_factor) + "@" +
            std::to_string(options.rope_scaling_original_context);
     out += ";build=" + options.context_cache.hybrid.persistent_identity;
-    out += ops::v100_kernel_cache_identity(options.v100_kernels == V100KernelPolicy::Ported);
+    out += ops::v100_kernel_cache_identity(options.v100_kernels == V100KernelPolicy::Ported,
+                                          options.nvfp4_w4a8_int);
     return out;
 }
 

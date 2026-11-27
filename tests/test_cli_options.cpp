@@ -33,6 +33,13 @@ int check(bool condition, const char* message) {
 
 int run_tests() {
     int failures = 0;
+    const auto v100 = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--nvfp4-w4a8-int",
+                             "--v100-kernels", "ported"});
+    failures += check(v100.v100_kernels == ninfer::V100KernelPolicy::Ported && v100.nvfp4_w4a8_int,
+                      "CLI lost the requested Volta arithmetic");
+    failures += check(rejects([] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                               "--nvfp4-w4a8-int"}); }),
+                      "CLI accepted native plus W4A8");
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--gpu-clock-floor",
                              "1500"}).gpu_clock_floor_mhz == 1500 &&
                           parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})

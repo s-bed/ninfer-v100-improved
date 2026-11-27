@@ -59,6 +59,7 @@ struct ServeOptions {
     std::string device_profile = "auto";
     std::filesystem::path device_profile_path;
     V100KernelPolicy v100_kernels = V100KernelPolicy::Native;
+    bool nvfp4_w4a8_int = false;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;

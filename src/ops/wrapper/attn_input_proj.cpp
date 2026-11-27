@@ -103,6 +103,7 @@ void validate_policy(LinearPolicy policy) {
     // The split Q4/Q5 pair has an integer-activation route; the single-parent forms decline it
     // below, where no such route is registered for their qtypes.
     case LinearPolicy::AllowA8Int:
+    case LinearPolicy::AllowNvfp4Int8:
     case LinearPolicy::AllowA8IntDecode:
     // The cuBLAS prefill route is registered only for linear_swiglu and linear_add. Everywhere else
     // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
@@ -134,7 +135,7 @@ void sm70_split(const Tensor& x, const Weight& first, std::initializer_list<Tens
         (first.qtype == QType::NVFP4 || (second && second->qtype == QType::NVFP4))
             ? QType::NVFP4 : first.qtype;
     const auto activation = detail::sm70::prepare_for(
-        x, std::max(first.n, second ? second->n : 0), workspace, stream, preparation_format, integer,detail::sm70::ProjectionPurpose::Generic,first.layout);
+        x, std::max(first.n, second ? second->n : 0), workspace, stream, preparation_format, integer,detail::sm70::ProjectionPurpose::Generic, first.layout, policy);
     const auto destinations = [](std::initializer_list<Tensor*> planes) {
         std::vector<detail::sm70::Destination> out;
         std::int32_t row = 0;

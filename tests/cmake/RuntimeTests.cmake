@@ -1,6 +1,11 @@
 ninfer_add_test(ninfer_v100_kernel_policy_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_v100_kernel_policy.cpp"
           "${PROJECT_SOURCE_DIR}/src/ops/common/v100_kernel_policy.cpp")
+add_test(NAME ninfer_v100_kernel_policy_mask_test COMMAND ninfer_v100_kernel_policy_test flash-head)
+set_tests_properties(ninfer_v100_kernel_policy_mask_test PROPERTIES ENVIRONMENT "NINFER_V100_CANDIDATES=flash,head")
+add_test(NAME ninfer_v100_kernel_policy_invalid_test COMMAND ninfer_v100_kernel_policy_test bad-mask)
+set_tests_properties(ninfer_v100_kernel_policy_invalid_test PROPERTIES ENVIRONMENT "NINFER_V100_CANDIDATES=head,head")
+add_test(NAME ninfer_v100_kernel_policy_w4a8_test COMMAND ninfer_v100_kernel_policy_test w4a8)
 add_test(NAME ninfer_v100_kernel_policy_native_test COMMAND ninfer_v100_kernel_policy_test native)
 
 ninfer_add_test(ninfer_admission_policy_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_admission_policy.cpp"

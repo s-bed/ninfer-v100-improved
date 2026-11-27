@@ -6,7 +6,7 @@ SCOPES = ('changed', 'native', 'calculator', 'host', 'includes', 'linux_scripts'
 COMPILER_INPUTS = {
     'CMakeLists.txt', 'CMakePresets.json', '.gitmodules',
     '.github/scripts/configure-linux-build.sh', '.github/scripts/patch-cuda12-glibc.py',
-    '.github/scripts/install-linux-release-tools.sh',
+    '.github/scripts/install-cutlass.py', '.github/scripts/install-linux-release-tools.sh',
     '.github/workflows/native-linux.yml', '.github/workflows/native-windows.yml',
     'scripts/build-native.bat', 'scripts/build.ps1',
 }
@@ -37,7 +37,7 @@ def classify(paths):
         result['calculator'] |= path.startswith('docs/config-calculator')
         result['linux_scripts'] |= path.endswith('.sh') or path == '.gitattributes'
         result['linux_runtime'] |= path in ('scripts/run.sh', 'scripts/download-model.sh', 'scripts/check-linux-scripts.sh', '.gitattributes')
-        result['python'] |= (path.startswith(('tools/', 'tests/artifact/', 'tests/convert/', 'tests/reference/', 'tests/pods/', 'scripts/pods/'))
+        result['python'] |= (path.startswith(('tools/', 'tests/artifact/', 'tests/convert/', 'tests/reference/', 'tests/pods/', 'scripts/pods/', 'bench/v100/'))
                              or path.startswith(('src/artifact/', 'include/ninfer/artifact')))
         result['docker'] |= path in ('Dockerfile', '.dockerignore', 'tests/test_docker_build_cache.sh', '.github/scripts/toolchain-image.sh')
         result['release_tools'] |= (path.startswith(('.github/scripts/', 'tests/release/'))

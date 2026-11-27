@@ -6,19 +6,34 @@ artifacts as a [router](#several-models-router), one Engine per loaded model.
 
 ## Custom V100 kernel policy
 
-The custom sm_70 build accepts `--v100-kernels native|ported`, defaulting to `native`.
-`ported` enables donor routes where their shape and output contracts apply; unsupported shapes
-retain native routes. It is rejected on GPUs other than sm_70. The policy is fixed until process
-restart because weight preparation and CUDA Graphs retain it. Native and ported hybrid cache
-files have distinct compatibility identities; use separate cache paths when comparing them.
-Shutdown logs count host route selections and fallbacks, including graph capture, rather than
-the number of GPU launches during graph replay.
+The sm_70 build accepts `--v100-kernels native|ported`. Native is the default and the
+explicit rollback. Ported requires sm_70 on every selected device. The option is fixed at
+startup because it affects prepared weights, captured graphs and persisted prefix state.
 
-Qualified NVFP4 MLP parents and complete Qwen FP8 projection parents are permuted on the device
-during loading. Artifact and Host bytes remain native. FP8 preparation excludes embedding and
-output-head parents, shared parents with any unqualified consumer, and partial or tensor-parallel
-pieces. Packed projections retain native fallbacks; activation staging preserves the existing A16
-output contract, including BF16 range repair. The native policy performs no donor preparation.
+The Linux Tesla V100 Qwen3.8-27B NVFP4 deployment qualified on November 27 uses
+`--v100-kernels ported --kv-dtype int8` with A16, MTP3, and the optimized proposal head.
+Start with a new prefix-cache path when switching builds. The INT8 W4A8 speed gate failed.
+[Measured workloads and deployment settings](../bench/v100/QUALIFICATION.md#november-27-qualification-and-release-decision)
+
+On Qwen3.5-core models, `--v100-kernels ported --nvfp4-w4a8-int` permits eligible NVFP4
+projections at `T <= 4` (decode and up to MTP3 verification) to quantize each token's
+activations in groups of 32. Wider calls (`T >= 5`) use the single-pass Volta FP16 Tensor Core
+routes (QPN, CUTLASS and cuBLAS). This option changes arithmetic independently of `--kv-dtype`.
+A16 and W4A8 have distinct prefix-cache identities, as does each candidate route mask. Use
+separate persistence paths for paired runs. Shutdown logs include selections for the FP8 head,
+drafter (narrow `T=1..4` Q4/Q8 `RowSplit`/`RowSplitPanel` projections and SwiGLU), GDN, Flash
+Attention, and narrow/wide W4A8. The host counts dispatch and graph capture; graph replays reuse
+them.
+
+For qualification, `NINFER_V100_CANDIDATES` accepts `none` or a comma-separated subset of
+`head,drafter,gdn,flash`. The default for explicit `ported` is all four. Automatic promotion
+requires measurements on the tested deployment profile. [V100 qualification](../bench/v100/QUALIFICATION.md)
+
+During load, eligible NVFP4 MLP and row-scaled FP8 parents are permuted on the GPU. The
+27B vocabulary head is packed in batches with at most 32 MiB of temporary device storage.
+A tied embedding or another consumer requiring the stored layout keeps the parent in that
+layout. Suspend/resume rematerializes the weight from the original artifact. FP16
+activation staging preserves the existing BF16 overrange repair.
 
 ## Start the server
 

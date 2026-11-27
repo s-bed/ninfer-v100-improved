@@ -8,17 +8,32 @@ target_link_libraries(ninfer_ops PUBLIC ninfer_core)
 # ops/linear_swiglu/q4cublas/w4_cublas_prefill.h for why that route exists.
 target_link_libraries(ninfer_ops PRIVATE CUDA::cublas)
 if(NINFER_ARCH_VOLTA)
-  if(FETCHCONTENT_SOURCE_DIR_CUTLASS)
+  if(DEFINED ENV{NINFER_V100_CUTLASS_SOURCE} AND NOT "$ENV{NINFER_V100_CUTLASS_SOURCE}" STREQUAL "")
+    set(_ninfer_cutlass_default "$ENV{NINFER_V100_CUTLASS_SOURCE}")
+  elseif(FETCHCONTENT_SOURCE_DIR_CUTLASS)
     set(_ninfer_cutlass_default "${FETCHCONTENT_SOURCE_DIR_CUTLASS}")
   else()
-    set(_ninfer_cutlass_default "/models/engine/geoffwatts-ninfer-v100/archive/build-v100/_deps/cutlass-src")
+    set(_ninfer_cutlass_default "${PROJECT_SOURCE_DIR}/third_party/cutlass/v4.4.2")
   endif()
   set(NINFER_V100_CUTLASS_SOURCE "${_ninfer_cutlass_default}" CACHE PATH
       "Existing pinned CUTLASS v4.4.2 source for the V100 kernel port (never downloaded)")
   if(NOT EXISTS "${NINFER_V100_CUTLASS_SOURCE}/include/cutlass/gemm/device/gemm.h")
-    message(FATAL_ERROR "V100 port needs cached CUTLASS headers: set NINFER_V100_CUTLASS_SOURCE")
+    message(FATAL_ERROR
+      "V100 port needs cached CUTLASS v4.4.2 headers: set NINFER_V100_CUTLASS_SOURCE or run "
+      "python3.11 .github/scripts/install-cutlass.py")
   endif()
   target_include_directories(ninfer_ops SYSTEM PRIVATE "${NINFER_V100_CUTLASS_SOURCE}/include")
+
+  # The Volta-only launchers and their registrations must come from the same sm_70
+  # compilation. In a mixed invocation NVCC can omit registrations when the last
+  # device pass excludes a kernel. The common Ops still build for every device.
+  add_library(ninfer_volta_kernels OBJECT)
+  set_target_properties(ninfer_volta_kernels PROPERTIES CUDA_ARCHITECTURES 70-real)
+  ninfer_internal_includes(ninfer_volta_kernels)
+  ninfer_cuda_archive(ninfer_volta_kernels)
+  target_link_libraries(ninfer_volta_kernels PRIVATE ninfer_core)
+  target_include_directories(ninfer_volta_kernels SYSTEM PRIVATE "${NINFER_V100_CUTLASS_SOURCE}/include")
+  target_sources(ninfer_ops PRIVATE $<TARGET_OBJECTS:ninfer_volta_kernels>)
 endif()
 
 # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from

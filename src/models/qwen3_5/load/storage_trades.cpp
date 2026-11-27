@@ -99,26 +99,17 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
         return rank_tiers[rank] == ops::DeviceTier::Volta;
     };
     const bool fp8_qpn=ops::v100_ported_kernels_enabled();
+    const bool pack_head = ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Head);
+    const bool panel_draft = weights.mtp &&
+                             ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Drafter);
     std::vector<bool> selected(bindings.weights.size(), false);
+    std::vector<bool> draft_projections(bindings.weights.size(), false);
     std::vector<WeightId> projections;
     std::vector<std::vector<WeightId>> fp8_groups;
     std::vector<bool> fp8_forbidden(bindings.weights.size(),false);
     const auto exclude=[&](WeightId id) {
         if (id.index<fp8_forbidden.size()) fp8_forbidden[id.index]=true;
     };
-    // Role aliases may reuse a WeightId as well as a physical object. Preserve
-    // the embedding/head veto even when no second PendingWeight records it.
-    exclude(weights.text.token_embedding);
-    exclude(weights.text.output_head);
-    if (weights.mtp) {
-        exclude(weights.mtp->token_embedding);
-        exclude(weights.mtp->output_head);
-    }
-    if (weights.draft) {
-        exclude(weights.draft->token_embedding);
-        exclude(weights.draft->output_head);
-    }
-    if (weights.proposal) exclude(weights.proposal->head);
     const auto take = [&](WeightId id) {
         if (id.index < selected.size() && !selected[id.index]) {
             selected[id.index] = true;
@@ -128,6 +119,37 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
     const auto group=[&](std::initializer_list<WeightId> ids) {
         if (fp8_qpn) fp8_groups.emplace_back(ids);
     };
+    const auto head = [&](WeightId id) {
+        if (id.index >= bindings.weights.size()) return;
+        const auto& shape = bindings.at(id).reference.shape;
+        if (pack_head && shape.size() == 2 && ops::detail::fp8_qpn_head_shape(shape[0], shape[1])) {
+            // Only RowScale FP8 heads enter the projection set. An equal-shape Q4 head may
+            // depend on a transcode or a different projected view of its source object.
+            const auto& parts = bindings.at(id).reference.binding.parts;
+            if (parts.size() == 1 && ops::detail::fp8_qpn_prepack_eligible(
+                                         bindings.binder.geometry(parts.front().object))) {
+                take(id);
+                group({id});
+                return;
+            }
+        }
+        exclude(id);
+    };
+    // Embeddings and DFlash heads can reuse a WeightId without creating another binding.
+    // Veto those aliases before deciding whether a shared object can change layouts.
+    exclude(weights.text.token_embedding);
+    head(weights.text.output_head);
+    if (weights.mtp) {
+        exclude(weights.mtp->token_embedding);
+        head(weights.mtp->output_head);
+    }
+    if (weights.draft) {
+        exclude(weights.draft->token_embedding);
+        // DFlash2's fused linear_topk reads the bound draft head in its stored layout.
+        // This WeightId aliases either the full target head or the optimized proposal head.
+        exclude(weights.draft->output_head);
+    }
+    if (weights.proposal) exclude(weights.proposal->head);
     const auto dense = [&](const DenseWeights& d) {
         take(d.gate);
         take(d.up);
@@ -164,12 +186,43 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
         take(weights.mtp->input_projection);
         group({weights.mtp->input_projection});
         ffn(weights.mtp->layer);
+        if (panel_draft) {
+            const auto take_draft = [&](WeightId id) {
+                take(id);
+                if (id.index < draft_projections.size()) draft_projections[id.index] = true;
+            };
+            take_draft(weights.mtp->input_projection);
+            if (const auto* a = std::get_if<AttentionWeights>(&weights.mtp->layer.mixer)) {
+                for (const WeightId id : {a->query, a->key, a->gate, a->value, a->output}) take_draft(id);
+            }
+            if (const auto* d = std::get_if<DenseWeights>(&weights.mtp->layer.ffn)) {
+                for (const WeightId id : {d->gate, d->up, d->down}) take_draft(id);
+            }
+            if (weights.proposal) take_draft(weights.proposal->head);
+        }
     }
     std::unordered_map<std::size_t, bool> only_projections;
+    std::unordered_map<std::size_t, bool> only_draft_projections;
+    // bind_proposal also assigns the optimized proposal's WeightId to the MTP output role.
+    // That alias is a projection too. The full target head and any embedding still veto it.
+    const bool optimized_mtp_head = panel_draft && weights.proposal &&
+                                    weights.mtp->output_head == weights.proposal->head;
     for (std::size_t i = 0; i < bindings.weights.size(); ++i) {
+        const bool panel_safe = i != weights.text.token_embedding.index &&
+                                i != weights.text.output_head.index &&
+                                (!weights.draft || i != weights.draft->output_head.index) &&
+                                (!weights.mtp || (i != weights.mtp->token_embedding.index &&
+                                                  (optimized_mtp_head ||
+                                                   i != weights.mtp->output_head.index)));
         for (const auto& part : bindings.weights[i].reference.binding.parts) {
-            const auto [entry, inserted] = only_projections.emplace(part.object.index, selected[i]);
-            if (!inserted) { entry->second = entry->second && selected[i]; }
+            const bool projection = selected[i] && panel_safe;
+            const auto [entry, inserted] = only_projections.emplace(part.object.index, projection);
+            if (!inserted) { entry->second = entry->second && projection; }
+            if (panel_draft) {
+                const bool safe = draft_projections[i] && panel_safe;
+                const auto [draft, fresh] = only_draft_projections.emplace(part.object.index, safe);
+                if (!fresh) draft->second = draft->second && safe;
+            }
         }
     }
     // Every actual FP8 consumer group must concatenate a complete physical parent
@@ -187,6 +240,8 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
                 if (bindings.binder.selected(part.object)) return false;
                 const auto geometry=bindings.binder.geometry(part.object);
                 if (!ops::detail::fp8_qpn_prepack_eligible(geometry) ||
+                    (ops::detail::fp8_qpn_head_shape(geometry.shape[0], geometry.shape[1]) &&
+                     !pack_head) ||
                     parameter.reference.shape[1]!=geometry.shape[1]) return false;
                 if (!parent) {
                     parent=part.object;
@@ -237,7 +292,9 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
             const bool format =
                 geometry.format == QType::T2_G128_FP16 || geometry.format == QType::Q2_G64_FP16 ||
                 geometry.format == QType::Q4_G64_FP16 || geometry.format == QType::Q5_G64_FP16 ||
-                geometry.format == QType::Q6_G64_FP16;
+                geometry.format == QType::Q6_G64_FP16 ||
+                (geometry.format == QType::Q8_G32_FP16 && panel_draft &&
+                 only_draft_projections.at(part.object.index));
             if (format && only_projections.at(part.object.index) &&
                 geometry.layout == QuantLayout::RowSplit &&
                 artifact::row_split_panel_supported(geometry)) {

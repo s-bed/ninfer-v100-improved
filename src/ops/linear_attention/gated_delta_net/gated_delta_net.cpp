@@ -4,7 +4,9 @@
 #include "core/device.h"
 #include "core/layout.h"
 #include "ops/common/device_route.h"
+#include "ops/common/device_tier.h"
 #include "ops/common/math.h"
+#include "ops/common/v100_kernel_policy.h"
 #include "ops/linear_attention/gated_delta_net/common.h"
 #include "ops/linear_attention/gated_delta_net/launch.h"
 #include "ops/linear_attention/gated_delta_net/two_stage/launch.h"
@@ -205,14 +207,26 @@ ChunkedWorkspace allocate_chunked_workspace(Allocator& allocator, std::int32_t q
     return out;
 }
 
-// The two-stage prefill against the WY/state-passing/output pipeline, per prompt width: the device
-// profile's "gdn_two_stage/h<value heads>" entry, or NINFER_GDN_TWO_STAGE=0/1 for every width.
-bool two_stage_route(std::int32_t value_heads, std::int32_t tokens) {
-    if (tokens < detail::gated_delta_net::two_stage::kMinTokens) { return false; }
+int forced_two_stage_route() {
     static const int forced = [] {
         const char* value = std::getenv("NINFER_GDN_TWO_STAGE");
         return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
     }();
+    return forced;
+}
+
+// Preserve both explicit controls when qualifying or calibrating the existing algorithms.
+bool volta_recurrent_prefill(std::int32_t qk_heads, std::int32_t value_heads) {
+    return qk_heads == 16 && (value_heads == 32 || value_heads == 48) &&
+           v100_candidate_route_enabled(V100CandidateRoute::Gdn) && current_device_volta() &&
+           forced_two_stage_route() < 0;
+}
+
+// The two-stage prefill against the WY/state-passing/output pipeline, per prompt width: the device
+// profile's "gdn_two_stage/h<value heads>" entry, or NINFER_GDN_TWO_STAGE=0/1 for every width.
+bool two_stage_route(std::int32_t value_heads, std::int32_t tokens) {
+    if (tokens < detail::gated_delta_net::two_stage::kMinTokens) { return false; }
+    const int forced = forced_two_stage_route();
     if (forced >= 0) { return forced == 1; }
     return device_route_schedule("gdn_two_stage/h" + std::to_string(value_heads), tokens) == "on";
 }
@@ -295,6 +309,7 @@ std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t qk_heads,
         max_tokens < min_tokens) {
         throw std::invalid_argument("gated_delta_net workspace: invalid profile or interval");
     }
+    if (volta_recurrent_prefill(qk_heads, value_heads)) { return 0; }
     // Either prefill algorithm may serve any width the route admits it for.
     WorkspaceLayoutBuilder chunked;
     (void)allocate_chunked_workspace(chunked, qk_heads, value_heads, max_tokens, normalize_qk);
@@ -337,6 +352,15 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                      cudaStream_t stream) {
     validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
+    if (volta_recurrent_prefill(q.ne[1], v.ne[1])) {
+        detail::gated_delta_net::launch_recurrent_inout(q, k, v, g, beta, scale, normalize_qk,
+                                                       ssm_state_in, ssm_state_out, out, stream);
+        if (q.ne[2] >= detail::gated_delta_net::two_stage::kMinTokens) {
+            record_v100_selection(V100ObservedRoute::Gdn);
+            record_v100_kernel_route(true);
+        }
+        return;
+    }
     if (two_stage_route(v.ne[1], q.ne[2])) {
         run_two_stage(q, k, v, g, beta, scale, normalize_qk, ws, ssm_state_in, ssm_state_out, out,
                       stream);

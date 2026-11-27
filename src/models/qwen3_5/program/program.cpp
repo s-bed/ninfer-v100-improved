@@ -319,9 +319,11 @@ RequestBasePlan Program::plan_request(const PreparedPrompt& prompt,
     return impl_->plan_request(PreparedPromptAccess::view(prompt), options, engine_anchors);
 }
 
-std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target) {
+std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
+                                        std::uint32_t max_scored_width) {
     if (impl_->experts) { impl_->experts->check(); }
-    auto result = impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target);
+    auto result = impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target,
+                                      max_scored_width);
     if (impl_->experts) { impl_->experts->check(); }
     return result;
 }

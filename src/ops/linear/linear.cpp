@@ -109,7 +109,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         auto scope            = workspace->scope();
         const auto activation = detail::sm70::prepare_for(
             x, w.n, *workspace, stream, w.qtype, detail::sm70::integer_takes(w, x.ne[1], policy),
-            detail::sm70::ProjectionPurpose::Generic,w.layout);
+            detail::sm70::ProjectionPurpose::Generic, w.layout, policy);
         detail::sm70::project_for(activation, w, {&all, 1}, stream);
         return;
     }

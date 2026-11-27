@@ -50,6 +50,7 @@ one private runtime from the selected backend directory. All commands share that
 images. Keep `backends/` and `help/` beside the executables when moving the installation.
 `--help` and `--version` work without a driver. NVIDIA libraries remain subject to the
 `NVIDIA-CUDA-EULA.txt` in their backend directory, separately from NInfer's Apache-2.0 licence.
+The archives include `LICENSE-ggml.txt`. Archives containing Volta also include `LICENSE-cutlass.txt`.
 
 ## Docker without compilation
 

@@ -444,7 +444,7 @@ int run_q8() {
     return failures;
 }
 
-int run_nvfp4() {
+int run_nvfp4(bool v100_w4a8 = false) {
     constexpr std::int32_t kHidden    = 5120;
     constexpr std::int32_t kValueRows = 6144;
     constexpr std::int32_t kZRows     = 6144;
@@ -463,8 +463,11 @@ int run_nvfp4() {
                                                                        policy, batch, width, width);
         const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
             QType::NVFP4, kRows, kHidden, policy, batch, width, width);
-        return run_case(
-            std::string("NVFP4 ") + (policy == ops::LinearPolicy::AllowA4 ? "A4" : "A16") +
+        const bool w4a8 = policy == ops::LinearPolicy::AllowNvfp4Int8;
+        const auto before = ops::v100_kernel_route_counts();
+        const auto label = w4a8 ? "W4A8" : policy == ops::LinearPolicy::AllowA4 ? "A4" : "A16";
+        int result = run_case(
+            std::string("NVFP4 ") + label +
                 " B=" + std::to_string(batch) + " T=" + std::to_string(width),
             kHidden, kValueRows, kZRows, width, batch, std::move(valid), snapshot_bytes,
             record_bytes,
@@ -483,7 +486,25 @@ int run_nvfp4() {
                                                 stream);
             },
             seed);
+        if (w4a8) {
+            const auto after = ops::v100_kernel_route_counts();
+            const bool narrow = batch * width <= 4;
+            if ((after.w4a8_narrow > before.w4a8_narrow) != narrow ||
+                (after.w4a8_wide > before.w4a8_wide) == narrow) {
+                std::cerr << "NVFP4 record/snapshot selected an incorrect arithmetic route\n";
+                ++result;
+            }
+        }
+        return result;
     };
+    if (v100_w4a8) {
+        for (const auto [width, batch] : {std::pair{4, 1}, {5, 1}, {64, 1}, {2, 2}, {2, 3}}) {
+            failures += run(width, batch, ragged(width, batch), ops::LinearPolicy::AllowNvfp4Int8,
+                            1680U + width + batch);
+        }
+        failures += parent.verify_preserved("NVFP4 W4A8 record parent weight");
+        return failures;
+    }
     // AllowA4 has no route on sm_86; the wrapper skips only genuine engine refusals, so the
     // A16 half of this sweep is still checked in full.
     for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4}) {
@@ -587,8 +608,9 @@ int run_fp8(bool v100_scoped=false) {
 
 int main(int argc,char** argv) {
     const bool v100_fp8=argc==2 && std::string_view(argv[1])=="--v100-fp8";
-    if (argc!=1 && !v100_fp8) {
-        std::cerr<<"usage: ninfer_gdn_input_proj_conv_record_test [--v100-fp8]\n";
+    const bool v100_w4a8=argc==2 && std::string_view(argv[1])=="--v100-w4a8";
+    if (argc!=1 && !v100_fp8 && !v100_w4a8) {
+        std::cerr<<"usage: ninfer_gdn_input_proj_conv_record_test [--v100-fp8|--v100-w4a8]\n";
         return 2;
     }
     if (cuda_unavailable()) {
@@ -596,6 +618,11 @@ int main(int argc,char** argv) {
         return 77;
     }
 
+    if (v100_w4a8) {
+        if (!ops::detail::sm70::enabled()) return 77;
+        ops::set_v100_kernel_policy(true, true);
+        return run_nvfp4(true) == 0 ? 0 : 1;
+    }
     if (v100_fp8) {
         if (!ops::detail::sm70::enabled()) return 77;
         ops::set_v100_kernel_policy(true);

@@ -38,10 +38,14 @@ enum class LinearPolicy : std::uint8_t {
     /// scales and per-token activation scales, where the integer route carries per-group ones -- so
     /// it is opt-in per engine, and it falls back to AllowA8Int below the width where it pays.
     AllowPrefillCublas,
+    /// Volta NVFP4 narrow projections may quantize BF16 to signed bytes per token and 32 inputs.
+    /// The stored weight codes and per-source multipliers are preserved. Wide calls admit A16.
+    AllowNvfp4Int8,
 };
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
-    return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
+    return policy == LinearPolicy::AllowNvfp4Int8 || policy == LinearPolicy::A16Only ||
+           policy == LinearPolicy::AllowA8 ||
            policy == LinearPolicy::AllowA4 || policy == LinearPolicy::AllowA8Int ||
            policy == LinearPolicy::AllowA8IntDecode || policy == LinearPolicy::AllowPrefillCublas;
 }

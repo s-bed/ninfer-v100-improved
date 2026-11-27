@@ -375,17 +375,18 @@ public:
                 ops::validate_v100_kernel_architecture(true, device.rank(rank).compute_capability());
             }
         }
-        ops::set_v100_kernel_policy(ported);
+        ops::set_v100_kernel_policy(ported, options.nvfp4_w4a8_int);
         runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                                     "v100 kernels: %s (host route selections include graph capture)",
                                     ported ? "ported" : "native");
         if (ported) {
             runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                "v100 route policy | qualified NVFP4: QPN T<=63, FP16 split MLP and "
-                "packed down staging T<=32, "
-                "CUTLASS T64..2047, native wide fallback | qualified FP8: packed FP16 QPN "
-                "T<=32, raw fused MLP T<=8, GDN CUTLASS T33..4096, native fallbacks | "
-                "head/embedding stay native");
+                "V100 candidate routes | head=%d drafter=%d gdn=%d flash=%d nvfp4-w4a8-int=%d",
+                ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Head),
+                ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Drafter),
+                ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Gdn),
+                ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Flash),
+                options.nvfp4_w4a8_int);
         }
         report_gpu_clock_floor(options, clock_floor);
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
@@ -509,9 +510,13 @@ public:
         const auto routes = ops::v100_kernel_route_counts();
         runtime::publish_diagnostic(
             options.diagnostic_observer, DiagnosticLevel::Info,
-            "v100 kernel route selections: ported=%llu fallback=%llu (graph replays not counted)",
+            "v100 kernel route selections: ported=%llu fallback=%llu head=%llu drafter=%llu gdn=%llu "
+            "flash=%llu w4a8_narrow=%llu w4a8_wide=%llu (graph replays not counted)",
             static_cast<unsigned long long>(routes.ported),
-            static_cast<unsigned long long>(routes.fallback));
+            static_cast<unsigned long long>(routes.fallback), static_cast<unsigned long long>(routes.head),
+            static_cast<unsigned long long>(routes.drafter), static_cast<unsigned long long>(routes.gdn),
+            static_cast<unsigned long long>(routes.flash), static_cast<unsigned long long>(routes.w4a8_narrow),
+            static_cast<unsigned long long>(routes.w4a8_wide));
     }
 
     void stop() noexcept {
@@ -795,7 +800,8 @@ std::string Engine::token_bytes(TokenId token) const {
     return impl_->frontend().token_bytes(token);
 }
 
-std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target) {
+std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target,
+                                        std::uint32_t max_scored_width) {
     nvtx::ScopedRange score_range(nvtx::Name::Score, nvtx::Category::Scoring,
                                   static_cast<std::uint64_t>(tokens.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
@@ -814,11 +820,15 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
     std::vector<float> result  = std::visit(
         [&](auto& core) -> std::vector<float> {
             using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::Qwen4ExpCore>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::Gemma4Core>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::FlintCore>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::DeepSeekV41Core>>) {
+            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                return core->score(std::move(prompt.impl_->value), first_target, max_scored_width);
+            } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::Qwen4ExpCore>> ||
+                                 std::is_same_v<CoreState, std::unique_ptr<Impl::Gemma4Core>> ||
+                                 std::is_same_v<CoreState, std::unique_ptr<Impl::FlintCore>> ||
+                                 std::is_same_v<CoreState, std::unique_ptr<Impl::DeepSeekV41Core>>) {
+                if (max_scored_width != 0) {
+                    throw std::invalid_argument("limiting scored width requires a Qwen3.5-core model");
+                }
                 return core->score(std::move(prompt.impl_->value), first_target);
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");

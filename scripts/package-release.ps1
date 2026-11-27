@@ -89,6 +89,11 @@ foreach ($name in "cublas64_$CudaMajor.dll", "cublasLt64_$CudaMajor.dll") {
 }
 Copy-Item -LiteralPath $Eula -Destination (Join-Path $BackendRoot 'NVIDIA-CUDA-EULA.txt')
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'LICENSE') -Destination $ProductRoot
+Copy-Item -LiteralPath (Join-Path $RepoRoot 'third_party\ggml-quants\LICENSE') -Destination (Join-Path $ProductRoot 'LICENSE-ggml.txt')
+if ($Archs -contains '70') {
+    $CutlassLicense = Join-Path $RepoRoot 'third_party\licenses\cutlass-4.4.2.txt'
+    Copy-Item -LiteralPath $CutlassLicense -Destination (Join-Path $ProductRoot 'LICENSE-cutlass.txt')
+}
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'docs\release-archive-windows.md') -Destination (Join-Path $ProductRoot 'README.md')
 foreach ($script in 'run.bat', 'download-model.bat') {
     Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\$script") -Destination $ProductRoot

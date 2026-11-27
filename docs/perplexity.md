@@ -5,6 +5,17 @@ It uses the artifact's tokenizer, Text model, selected Main KV representation, f
 and main output head. It is an offline evaluator, not a serving endpoint or a logits-export API.
 Only Text weights and resources are loaded; Vision and speculative components are not required.
 
+## Volta arithmetic
+
+On a Tesla V100, `--v100-kernels native|ported` selects the startup policy. Native is the
+default. On Qwen3.5-core models, `--v100-kernels ported --nvfp4-w4a8-int` scores the target
+suffix in groups of four predictors so eligible NVFP4 projections exercise narrow W4A8.
+Unscored window context uses the ordinary prefill schedule. Use `--v100-kernels ported --score-width 4`
+for the matched A16 control and keep `--kv-dtype` identical. Smaller widths
+from one through three are also supported. Check the shutdown counter `w4a8_narrow` for a
+positive selection on the W4A8 arm. The report records the arithmetic policy and scoring width.
+[V100 qualification and controls](../bench/v100/QUALIFICATION.md)
+
 ## Run the fixed corpus
 
 The repository includes `ninfer-ppl-1m-v1`, a fixed set of 16 independent UTF-8 streams covering

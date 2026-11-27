@@ -1,4 +1,6 @@
+#include "artifact/binder.h"
 #include "ninfer/engine.h"
+#include "ops/common/device_tier.h"
 #include "speculative_graft.h"
 #include "speculative_page_boundary.h"
 
@@ -12,6 +14,24 @@
 namespace {
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
+}
+
+void check_volta_fixture(const char* path, bool optimized) {
+    using namespace ninfer;
+    artifact::Reader reader(path);
+    artifact::Binder binder(reader);
+    const auto full = binder.parameter("text/output_head", {248320, 5120}, artifact::Residency::Device,
+                                       QType::FP8_E4M3FN_ROW_BF16);
+    require(full.binding.parts.size() == 1 &&
+                binder.geometry(full.binding.parts.front().object).layout == QuantLayout::RowScale,
+            "the DFlash2 layout regression needs a native row-scaled FP8 full head");
+    if (optimized) {
+        const auto stored = binder.parameter("proposal/head", {131072, 5120}, artifact::Residency::Device,
+                                             QType::Q4_G64_FP16);
+        require(stored.binding.parts.size() == 1 &&
+                    binder.geometry(stored.binding.parts.front().object).layout == QuantLayout::RowSplit,
+                "the DFlash2 layout regression needs a native RowSplit Q4 proposal head");
+    }
 }
 
 ninfer::RequestOptions request(std::uint32_t outputs, bool reuse = false) {
@@ -59,20 +79,29 @@ ninfer::PromptInput media_prompt(ninfer::MediaKind kind) {
 }
 } // namespace
 
-// Optional K, Graph, optimized-head, B and KV codec arguments select representative integration
-// routes without multiplying test binaries. The artifact supplies the actual weight
-// representations.
+// Optional arguments select integration routes without multiplying test binaries.
 int main(int argc, char** argv) {
-    const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
+    const bool volta = argc > 8 && std::string(argv[8]) == "v100-ported";
+    const char* artifact_var = volta ? "NINFER_TEST_V100_DFLASH2_ARTIFACT" : "NINFER_TEST_ARTIFACT";
+    const char* artifact = std::getenv(artifact_var);
     if (!artifact || !*artifact) {
-        std::cout << "skip: NINFER_TEST_ARTIFACT is not set\n";
+        std::cout << "skip: " << artifact_var << " is not set\n";
         return 77;
     }
     try {
+        if (volta) {
+            cudaDeviceProp device{};
+            if (!ninfer::ops::kBuildVolta || cudaGetDeviceProperties(&device, 0) != cudaSuccess ||
+                device.major != 7 || device.minor != 0) {
+                std::cout << "skip: DFlash2 ported layout regression needs a Volta device and build\n";
+                return 77;
+            }
+        }
         const auto k         = argc > 1 ? static_cast<unsigned>(std::stoul(argv[1])) : 15U;
         const bool graph     = argc > 2 ? std::stoi(argv[2]) != 0 : true;
         const bool optimized = argc > 3 ? std::stoi(argv[3]) != 0 : true;
         const auto batch     = argc > 4 ? static_cast<unsigned>(std::stoul(argv[4])) : 8U;
+        if (volta) check_volta_fixture(artifact, optimized);
         ninfer::EngineOptions options;
         options.artifact_path   = artifact;
         options.max_context     = 2304;
@@ -92,6 +121,7 @@ int main(int argc, char** argv) {
         options.speculative.draft_tokens             = k;
         options.speculative.proposal_head =
             optimized ? ninfer::ProposalHead::Optimized : ninfer::ProposalHead::Full;
+        if (volta) options.v100_kernels = ninfer::V100KernelPolicy::Ported;
         ninfer::test::add_test_graft(options);
         ninfer::Engine engine(options);
         const auto prompt = engine.tokenize_text("Count from one to twenty: one, two, three,");

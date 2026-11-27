@@ -163,7 +163,9 @@ runs on each of them, for example an `86` build across RTX 30 and RTX 40 series 
 ## Tesla V100 (sm_70)
 
 A `70` build runs on Tesla V100 (16 or 32 GB). It needs CUDA 12.8 or 12.9: CUDA 13 no longer
-compiles `sm_70`, and configure refuses that combination. Configure it like any other build, with
+compiles `sm_70`, and configure refuses that combination. Stage CUTLASS 4.4.2 headers with
+`python3.11 .github/scripts/install-cutlass.py`, or set `-DNINFER_V100_CUTLASS_SOURCE=/path/to/cutlass-4.4.2`
+when configuring with an existing copy. Build with
 `-DCMAKE_CUDA_ARCHITECTURES=70` and the 12.x `nvcc`:
 
 ```bash

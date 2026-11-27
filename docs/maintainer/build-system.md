@@ -129,6 +129,12 @@ same card in any build that runs it on the same tier. `DeviceContext` admits ran
 compute capabilities when each runs the build's code (`docs/maintainer/pipeline-stages.md`).
 Compile time and binary size grow with the number of architectures.
 
+In a build containing Volta, the ported linear and Flash Attention CUDA launchers compile in
+`ninfer_volta_kernels` with a single `70-real` code target. The resulting objects enter the
+ordinary Ops archive. This keeps NVCC's host launch registrations and the corresponding sm_70
+kernels together, including templated launchers in mixed builds. The common dispatchers
+compile for the full architecture list and check the device tier before calling these launchers.
+
 `NINFER_CUDA_PRUNE_PTX=ON` runs NVIDIA `nvprune` on CUDA static archives before host linking.
 It retains all configured SASS targets and host code, and removes PTX. Object-cache entries remain
 unmodified. Windows release builds enable it to reduce image size; local and Linux builds default

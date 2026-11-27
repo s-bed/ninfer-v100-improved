@@ -96,7 +96,7 @@ API key blank.
 | `backends/cuda*/NVIDIA-CUDA-EULA.txt` | the licence under which the two cuBLAS DLLs are redistributed |
 | `SHA256SUMS.txt` | checksums for the package files, including subdirectories |
 | `BUILD-INFO.json` | source, Toolkit, device images and validation scope |
-| `LICENSE-*.txt` | dependency notices from vcpkg |
+| `LICENSE-*.txt` | ggml and vcpkg dependency notices, plus the CUTLASS notice in Volta packages |
 
 ## Overrides
 

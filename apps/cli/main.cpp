@@ -411,6 +411,8 @@ int main(int argc, char** argv) {
         engine_options.wddm_evictable_budget    = cli.wddm_evictable_budget;
         engine_options.mlp_a8_decode            = cli.mlp_a8_decode;
         engine_options.prefill_a8               = cli.prefill_a8;
+        engine_options.v100_kernels = cli.v100_kernels;
+        engine_options.nvfp4_w4a8_int = cli.nvfp4_w4a8_int;
         engine_options.prefill_cublas           = cli.prefill_cublas;
         engine_options.prefill_cublas_projections = cli.prefill_cublas_projections;
         // One CLI invocation owns exactly one request, so retained cross-request context has no

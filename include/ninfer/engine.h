@@ -116,8 +116,11 @@ public:
     [[nodiscard]] std::string token_bytes(TokenId token) const;
 
     // Returns log p(tokens[i] | tokens[0..i)) for i in [first_target,tokens.size()).
+    // On Qwen3.5-core models a positive max_scored_width limits predictor and head batches
+    // for the scored suffix. Zero keeps the ordinary scoring schedule for every family.
     [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
-                                                  std::uint32_t first_target);
+                                                  std::uint32_t first_target,
+                                                  std::uint32_t max_scored_width = 0);
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;

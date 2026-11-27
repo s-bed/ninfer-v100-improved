@@ -1,7 +1,12 @@
 #include "ninfer/ops/gated_delta_net.h"
 
+#include "core/decode_graph.h"
+#include "core/device.h"
+#include "ops/common/device_tier.h"
+#include "ops/common/v100_kernel_policy.h"
 #include "ops/gdn_ref.h"
 #include "ops/op_tester.h"
+#include "ops/quantized_weight.h"
 
 #include <cuda_runtime.h>
 
@@ -18,13 +23,14 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 using namespace ninfer;
 using namespace ninfer::test;
 
-// The two-stage prefill (NINFER_GDN_TWO_STAGE=1) qualified against the complete FP64 recurrence;
+// Qualify the two-stage and Volta recurrent prefill against the complete FP64 recurrence.
 // test_gated_delta_net.cpp qualifies the WY/state-passing prefill and the decode paths.
 namespace {
 
@@ -370,25 +376,40 @@ gdn_ref::Result reference_prefix(const gdn_ref::Inputs& in, int tokens, float sc
 
 int run_case(const Case& test_case, std::uint32_t seed,
              InputPattern pattern = InputPattern::Ordinary, bool inplace = false,
-             std::vector<int> partitions = {}) {
-    const gdn_ref::Inputs in = make_inputs(test_case, seed, pattern);
+             std::vector<int> partitions = {}, bool recurrent_prefill = false,
+             bool graph_replay = false, DType state_dtype = DType::FP32) {
+    gdn_ref::Inputs in = make_inputs(test_case, seed, pattern);
     if (partitions.empty()) partitions.push_back(test_case.tokens);
     if (std::accumulate(partitions.begin(), partitions.end(), 0) != test_case.tokens ||
         *std::min_element(partitions.begin(), partitions.end()) <= 0) {
         throw std::logic_error("invalid GDN continuation partition");
     }
+    namespace fp16 = quantized_weight::detail;
+    std::vector<std::uint16_t> half_state;
+    if (state_dtype == DType::FP16) {
+        if (partitions.size() != 1) throw std::logic_error("FP16 fixture needs one state write");
+        half_state.reserve(in.state.size());
+        for (float& value : in.state) {
+            half_state.push_back(fp16::f32_to_f16(value));
+            value = fp16::f16_to_f32(half_state.back());
+        }
+    }
     const std::string label =
         std::string(test_case.name) + " H=" + std::to_string(test_case.qk_heads) + "/" +
         std::to_string(test_case.value_heads) + " T=" + std::to_string(test_case.tokens) +
         (test_case.normalize_qk ? " normalized" : " raw") +
-        (inplace ? " inplace" : " distinct-state");
+        (inplace ? " inplace" : " distinct-state") +
+        (state_dtype == DType::FP16 ? " FP16 state" : "");
     std::cout << "GDN_CASE " << label << " calls=" << partitions.size() << std::endl;
     const float scale = 1.0F / std::sqrt(static_cast<float>(kStateDim));
     DeviceInputs device(in);
-    GuardedDeviceBuffer state_a(in.state.size() * sizeof(float));
-    GuardedDeviceBuffer state_b(in.state.size() * sizeof(float));
+    const std::size_t state_bytes = in.state.size() *
+        (state_dtype == DType::FP16 ? sizeof(std::uint16_t) : sizeof(float));
+    GuardedDeviceBuffer state_a(state_bytes);
+    GuardedDeviceBuffer state_b(state_bytes);
     GuardedDeviceBuffer out(in.v.size() * sizeof(std::uint16_t));
-    state_a.copy_from_host(in.state.data(), state_a.bytes());
+    state_a.copy_from_host(state_dtype == DType::FP16 ? static_cast<const void*>(half_state.data())
+                                                      : in.state.data(), state_bytes);
     out.fill(0xff);
     Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
     Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
@@ -410,28 +431,42 @@ int run_case(const Case& test_case, std::uint32_t seed,
     bool consumed_chunked        = false;
     for (int length : partitions) {
         auto* destination = inplace ? current : (current == &state_a ? &state_b : &state_a);
-        std::vector<float> source_before;
+        std::vector<std::uint8_t> source_before;
         if (!inplace) {
-            source_before = from_device<float>(current->data(), in.state.size());
+            source_before = from_device<std::uint8_t>(current->data(), state_bytes);
             destination->fill(0xff);
         }
-        Tensor input_state(current->data(), DType::FP32,
+        Tensor input_state(current->data(), state_dtype,
                            {kStateDim, kStateDim, test_case.value_heads});
-        Tensor output_state(destination->data(), DType::FP32,
+        Tensor output_state(destination->data(), state_dtype,
                             {kStateDim, kStateDim, test_case.value_heads});
         Tensor qs = q.slice(2, begin, length), ks = k.slice(2, begin, length);
         Tensor vs = v.slice(2, begin, length), gs = g.slice(1, begin, length);
         Tensor bs = beta.slice(1, begin, length), os = output.slice(2, begin, length);
-        if (inplace) {
-            ops::gated_delta_net(qs, ks, vs, gs, bs, scale, test_case.normalize_qk, workspace,
-                                 output_state, os, nullptr);
+        const auto launch = [&](cudaStream_t stream) {
+            if (inplace) {
+                ops::gated_delta_net(qs, ks, vs, gs, bs, scale, test_case.normalize_qk, workspace,
+                                     output_state, os, stream);
+            } else {
+                ops::gated_delta_net(qs, ks, vs, gs, bs, scale, test_case.normalize_qk, workspace,
+                                     input_state, output_state, os, stream);
+            }
+        };
+        if (graph_replay) {
+            DeviceContext context;
+            DecodeGraphDefinition definition;
+            DecodeGraphExecutable graph;
+            definition.capture(context.stream, [&] { launch(context.stream); });
+            graph.instantiate(definition);
+            graph.launch(context.stream);
+            cuda_synchronize(context.stream);
         } else {
-            ops::gated_delta_net(qs, ks, vs, gs, bs, scale, test_case.normalize_qk, workspace,
-                                 input_state, output_state, os, nullptr);
+            launch(nullptr);
+            cuda_synchronize();
         }
-        cuda_synchronize();
         begin += length;
         consumed_chunked |=
+            !recurrent_prefill &&
             prefill_profile(length, test_case.normalize_qk) != PrecisionProfile::Recurrent;
         // A recurrent suffix inherits earlier chunked error. Check the complete prefix against
         // the sequence's arithmetic profile; do not reset its error by seeding the oracle with
@@ -440,11 +475,21 @@ int run_case(const Case& test_case, std::uint32_t seed,
                                  ? prefill_profile(test_case.tokens, test_case.normalize_qk)
                                  : PrecisionProfile::Recurrent;
         const std::string checkpoint = label + " prefix=" + std::to_string(begin);
-        const auto ref               = reference_prefix(in, begin, scale, test_case.normalize_qk);
+        auto ref = reference_prefix(in, begin, scale, test_case.normalize_qk);
         const auto output_count =
             static_cast<std::size_t>(begin) * test_case.value_heads * kStateDim;
         const auto got_output = from_device_bf16(out.data(), output_count);
-        const auto got_state  = read_f32(destination->data(), in.state.size());
+        std::vector<double> got_state;
+        if (state_dtype == DType::FP16) {
+            const auto bits = from_device<std::uint16_t>(destination->data(), in.state.size());
+            got_state.reserve(bits.size());
+            for (const auto word : bits) got_state.push_back(fp16::f16_to_f32(word));
+            for (double& value : ref.final_state) {
+                value = fp16::f16_to_f32(fp16::f32_to_f16(static_cast<float>(value)));
+            }
+        } else {
+            got_state = read_f32(destination->data(), in.state.size());
+        }
         failures += verify_heads(checkpoint + " out", got_output, ref.out, test_case.value_heads,
                                  begin, profile, false);
         if (partitions.size() > 1) {
@@ -471,7 +516,7 @@ int run_case(const Case& test_case, std::uint32_t seed,
         if (!inplace) {
             failures +=
                 verify_exact(checkpoint + " source state unchanged",
-                             from_device<float>(current->data(), in.state.size()), source_before);
+                             from_device<std::uint8_t>(current->data(), state_bytes), source_before);
         }
         if (output_count < in.v.size()) {
             const auto* suffix = static_cast<const std::uint16_t*>(out.data()) + output_count;
@@ -500,19 +545,58 @@ int run_case(const Case& test_case, std::uint32_t seed,
     return failures;
 }
 
+int volta_prefill_test(bool forced) {
+    if (!ops::current_device_volta()) return 77;
+    ops::set_v100_kernel_policy(true);
+    const auto capacity = [](int qk_heads, int value_heads) {
+        return ops::gated_delta_net_workspace_capacity_bytes(qk_heads, value_heads, true, 1, 4097);
+    };
+    if ((capacity(16, 48) != 0) != forced || (capacity(16, 32) != 0) != forced ||
+        capacity(1, 3) == 0) {
+        std::cerr << "Volta GDN workspace disagrees with route and geometry\n";
+        return 1;
+    }
+    if (forced) {
+        const int failures = run_case({"Volta forced two stage", 16, 48, 65, true}, 3259U);
+        return failures == 0 && ops::v100_kernel_route_counts().ported == 0 ? 0 : 1;
+    }
+    int failures = 0;
+    for (int t : {15, 16, 17, 63, 64, 65}) {
+        failures += run_case({"Volta recurrent prefill boundary", 16, 32, t, t != 16},
+                             3200U + t, InputPattern::Ordinary, t % 2 != 0, {}, true);
+    }
+    failures += run_case({"Volta recurrent 27B", 16, 48, 2048, true}, 3248U,
+                         InputPattern::Ordinary, false, {}, true, true);
+    failures += run_case({"Volta recurrent 27B", 16, 48, 65, true}, 3249U,
+                         InputPattern::Ordinary, false, {}, true, false, DType::FP16);
+    failures += run_case({"Volta recurrent 35B continuation", 16, 32, 4097, true}, 3250U,
+                         InputPattern::WeakDecay, true, {4096, 1}, true);
+    const auto prefills = ops::v100_kernel_route_counts().ported;
+    failures += run_case({"Volta GDN geometry fallback", 1, 3, 65, true}, 3251U);
+    if (prefills == 0 || ops::v100_kernel_route_counts().ported != prefills) ++failures;
+    print_summaries();
+    return failures == 0 ? 0 : 1;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const std::string_view mode = argc > 1 ? argv[1] : "";
+    const bool volta_recurrent = mode == "--v100-recurrent";
+    const bool volta_forced = mode == "--v100-forced-two-stage";
+    if (argc > 2 || (argc == 2 && !volta_recurrent && !volta_forced)) return 2;
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
     // Read once, at the first prefill.
 #ifdef _WIN32
-    _putenv_s("NINFER_GDN_TWO_STAGE", "1");
+    _putenv_s("NINFER_GDN_TWO_STAGE", volta_recurrent ? "" : "1");
 #else
-    setenv("NINFER_GDN_TWO_STAGE", "1", 1);
+    if (volta_recurrent) unsetenv("NINFER_GDN_TWO_STAGE");
+    else setenv("NINFER_GDN_TWO_STAGE", "1", 1);
 #endif
+    if (volta_recurrent || volta_forced) return volta_prefill_test(volta_forced);
 
     int failures = 0;
 

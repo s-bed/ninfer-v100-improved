@@ -17,9 +17,47 @@
 #include <string>
 #include <iostream>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace {
+int drafter_gemv() {
+    using namespace ninfer;
+    namespace lt = test::linear;
+    namespace st = test::linear_swiglu;
+    const bool enabled = ops::v100_candidate_route_enabled(ops::V100CandidateRoute::Drafter);
+    constexpr lt::Invocation widths[] = {
+        {1}, {2}, {3}, {4}, {4, lt::CallForm::Policy, ops::LinearPolicy::A16Only, true}};
+    constexpr lt::Invocation fallback[] = {{5}};
+    int failures = 0;
+    for (bool panel : {false, true}) {
+        for (auto [n, k, generator] : {
+                 std::tuple{34816, 5120, &lt::make_q8_g32_fp16_weight},
+                 std::tuple{131072, 5120, &lt::make_q4_g64_fp16_weight}}) {
+            lt::ShapeCase cases{n, k, 3713U, lt::Comparison::SampledRows, true, widths};
+            cases.panel = panel;
+            cases.activation_signs = lt::ActivationSigns::CenteredWideRange;
+            const auto before = ops::v100_kernel_route_counts();
+            failures += lt::run_shape("Volta drafter GEMV", lt::ActivationCompute::A16,
+                                      generator, cases);
+            const auto after = ops::v100_kernel_route_counts();
+            if ((after.ported != before.ported) != enabled) ++failures;
+            cases.invocations = fallback;
+            failures += lt::run_shape("Volta drafter GEMV fallback", lt::ActivationCompute::A16,
+                                      generator, cases);
+            if (ops::v100_kernel_route_counts().ported != after.ported) ++failures;
+        }
+    }
+    constexpr int swiglu_widths[] = {1, 2, 3, 4, 5};
+    constexpr int graphs[] = {4, 5};
+    for (const auto format : {QType::Q4_G64_FP16, QType::Q8_G32_FP16}) {
+        failures += st::run_profile("Volta drafter GEMV SwiGLU",
+                                   {format, 34816, 5120, 17408, 3271U,
+                                    st::ActivationCompute::A16}, swiglu_widths, graphs);
+    }
+    return failures;
+}
+
 ninfer::test::quantized_weight::PackedWeight stacked(int n,int k,std::uint32_t seed) {
     auto p=ninfer::test::linear::make_nvfp4_weight(n,k,seed);
     p.payload.resize(p.weight_divisor_offset+8);
@@ -297,6 +335,7 @@ int main(int argc,char** argv) {
         ops::set_v100_kernel_policy(!native_packed);
         constexpr std::array<lt::Invocation,26> cases{{{1},{2},{3},{4},{5},{6},{7},{8},{9},{15},{16},{17},{31},{32},{33},{48},{63},{64},{65},{128},{256},{511},{512},{513},{4,lt::CallForm::Policy,ops::LinearPolicy::A16Only,true},{1,lt::CallForm::A16Convenience}}};
         int failures=down_staging_contract()+nan_propagation()+residual_output()+split_swiglu_outliers();
+        failures += drafter_gemv();
         failures+=lt::verify_workspace_envelopes(QType::NVFP4,34816,5120);
         failures+=lt::verify_workspace_envelopes(QType::NVFP4,5120,17408);
         for (bool packed : {false,true}) {

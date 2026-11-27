@@ -107,6 +107,9 @@ RUN for build in /opt/ninfer/sm* /opt/ninfer/multi; do \
       done; \
     done
 COPY scripts/run.sh scripts/download-model.sh /opt/ninfer/
+COPY LICENSE /opt/ninfer/licenses/LICENSE
+COPY third_party/ggml-quants/LICENSE /opt/ninfer/licenses/LICENSE-ggml.txt
+COPY third_party/licenses/cutlass-4.4.2.txt /opt/ninfer/licenses/LICENSE-cutlass.txt
 COPY docker/entrypoint.sh /usr/local/bin/ninfer-entrypoint
 
 # nvidia-smi (the "utility" capability) is how the entrypoint reads the GPU's compute capability.

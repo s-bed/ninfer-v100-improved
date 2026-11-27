@@ -51,6 +51,7 @@ enum class ProjectionPurpose { Generic, GdnInput, SwiGLU };
 struct Activation {
     ProjectionPurpose purpose = ProjectionPurpose::Generic;
     QuantLayout source_layout = QuantLayout::RowScale;
+    bool nvfp4_w4a8 = false;
     const __half* data        = nullptr;
     const __nv_bfloat16* bf16 = nullptr;
     __half* pass              = nullptr;
@@ -72,6 +73,9 @@ struct Activation {
     const std::int8_t* codes      = nullptr;
     const float* code_scales      = nullptr;
     const std::int32_t* code_sums = nullptr;
+    // The narrow NVFP4 W4A8 route's group-32 quantized form (v100_w4a8.h), separate from T2.
+    const std::int8_t* w4a8_codes = nullptr;
+    const float* w4a8_scales      = nullptr;
 };
 
 // Workspace of prepare() for parents of at most `max_rows` rows.
@@ -89,6 +93,11 @@ void project(const Activation& x, const Weight& w, std::span<const Destination> 
 // 2 rows) of one parent (`up` null) or rows of two weights. `out` is BF16 [rows, T].
 void swiglu(const Activation& x, const Weight& gate, const Weight* up, Tensor& out,
             cudaStream_t stream);
+
+// Narrow NVFP4 activation quantization reads weights once across up to four columns (decode and
+// MTP3 verification); wider calls keep the single-pass FP16 QPN and CUTLASS routes.
+inline constexpr std::int32_t kW4A8MaxTokens = 4;
+[[nodiscard]] bool w4a8_allowed(LinearPolicy policy);
 
 // --- Both sm_70 routes ------------------------------------------------------------------------
 // The wide route above and the small-T one (sm70_small.h) together take every width of a dense
@@ -114,7 +123,8 @@ template <class Routes>
                                      WorkspaceArena& workspace, cudaStream_t stream, QType format,
                                      bool integer = false,
                                      ProjectionPurpose purpose = ProjectionPurpose::Generic,
-                                     QuantLayout source_layout = QuantLayout::RowScale);
+                                     QuantLayout source_layout = QuantLayout::RowScale,
+                                     LinearPolicy policy = LinearPolicy::A16Only);
 // The activations of a call no wider than the small-T route's direct widths, which need no
 // workspace (callers without an arena check direct_tokens first).
 [[nodiscard]] bool direct_tokens(std::int32_t tokens);

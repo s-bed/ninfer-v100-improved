@@ -586,6 +586,7 @@ struct EngineOptions {
     std::filesystem::path device_profile_path;
     // Custom sm_70 donor routes. Fixed for the process before materializing any weights.
     V100KernelPolicy v100_kernels = V100KernelPolicy::Native;
+    bool nvfp4_w4a8_int = false;
     // Lowest graphics clock, in MHz, the Engine's GPUs are held at while a generation or scoring
     // call runs (core/gpu_clock_floor.h): a layer pipeline's stages otherwise wait at idle clocks.
     // Zero leaves the clocks to the driver. Holding them needs administrator rights (root on

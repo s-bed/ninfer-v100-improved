@@ -109,7 +109,8 @@ class LinuxPackageTest(unittest.TestCase):
         self.repo = self.root / 'repo'
         self.cuda = self.root / 'cuda'
         self.build = self.repo / 'build'
-        for directory in ('scripts', 'docs', 'docker', 'build/portable/backends/cuda13',):
+        for directory in ('scripts', 'docs', 'docker', 'third_party/ggml-quants', 'third_party/licenses',
+                          'build/portable/backends/cuda13'):
             (self.repo / directory).mkdir(parents=True)
         for directory in ('bin', 'lib64/stubs'):
             (self.cuda / directory).mkdir(parents=True)
@@ -128,12 +129,17 @@ class LinuxPackageTest(unittest.TestCase):
             'CMAKE_CUDA_ARCHITECTURES:STRING=75;120a\nNINFER_SHARED_RUNTIME:BOOL=ON\n')
         for name in ('LICENSE', 'docs/release-archive-linux.md', 'scripts/run.sh', 'scripts/download-model.sh'):
             (self.repo / name).write_text('fixture')
+        self.ggml_license = self.repo / 'third_party/ggml-quants/LICENSE'
+        shutil.copy2(ROOT / 'third_party/ggml-quants/LICENSE', self.ggml_license)
+        self.cutlass_license = self.repo / 'third_party/licenses/cutlass-4.4.2.txt'
+        shutil.copy2(ROOT / 'third_party/licenses/cutlass-4.4.2.txt', self.cutlass_license)
         (self.build / 'generated').mkdir()
         (self.build / 'generated/ninfer_build_id.h').write_text(
             '#define NINFER_BUILD_ID "aaaaaaaaa"\n#define NINFER_VERSION "2026-10-23.2"\n')
         shutil.copy2(ROOT / 'docker/entrypoint.sh', self.repo / 'docker/entrypoint.sh')
         shutil.copy2(ROOT / 'docker/release.Dockerfile', self.repo / 'docker/release.Dockerfile')
         self.images = 'ELF file: sm_75.cubin\nELF file: sm_120a.cubin'
+        self.cuda_version = '13.4'
         self.help_failure = False
         self.original_read = Path.read_text
         def read_text(path, *args, **kwargs):
@@ -161,7 +167,7 @@ class LinuxPackageTest(unittest.TestCase):
         if args[0] == 'getconf':
             return 'glibc 2.41'
         if args[0].endswith('/nvcc'):
-            return 'Cuda compilation tools, release 13.4, V13.4.92'
+            return f'Cuda compilation tools, release {self.cuda_version}, V{self.cuda_version}.92'
         if args[0].endswith('/cuobjdump'):
             return self.images
         if args[-1] in ('--help', '--version'):
@@ -194,10 +200,32 @@ class LinuxPackageTest(unittest.TestCase):
             prefix = names[0]
             self.assertTrue(archive.getmember(prefix + '/ninfer').isfile())
             self.assertTrue(archive.getmember(prefix + '/backends/cuda13/libninfer-runtime.so').isfile())
-            self.assertIn(prefix + '/Dockerfile', names)
+            self.assertEqual(archive.extractfile(prefix + '/LICENSE-ggml.txt').read(),
+                             self.ggml_license.read_bytes())
+            dockerfile = archive.extractfile(prefix + '/Dockerfile').read().decode()
+            self.assertIn('COPY LICENSE LICENSE-*.txt /opt/ninfer/licenses/', dockerfile)
             info = json.load(archive.extractfile(prefix + '/BUILD-INFO.json'))
             self.assertEqual(info['architectures'], ['75', '120a'])
             self.assertEqual(info['version'], '2026-10-23.2')
+
+    def test_volta_archive_contains_cutlass_license_with_external_headers(self):
+        self.cuda_version = '12.9'
+        self.images = 'ELF file: sm_70.cubin\nELF file: sm_75.cubin'
+        backends = self.build / 'portable/backends'
+        (backends / 'cuda13').rename(backends / 'cuda12')
+        (backends / 'cuda12/architectures.txt').write_text('70 75\n')
+        cutlass = self.root / 'cached-cutlass-headers'
+        (cutlass / 'include').mkdir(parents=True)
+        (self.build / 'CMakeCache.txt').write_text(
+            f'CMAKE_CUDA_COMPILER:FILEPATH={self.cuda}/bin/nvcc\n'
+            'CMAKE_CUDA_ARCHITECTURES:STRING=70;75\nNINFER_SHARED_RUNTIME:BOOL=ON\n'
+            f'NINFER_V100_CUTLASS_SOURCE:PATH={cutlass}\n')
+        PACKAGE.main()
+        volume = next((self.repo / 'dist').glob('*.tar.gz.001'))
+        with tarfile.open(volume, 'r:gz') as archive:
+            prefix = archive.getnames()[0]
+            self.assertEqual(archive.extractfile(prefix + '/LICENSE-cutlass.txt').read(),
+                             self.cutlass_license.read_bytes())
 
     def test_build_reporting_another_release_tag_is_refused(self):
         with patch.dict(os.environ, NINFER_VERSION='2026-10-23.3'):

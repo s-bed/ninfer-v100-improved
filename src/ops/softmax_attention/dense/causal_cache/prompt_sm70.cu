@@ -298,7 +298,8 @@ __launch_bounds__(kThreads) __global__
                        const void* __restrict__ scale_k, const void* __restrict__ scale_v,
                        std::int32_t tokens, std::int32_t q_heads, std::int32_t kv_heads,
                        float scale, __nv_bfloat16* __restrict__ out, CausalKeyPartition partition,
-                       float* __restrict__ partial_out) {
+                       float* __restrict__ partial_out, const std::uint32_t* required) {
+    if (required != nullptr && *required == 0) { return; }
     extern __shared__ __align__(16) unsigned char shared_bytes[];
     __half* q_s = reinterpret_cast<__half*>(shared_bytes);
     __half* k_s = q_s + kRows * kStride;
@@ -549,7 +550,8 @@ void with_codings(KvCacheStorage storage, F&& f) {
 template <bool Partial, class View, class Metadata>
 void launch(const Tensor& q, const Tensor& positions, const std::int32_t* valid_columns,
             float scale, const View& cache, Metadata metadata, Tensor* out,
-            CausalKeyPartition partition, float* partial_out, cudaStream_t stream) {
+            CausalKeyPartition partition, float* partial_out, cudaStream_t stream,
+            const std::uint32_t* required = nullptr) {
     const std::int32_t q_heads  = q.ne[1];
     const std::int32_t tokens   = q.ne[2];
     const std::int32_t kv_heads = cache.num_kv_heads;
@@ -569,7 +571,7 @@ void launch(const Tensor& q, const Tensor& positions, const std::int32_t* valid_
             cache.k_pages.data, cache.v_pages.data, cache.k_scale_pages.data,
             cache.v_scale_pages.data, tokens, q_heads, kv_heads, scale,
             out == nullptr ? nullptr : static_cast<__nv_bfloat16*>(out->data), partition,
-            partial_out);
+            partial_out, required);
         CUDA_CHECK(cudaGetLastError());
     });
 }
@@ -583,15 +585,16 @@ bool causal_attention_prompt_sm70_applies(KvCacheStorage storage, std::int32_t b
 
 void causal_attention_prompt_sm70_launch(const Tensor& q, const Tensor& positions, float scale,
                                          const PagedKVLayerView& cache, Tensor& out,
-                                         cudaStream_t stream) {
+                                         cudaStream_t stream, const std::uint32_t* required) {
     const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
-    launch<false>(q, positions, nullptr, scale, cache, metadata, &out, {}, nullptr, stream);
+    launch<false>(q, positions, nullptr, scale, cache, metadata, &out, {}, nullptr, stream, required);
 }
 
 void causal_attention_prompt_sm70_launch(const Tensor& q, const Tensor& positions,
                                          const Tensor& valid_columns, const Tensor& table_rows,
                                          float scale, const PagedKVBatchLayerView& cache,
-                                         Tensor& out, cudaStream_t stream) {
+                                         Tensor& out, cudaStream_t stream,
+                                         const std::uint32_t* required) {
     const PagedKVBatchMetadata<false> metadata{
         .tables        = static_cast<const std::int32_t*>(cache.block_tables.data),
         .valid_columns = nullptr,
@@ -599,7 +602,7 @@ void causal_attention_prompt_sm70_launch(const Tensor& q, const Tensor& position
         .table_stride  = cache.block_tables.ne[0],
     };
     launch<false>(q, positions, static_cast<const std::int32_t*>(valid_columns.data), scale,
-                  cache, metadata, &out, {}, nullptr, stream);
+                  cache, metadata, &out, {}, nullptr, stream, required);
 }
 
 void causal_attention_prompt_partial_launch(const Tensor& q, const Tensor& positions,

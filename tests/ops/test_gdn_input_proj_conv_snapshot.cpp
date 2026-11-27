@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -847,8 +848,19 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     constexpr std::int32_t kRows             = kChannels + kZRows;
     constexpr std::int32_t kSnapshotBaseSlot = 1;
     const std::int32_t slots                 = std::max(tokens + 2, initial_slot + 1);
-    const std::vector<float> activation =
+    const bool w4a8 = policy == ops::LinearPolicy::AllowNvfp4Int8;
+    const bool narrow = w4a8 && tokens <= 4;
+    std::vector<float> activation =
         make_bf16_activation(kHidden, tokens, 809U + static_cast<std::uint32_t>(tokens));
+    if (narrow) {
+        for (std::size_t start = 0; start < activation.size(); start += 32) {
+            const float scale = std::ldexp(1.0F, -8 - int(start / 32 % 3));
+            activation[start] = 127.0F * scale;
+            for (int i = 1; i < 32; ++i) {
+                activation[start + i] = (float(int((start + 11 * i) % 63) - 31) + 0.5F) * scale;
+            }
+        }
+    }
     const std::vector<std::uint16_t> activation_bits  = bf16_bits(activation);
     const std::vector<float> conv_weight              = make_conv_weight(kChannels, 811U);
     const std::vector<std::uint16_t> conv_weight_bits = bf16_bits(conv_weight);
@@ -880,9 +892,32 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
         QType::NVFP4, kRows, kHidden, policy, 1, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
+    const auto before = ops::v100_kernel_route_counts();
     ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, Tensor{}, initial,
                                       snapshot_base, q, k, v, z_output, policy, workspace, nullptr);
     cuda_synchronize();
+    const auto after = ops::v100_kernel_route_counts();
+    int failures = 0;
+    if (w4a8 && (after.w4a8_narrow - before.w4a8_narrow != (narrow ? 1 : 0) ||
+                 after.w4a8_wide - before.w4a8_wide != (narrow ? 0 : 1))) {
+        std::cerr << "NVFP4 snapshot selected an incorrect arithmetic route\n";
+        ++failures;
+    }
+
+    auto represented = activation;
+    if (narrow) {
+        for (std::size_t start = 0; start < represented.size(); start += 32) {
+            float magnitude = 0.0F;
+            for (int i = 0; i < 32; ++i) {
+                magnitude = std::max(magnitude, std::abs(activation[start + i]));
+            }
+            const float scale = magnitude / 127.0F;
+            if (scale == 0.0F) { continue; }
+            for (int i = 0; i < 32; ++i) {
+                represented[start + i] = std::nearbyint(activation[start + i] / scale) * scale;
+            }
+        }
+    }
 
     const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
     const std::span<const std::uint16_t> initial_state(state_before.data() + initial_base,
@@ -890,18 +925,18 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     const SnapshotOracle oracle = snapshot_oracle(
         kValueRows, tokens, conv_weight, initial_state, [&](std::int32_t row, std::int32_t token) {
             return quantized_weight::dot_fp64(
-                parent.host, row, activation.data() + static_cast<std::size_t>(token) * kHidden,
+                parent.host, row, represented.data() + static_cast<std::size_t>(token) * kHidden,
                 kHidden);
         });
     const bool a4 = policy == ops::LinearPolicy::AllowA4 && tokens >= 4;
     const ReductionCriterion& criterion =
         a4 ? kGdnInputProjConvSnapshotA4Tolerance : kGdnInputProjConvSnapshotA16Tolerance;
     const std::string suffix =
-        std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens) +
+        std::string(" NVFP4 ") + (w4a8 ? "W4A8" : a4 ? "A4" : "A16") + " T=" + std::to_string(tokens) +
         " initial=" + std::to_string(initial_slot) + " base=" + std::to_string(kSnapshotBaseSlot);
     const std::vector<std::uint16_t> state_after = state.bits();
-    int failures =
-        verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle, criterion);
+    failures += verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle,
+                                        criterion);
     failures += compare("snapshot state" + suffix,
                         gather_state(state_after, kChannels, kValueRows, tokens, kSnapshotBaseSlot),
                         oracle.state, criterion);
@@ -913,7 +948,7 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     failures +=
         compare("snapshot z" + suffix,
                 gather_rows(z.values(), kZRows, 0, kZRows, tokens, snapshot_sample_count(tokens)),
-                projection_oracle(parent.host, kChannels, kZRows, activation, kHidden, tokens,
+                projection_oracle(parent.host, kChannels, kZRows, represented, kHidden, tokens,
                                   snapshot_sample_count(tokens)),
                 criterion);
     failures += verify_preserved("snapshot x" + suffix, device_activation, activation_bits);
@@ -927,10 +962,26 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
         std::cerr << "snapshot" << suffix << ": workspace query/execution high-water mismatch\n";
         ++failures;
     }
+    if (w4a8 && tokens > 4) {
+        const auto control_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+            QType::NVFP4, kRows, kHidden, ops::LinearPolicy::A16Only, 1, tokens, tokens);
+        WorkspaceArena control(std::max<std::size_t>(256, control_bytes));
+        const auto outputs = std::array{query.bits(), key.bits(), value.bits(), z.bits()};
+        state.copy_from_bits(state_before);
+        ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, Tensor{}, initial,
+                                          snapshot_base, q, k, v, z_output,
+                                          ops::LinearPolicy::A16Only, control, nullptr);
+        cuda_synchronize();
+        if (control_bytes != workspace_bytes || state.bits() != state_after ||
+            outputs != std::array{query.bits(), key.bits(), value.bits(), z.bits()}) {
+            std::cerr << "NVFP4 wide snapshot outputs or workspace differ from A16\n";
+            ++failures;
+        }
+    }
     return failures;
 }
 
-int run_nvfp4() {
+int run_nvfp4(bool v100_w4a8 = false) {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kRows   = 16384;
     quantized_weight::PatternedWeightOptions options;
@@ -940,6 +991,12 @@ int run_nvfp4() {
         quantized_weight::make_patterned_weight(QType::NVFP4, kRows, kHidden, 823U, options));
 
     int failures = 0;
+    if (v100_w4a8) {
+        for (int width : {4, 5, 64, 65}) {
+            failures += run_nvfp4_case(parent, width, ops::LinearPolicy::AllowNvfp4Int8, 0);
+        }
+        return failures;
+    }
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only, 2);
     for (const auto [tokens, initial_slot] : {std::pair{3, 4}, std::pair{4, 5},
                                               std::pair{17, 0}, std::pair{1024, 1025}}) {
@@ -1175,8 +1232,9 @@ int run_fp8(bool v100_scoped=false) {
 
 int main(int argc,char** argv) {
     const bool v100_fp8=argc==2 && std::string_view(argv[1])=="--v100-fp8";
-    if (argc!=1 && !v100_fp8) {
-        std::cerr<<"usage: ninfer_gdn_input_proj_conv_snapshot_test [--v100-fp8]\n";
+    const bool v100_w4a8=argc==2 && std::string_view(argv[1])=="--v100-w4a8";
+    if (argc!=1 && !v100_fp8 && !v100_w4a8) {
+        std::cerr<<"usage: ninfer_gdn_input_proj_conv_snapshot_test [--v100-fp8|--v100-w4a8]\n";
         return 2;
     }
     if (cuda_unavailable()) {
@@ -1184,6 +1242,11 @@ int main(int argc,char** argv) {
         return 77;
     }
 
+    if (v100_w4a8) {
+        if (!ops::detail::sm70::enabled()) return 77;
+        ops::set_v100_kernel_policy(true, true);
+        return run_nvfp4(true) == 0 ? 0 : 1;
+    }
     if (v100_fp8) {
         if (!ops::detail::sm70::enabled()) return 77;
         ops::set_v100_kernel_policy(true);

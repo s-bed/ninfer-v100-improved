@@ -2,10 +2,26 @@
 // These keep shared native callers/link interfaces usable without CUTLASS headers.
 #include "ops/linear/sm70/v100_qpn.h"
 #include "ops/linear/sm70/v100_cutlass.h"
+#include "ops/linear/sm70/v100_drafter_gemv.h"
 #include "ops/linear/sm70/v100_fp8.h"
+#include "ops/linear/sm70/v100_w4a8.h"
 #include <stdexcept>
 
 namespace ninfer::ops::detail::sm70 {
+bool v100_drafter_gemv_project(const Activation&, const Weight&, std::span<const Destination>,
+                               cudaStream_t) { return false; }
+bool v100_drafter_gemv_swiglu(const Activation&, const Weight&, const Weight*, Tensor&,
+                              cudaStream_t) { return false; }
+std::size_t w4a8_workspace_bytes(int,int) { return 0; }
+Activation w4a8_prepare(const Tensor&,WorkspaceArena&,cudaStream_t) {
+    throw std::logic_error("Volta W4A8 needs an sm_70 build");
+}
+bool w4a8_project(const Activation&,const Weight&,std::span<const Destination>,cudaStream_t) {
+    return false;
+}
+bool w4a8_swiglu(const Activation&,const Weight&,const Weight*,Tensor&,cudaStream_t) {
+    return false;
+}
 void set_v100_wide_backend_mma_for_benchmark(bool mma) {
     if (mma) throw std::invalid_argument("V100 MMA benchmark needs an sm_70 build");
 }

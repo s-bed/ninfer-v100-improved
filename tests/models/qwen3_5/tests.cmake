@@ -42,7 +42,7 @@ ninfer_add_test(ninfer_qwen3_5_loading_test
 # CPU-only model-owned FP8 request selection; GPU upload/resume is explicitly scoped.
 ninfer_add_test(ninfer_v100_fp8_loading_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_v100_fp8_loading.cpp"
-  LIBRARIES ninfer_model_loading TEST_ARGS ported)
+  LIBRARIES ninfer_model_loading ninfer_model_runtime TEST_ARGS ported)
 add_test(NAME ninfer_v100_fp8_loading_native_test
   COMMAND ninfer_v100_fp8_loading_test native)
 add_test(NAME ninfer_v100_fp8_loading_gpu_test
@@ -178,12 +178,21 @@ set_tests_properties(
 # path and fits, so the test is coverage rather than a standing failure.
 ninfer_add_test(ninfer_qwen3_5_dflash2_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash2_real.cpp"
-  LIBRARIES ninfer_engine
+  LIBRARIES ninfer_engine ninfer_artifact ninfer_ops
   TEST_ARGS 7 1 1 2 int8 0 1)
 
 set_tests_properties(
   ninfer_qwen3_5_dflash2_real_test
   PROPERTIES SKIP_RETURN_CODE 77)
+
+# On the same FP8-full/Q4-proposal artifact, exercise each fused head under ported policy.
+add_test(NAME ninfer_qwen3_5_v100_dflash2_full_real_test
+  COMMAND ninfer_tests ninfer_qwen3_5_dflash2_real_test 7 1 0 2 int8 0 1 v100-ported)
+add_test(NAME ninfer_qwen3_5_v100_dflash2_optimized_real_test
+  COMMAND ninfer_tests ninfer_qwen3_5_dflash2_real_test 7 1 1 2 int8 0 1 v100-ported)
+set_tests_properties(
+  ninfer_qwen3_5_v100_dflash2_full_real_test ninfer_qwen3_5_v100_dflash2_optimized_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "NINFER_V100_CANDIDATES=head,drafter")
 
 ninfer_add_test(ninfer_qwen3_5_moe_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_moe_real.cpp"
@@ -208,6 +217,14 @@ ninfer_add_test(ninfer_qwen3_5_suspend_real_test
 set_tests_properties(
   ninfer_qwen3_5_suspend_real_test
   PROPERTIES SKIP_RETURN_CODE 77)
+
+if(NINFER_ARCH_VOLTA)
+  add_test(NAME ninfer_qwen3_5_volta_flash_suspend_real_test
+    COMMAND ninfer_tests ninfer_qwen3_5_suspend_real_test)
+  set_tests_properties(ninfer_qwen3_5_volta_flash_suspend_real_test PROPERTIES
+    ENVIRONMENT "NINFER_QWEN35_SUSPEND_V100_FLASH=1;NINFER_V100_CANDIDATES=flash"
+    SKIP_RETURN_CODE 77)
+endif()
 
 ninfer_add_test(ninfer_qwen3_5_dflash_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash_real.cpp"

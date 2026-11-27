@@ -14,6 +14,7 @@
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast_plan.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_sm70.h"
+#include "ops/softmax_attention/dense/causal_cache/volta_flash.h"
 
 #include <algorithm>
 #include <cmath>
@@ -77,6 +78,19 @@ bool prompt_nvfp4_fast(KvCacheStorage storage, CausalAttentionExecutionEnvelope 
     return false;
 #endif
 }
+
+#if defined(NINFER_TIER_VOLTA)
+bool prompt_volta_flash(AttentionHeadGeometry geometry, KvCacheStorage storage,
+                        CausalAttentionExecutionEnvelope envelope, std::int32_t batch,
+                        std::int32_t width) {
+    return width >= detail::kVoltaFlashQueryBlock &&
+           envelope.min_visible_keys == envelope.max_visible_keys &&
+           envelope.max_visible_keys >= static_cast<std::uint32_t>(width) &&
+           envelope.max_visible_keys <= detail::kVoltaFlashMaximumKeys &&
+           detail::volta_flash_prompt_enabled(geometry.query_heads, geometry.kv_heads, storage,
+                                              batch);
+}
+#endif
 
 void require_shape(const Tensor& tensor, std::int32_t n0, std::int32_t n1, std::int32_t n2,
                    std::int32_t n3, const char* op, const char* name) {
@@ -716,6 +730,18 @@ static std::size_t workspace_capacity_bytes(AttentionHeadGeometry geometry,
                 maximum, detail::rotated_fast_prompt_split_bytes(q_heads, width, plan.splits));
         }
     }
+#if defined(NINFER_TIER_VOLTA)
+    const std::uint32_t flash_keys = std::min<std::uint32_t>(
+        envelope.max_visible_keys, detail::kVoltaFlashMaximumKeys);
+    const auto flash_width = std::max(min_width, detail::kVoltaFlashQueryBlock);
+    // A range-sized arena may execute a dense exact prompt below the route's cap.
+    if (flash_width <= max_width && flash_keys >= static_cast<std::uint32_t>(flash_width) &&
+        envelope.min_visible_keys <= flash_keys &&
+        detail::volta_flash_prompt_enabled(q_heads, geometry.kv_heads, cache_storage, batch_size)) {
+        maximum = std::max(maximum, detail::volta_flash_prompt_workspace_bytes(
+                                       q_heads, geometry.kv_heads, flash_keys));
+    }
+#endif
     return maximum;
 }
 
@@ -834,8 +860,17 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     if (detail::causal_attention_prompt_sm70_applies(cache.storage, batch)) {
         detail::kv_cache_append_batch_launch(k, v, positions, valid_columns, kv_table_rows, cache,
                                              stream);
+        const std::uint32_t* native_required = nullptr;
+#if defined(NINFER_TIER_VOLTA)
+        if (valid_columns.data == nullptr &&
+            prompt_volta_flash(geometry, cache.storage, envelope, batch, width)) {
+            native_required = detail::volta_flash_prompt_launch(
+                q, positions, &kv_table_rows, scale, envelope.max_visible_keys, cache, workspace,
+                out, stream);
+        }
+#endif
         detail::causal_attention_prompt_sm70_launch(q, positions, valid_columns, kv_table_rows,
-                                                    scale, cache, out, stream);
+                                                    scale, cache, out, stream, native_required);
         if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
         return;
     }
@@ -882,7 +917,16 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     }
 #endif
     if (detail::causal_attention_prompt_sm70_applies(cache.storage, 1)) {
-        detail::causal_attention_prompt_sm70_launch(q, positions, scale, cache, out, stream);
+        const std::uint32_t* native_required = nullptr;
+#if defined(NINFER_TIER_VOLTA)
+        if (prompt_volta_flash(geometry, cache.storage, envelope, 1, q.ne[2])) {
+            native_required = detail::volta_flash_prompt_launch(
+                q, positions, nullptr, scale, envelope.max_visible_keys,
+                single_row_paged_kv_batch_view(cache), workspace, out, stream);
+        }
+#endif
+        detail::causal_attention_prompt_sm70_launch(q, positions, scale, cache, out, stream,
+                                                    native_required);
         return;
     }
     detail::causal_attention_prompt_attention_launch(q, positions, scale, cache,

@@ -90,6 +90,7 @@ void validate_policy(LinearPolicy policy) {
     case LinearPolicy::AllowA8:
     case LinearPolicy::AllowA4:
     case LinearPolicy::AllowA8Int:
+    case LinearPolicy::AllowNvfp4Int8:
     case LinearPolicy::AllowA8IntDecode:
     // The cuBLAS prefill route is registered only for linear_swiglu and linear_add. Everywhere else
     // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
@@ -244,7 +245,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         auto scope            = ws.scope();
         const auto activation = detail::sm70::prepare_for(
             x, w.n, ws, stream, w.qtype, detail::sm70::integer_takes(w, t, policy),
-            detail::sm70::ProjectionPurpose::Generic,w.layout);
+            detail::sm70::ProjectionPurpose::Generic, w.layout, policy);
         const detail::sm70::Destination residual{
             static_cast<__nv_bfloat16*>(residual_out.data), w.n, 0, 0, w.n, true};
         detail::sm70::project_for(activation, w, {&residual, 1}, stream);
