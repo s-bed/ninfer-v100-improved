@@ -445,6 +445,36 @@ void test_host_only_reattach() {
 
 // A saved Host tier keeps exactly the Host-backed snapshots whose paths are Host-resident, and a
 // fresh index rebuilt from it matches the same prompts through host-only blocks.
+// Host-only engines publish their state image only after the transfer has completed.
+void test_direct_host_capture() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(8, 0), backend);
+    const auto tokens = make_tokens(kBlockTokens + 1, 17);
+    const auto path = insert_sequence(index, backend, tokens);
+    backup_node(index, path.back());
+    const auto free = index.stats().host_free_slabs;
+    const auto capture = [&](const auto& write) {
+        return index.capture_host_image(path.back(), kBlockTokens, SnapshotKind::Tap, 42, write);
+    };
+    require_throws([&] {
+        capture([&](auto slabs) {
+            require(slabs.size() == 1 && index.stats().snapshots == 0, "published an incomplete host image");
+            throw std::runtime_error("interrupted state transfer");
+        });
+    }, "failed host write");
+    require(index.stats().snapshots == 0 && index.stats().host_free_slabs == free, "failed capture leaked capacity");
+    const auto snapshot = capture([](auto) {});
+    require(snapshot && index.stats().host_free_slabs == free - 1 && index.snapshot(*snapshot).host == CopyState::Resident, "completed image unavailable");
+    require(!capture([](auto) { throw std::logic_error("duplicate image copied"); }), "duplicate image published");
+    index.release_path(path);
+    index.evict_device_blocks(kNoId);
+    const auto match = index.match(tokens, block_lookup_hashes(tokens, {}), {}, tokens.size());
+    require(match.candidates.size() == 1 && !match.candidates[0].image_on_device &&
+            match.candidates[0].restore_bytes == index.config().block_bytes + 42 &&
+            match.candidates[0].frontier == kBlockTokens, "host-only match after device displacement");
+    index.check_invariants();
+}
+
 void test_persistence_roundtrip() {
     RecordingBackend backend;
     PrefixCacheIndex source(small_config(64, 2), backend);
@@ -1849,6 +1879,7 @@ int main() {
         test_host_only_reattach();
         test_tail_device_fill();
         test_snapshot_pin_holds_anchor_path();
+        test_direct_host_capture();
         test_persistence_roundtrip();
         test_restore_plan();
         test_image_only_host_tier();

@@ -142,6 +142,7 @@ private:
 
 class PinnedHostBuffer {
 public:
+    PinnedHostBuffer() noexcept = default;
     explicit PinnedHostBuffer(std::size_t size_bytes);
     ~PinnedHostBuffer();
 

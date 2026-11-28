@@ -414,6 +414,8 @@ struct NgramTableOptions {
     bool disabled = false;
 };
 
+enum class ExpertsMxfp8 : std::uint8_t { Auto, Off, On };
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -598,6 +600,8 @@ struct EngineOptions {
     StartupObserver startup_observer;
     DiagnosticObserver diagnostic_observer;
     SlotAutoSaveOptions slot_auto_save;
+    // Re-encode eligible Inkling BF16 expert banks during loading.
+    ExpertsMxfp8 experts_mxfp8 = ExpertsMxfp8::Auto;
 };
 
 } // namespace ninfer

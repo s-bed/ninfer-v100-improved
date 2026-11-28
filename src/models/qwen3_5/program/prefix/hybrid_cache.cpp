@@ -25,8 +25,6 @@ using runtime::prefix_cache::TapPlannerConfig;
 namespace {
 
 constexpr auto kFullPage = static_cast<std::uint32_t>(kPagedKVPageSize);
-// Largest single pinned allocation of the Host slab pool.
-constexpr std::size_t kHostChunkBytes = std::size_t{4} << 30U;
 
 std::span<const std::byte* const> const_records(const std::vector<std::byte*>& records) noexcept {
     return {reinterpret_cast<const std::byte* const*>(records.data()), records.size()};
@@ -64,26 +62,7 @@ HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlanner
         if (!config.host_blocks || host.slab_bytes == 0 || config.image_slabs != host.image_slabs) {
             throw std::invalid_argument("hybrid Host tier configuration is inconsistent");
         }
-        slabs_per_chunk_ = static_cast<std::uint32_t>(
-            std::max<std::size_t>(1U, kHostChunkBytes / host.slab_bytes));
-        const std::uint64_t total = static_cast<std::uint64_t>(config.host_slabs) * host.slab_bytes;
-        std::uint64_t pinned      = 0;
-        host_chunks_.reserve((config.host_slabs + slabs_per_chunk_ - 1U) / slabs_per_chunk_);
-        for (std::uint32_t first = 0; first < config.host_slabs; first += slabs_per_chunk_) {
-            const std::uint32_t slabs = std::min(slabs_per_chunk_, config.host_slabs - first);
-            const std::size_t bytes   = static_cast<std::size_t>(slabs) * host.slab_bytes;
-            try {
-                host_chunks_.push_back(std::make_unique<HostPages>(bytes));
-                host_chunks_.back()->pin();
-            } catch (const std::exception& error) {
-                throw std::runtime_error("pinning the hybrid prefix cache Host tier failed after " +
-                                         std::to_string(pinned >> 20U) + " of " +
-                                         std::to_string(total >> 20U) + " MiB (" + error.what() +
-                                         "); lower --host-cache-mib");
-            }
-            pinned += bytes;
-            if (pin_progress != nullptr) { pin_progress->progress(pinned, total); }
-        }
+        host_slabs_.allocate(config.host_slabs, host.slab_bytes, pin_progress);
         CUDA_CHECK(cudaStreamCreateWithFlags(&restore_stream_, cudaStreamNonBlocking));
     }
     blocks_.reserve(config.max_nodes);
@@ -264,14 +243,13 @@ StateImageHandle HybridPrefixCache::image(SnapshotRef snapshot) const {
 // ---- transfers ---------------------------------------------------------------------------------
 
 std::byte* HybridPrefixCache::slab(std::uint32_t id) const noexcept {
-    return static_cast<std::byte*>(host_chunks_[id / slabs_per_chunk_]->data()) +
-           static_cast<std::size_t>(id % slabs_per_chunk_) * host_layout_.slab_bytes;
+    return host_slabs_.data(id);
 }
 
 void HybridPrefixCache::add_copies(PageCopies& copies, const HybridBlockPages& pages,
                                    std::uint32_t slab_id) {
     std::byte* record         = slab(slab_id);
-    const std::uint32_t chunk = slab_id / slabs_per_chunk_;
+    const std::uint32_t chunk = host_slabs_.chunk(slab_id);
     copies.text_pages.push_back(text_pages_->physical(pages.text));
     copies.text_records.push_back(record);
     copies.text_groups.push_back(chunk);

@@ -20,6 +20,7 @@ constexpr std::array kFormats = {
     std::pair{QType::NVFP4, std::string_view{"nvfp4"}},
     std::pair{QType::FP8_E4M3FN_ROW_BF16, std::string_view{"fp8_e4m3fn_row_bf16"}},
     std::pair{QType::FP8_E4M3FN_ROW_FP16, std::string_view{"fp8_e4m3fn_row_fp16"}},
+    std::pair{QType::GGML_REC_NVFP4_NVFP4, std::string_view{"ggml_rec_nvfp4_nvfp4"}},
     std::pair{QType::GGUF_Q8_0, std::string_view{"gguf_q8_0"}},
     std::pair{QType::GGUF_Q2_K, std::string_view{"gguf_q2_k"}},
     std::pair{QType::GGUF_Q3_K, std::string_view{"gguf_q3_k"}},
@@ -48,6 +49,7 @@ constexpr std::array kLayouts = {
     std::pair{QuantLayout::RowScale, std::string_view{"row_scale_v1"}},
     std::pair{QuantLayout::RowInterleaved, std::string_view{"row_interleaved_v1"}},
     std::pair{QuantLayout::BlockScaleK16M128x4, std::string_view{"block_scale_k16_m128x4_v1"}},
+    std::pair{QuantLayout::GgmlExpertRecord, std::string_view{"ggml_expert_record_v1"}},
     std::pair{QuantLayout::GgufBlocks, std::string_view{"gguf_blocks_v1"}},
 };
 
@@ -61,6 +63,7 @@ constexpr std::array kDeviceLayouts = {
 } // namespace
 
 QType parse_format(std::string_view name) {
+    if (name == "ggml_q8_0") { return QType::GGUF_Q8_0; }
     for (const auto& [format, spelling] : kFormats) {
         if (spelling == name) { return format; }
     }
@@ -68,6 +71,7 @@ QType parse_format(std::string_view name) {
 }
 
 QuantLayout parse_layout(std::string_view name) {
+    if (name == "ggml_blocks_v1") { return QuantLayout::GgufBlocks; }
     for (const auto& [layout, spelling] : kLayouts) {
         if (spelling == name) { return layout; }
     }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "serve/console_stats.h"
+#include "serve/http_security.h"
 #include "serve/engine_watch.h"
 #include "serve/generation_service.h"
 #include "serve/load_report.h"
@@ -21,6 +22,7 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <map>
 #include <memory>
 #include <string>
@@ -239,6 +241,7 @@ private:
     std::thread startup_listener_;
     std::atomic<bool> startup_listener_result_{false};
     ServeOptions options_;
+    std::optional<HostPolicy> host_policy_;
     // The one model's id in single-model mode; empty in router mode, where requests name models.
     std::string public_model_id_;
     std::chrono::steady_clock::time_point attached_at_;

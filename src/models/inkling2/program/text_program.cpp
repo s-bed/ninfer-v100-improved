@@ -1,0 +1,1430 @@
+// Written for NInfer-3090. See text_program.h; the order of operations is the spec's ("Forward, in order") and
+// tools/inkling2/reference.py Model.forward, which the golden comparison ties to llama.cpp.
+
+#include "models/inkling2/program/text_program.h"
+
+#include "ninfer/ops/cast.h"
+#include "ninfer/ops/depth_attention.h"
+#include "ninfer/ops/fp32_rows.h"
+#include "ninfer/ops/inkling2_adapters.h"
+#include "ninfer/ops/moe_situ.h"
+#include "ninfer/ops/projection_fp32.h"
+#include "ninfer/ops/relative_bias_attention.h"
+#include "ninfer/ops/short_conv.h"
+#include "ninfer/ops/tensor_core_fp32.h"
+
+#include "core/copy_batch.h"
+#include "core/host_gather.h"
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdlib>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <utility>
+
+namespace ninfer::models::inkling2 {
+namespace {
+
+constexpr std::size_t kAlign = 256;
+
+std::size_t padded(std::size_t bytes) { return (bytes + kAlign - 1) / kAlign * kAlign; }
+
+std::int32_t i32(std::uint32_t v) { return static_cast<std::int32_t>(v); }
+
+void sync(cudaStream_t stream) {
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { throw std::runtime_error("inkling2: stream synchronization failed"); }
+}
+
+// The most visit outputs a forward holds at once (the current one, the blocks, the loop's prelude and bank, and the
+// output being written): run()'s bookkeeping over ids, the embedding not counted.
+std::int32_t max_live_outputs(const TextConfig& c) {
+    std::vector<int> blocks, prelude_blocks, bank;
+    int cur = 0, prelude_cur = -1, bank_last = -1;
+    std::size_t peak = 0;
+    for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
+        const std::uint32_t p = c.physical(v), pass = c.pass(v);
+        if (c.is_core(p) && p == c.loop_core_start) {
+            if (pass == 0) {
+                prelude_blocks = blocks, prelude_cur = cur;
+            } else {
+                bank.assign(blocks.begin() + static_cast<std::ptrdiff_t>(prelude_blocks.size()) + 1, blocks.end());
+                bank_last = cur, blocks = prelude_blocks, cur = prelude_cur;
+            }
+        }
+        std::vector<int> live(blocks);
+        live.insert(live.end(), prelude_blocks.begin(), prelude_blocks.end());
+        live.insert(live.end(), bank.begin(), bank.end());
+        live.insert(live.end(), {cur, prelude_cur, bank_last});
+        std::sort(live.begin(), live.end());
+        live.erase(std::unique(live.begin(), live.end()), live.end());
+        const auto pooled = std::count_if(live.begin(), live.end(), [](int id) { return id > 0; });
+        peak = std::max(peak, static_cast<std::size_t>(pooled) + 1);
+        if (p % c.attn_res_block_size == 0) { blocks.push_back(cur); }
+        cur = static_cast<int>(v) + 1;
+    }
+    return static_cast<std::int32_t>(peak);
+}
+
+// The most workspace one forward of `cols` columns takes, `logit_cols` of them with logits, `split` true when its
+// attention may split its keys (at most ops::kSplitMaxColumns columns), `saving` when it saves its convolution inputs
+// (a forward of 2..max_rollback columns). Per column: the persistent part (the embedding, the pooled visit outputs) and
+// what crosses a visit's stages (ffn_inp, a, the MoE's loop message), then the largest of the stages, whose
+// temporaries TextProgram::visit releases before the next one allocates its own, and of the output; with slack.
+std::size_t forward_bytes(const TextConfig& c, std::int32_t cols, std::int32_t logit_cols, bool split, bool saving, std::int32_t max_context,
+                          const ProgramLimits::TensorCoreParts& tc, QType expert_format, const DenseWeightsQ8* dense) {
+    const std::size_t h = c.hidden_size, q = std::size_t(c.heads) * c.head_dim, kv = std::size_t(c.kv_heads) * c.head_dim;
+    const std::size_t t = static_cast<std::size_t>(cols), top_k = c.experts_per_token;
+    const std::size_t dyn = std::size_t(c.kv_heads) * c.conv_kernel_size, rel = std::size_t(c.heads) * c.d_rel;
+    const std::size_t col = h * 4 * t; // one FP32 [hidden, cols]
+    const std::size_t mix = ops::depth_attention_mix_workspace_bytes(i32(c.hidden_size), cols, ops::kDepthAttentionMaxSources);
+    const bool blas       = tc.blas && tc.any() && cols >= kTensorCoreMinColumns;
+    const auto control    = [&](int jobs) {
+        return blas ? ops::loop_controller_blas_workspace_bytes(i32(c.hidden_size), i32(c.loop_gate_rank), cols)
+                    : ops::loop_controller_workspace_bytes(i32(c.hidden_size), i32(c.loop_gate_rank), cols, jobs);
+    };
+    const std::size_t persistent = (static_cast<std::size_t>(max_live_outputs(c)) + 1) * col + padded(t * 4);
+    const std::size_t crossing   = 3 * col;
+    const std::size_t normed     = 3 * h * 2 * t; // the BF16 inputs of q, k and v
+    // The inputs: three loop messages, the mixed inputs and the controllers' outputs.
+    const std::size_t inputs = normed + 9 * col + std::max(mix, control(ops::kLoopControllerMaxJobs));
+    // The attention: the projections (q, rel, gate, sink, and k and v with their dynamic rows, in the q call or their
+    // own), the convolutions' outputs, the gated attention output and wo's; the split parts of a narrow call.
+    const bool wide          = cols >= kTensorCoreMinColumns;
+    const bool dense_tc      = tc.dense && wide && (dense == nullptr || dense->form() != DenseForm::Q8All);
+    const std::size_t widest = std::max(q, h);
+    const std::size_t attention =
+        normed + (2 * q + rel + c.heads + 2 * (kv + dyn)) * 4 * t + 2 * (kv + dyn) * 4 * t + 2 * kv * 4 * t + q * 2 * t + col +
+        (dense_tc ? ops::projection_tc_workspace_bytes(i32(widest), i32(widest), cols) : 0) +
+        (split ? ops::relative_bias_attention_split_bytes({i32(c.heads), i32(c.kv_heads), i32(c.head_dim), i32(c.d_rel), 0},
+                                                          std::min(cols, ops::kSplitMaxColumns),
+                                                          std::max<std::int64_t>(max_context, c.sliding_window))
+               : 0);
+    // The MoE half: the normed input and the route throughout; z and its controller's output until routed; then the
+    // entries' outputs, the combined y (saving) and the experts' own workspace: the tensor cores' route at prefill
+    // widths, else moe_situ_experts' (CUDA cores: per entry its activation and output, and the order; its formula for a
+    // bank of this geometry, either format).
+    ops::SituExpertBank bank;
+    bank.format = expert_format, bank.hidden = i32(h), bank.intermediate = i32(c.moe_intermediate), bank.experts = i32(c.experts);
+    const std::int64_t entries = static_cast<std::int64_t>(top_k * t);
+    const std::size_t routed   = col + 2 * padded(top_k * t * 4);
+    const std::size_t route    = 2 * col + std::max({mix,
+                                                         blas ? ops::moe_route_sigmoid_topk_blas_workspace_bytes(i32(c.experts), cols)
+                                                              : ops::moe_route_sigmoid_topk_workspace_bytes(i32(c.experts), cols),
+                                                         control(1)});
+    // With BF16 banks (expert_format BF16) the other layers are NVFP4 records: the larger of the two routes.
+    ops::SituExpertBank records = bank;
+    records.format              = QType::GGML_REC_NVFP4_NVFP4;
+    const std::size_t experts_tc =
+        expert_format == QType::BF16 ? std::max(ops::moe_situ_experts_tc_workspace_bytes(bank, entries, cols, false, blas ? tc.bank_experts : 0),
+                                                ops::moe_situ_experts_tc_workspace_bytes(records, entries, cols, false, blas ? tc.blas_experts : 0))
+                                     : ops::moe_situ_experts_tc_workspace_bytes(bank, entries, cols, false, blas ? tc.blas_experts : 0);
+    const std::size_t experts  = tc.experts && wide ? experts_tc
+                                                    : padded(top_k * t * c.moe_intermediate * 4) + padded(top_k * t * h * 4) + padded((1 + top_k * t) * 4);
+    const std::size_t moe      = routed + std::max(route, top_k * col + (saving ? col : 0) + experts);
+    // The output: its mix and norm, the head's BF16 input and the logits (the head is the widest weight a tensor-core
+    // call stages when every column's logits are kept; --dense-q8 re-encodes it, so nothing is staged then).
+    const std::size_t lc = static_cast<std::size_t>(logit_cols);
+    const bool head_tc   = tc.dense && logit_cols >= kTensorCoreMinColumns && dense == nullptr;
+    const std::size_t output = col + mix + h * 2 * lc + std::size_t(c.vocab_size) * 4 * lc +
+                               (head_tc ? ops::projection_tc_workspace_bytes(i32(h), i32(c.vocab_size), logit_cols) : 0);
+    // Each allocation pads to 256 bytes; a visit makes about 60. The stages are each an upper bound (the golden test's
+    // layout harness prints the peak against it), so the margin is small.
+    return persistent + std::max(crossing + std::max({inputs, attention, moe}), output) + (c.num_layer_visits * 2 + 64) * kAlign * 4 +
+           (16U << 20);
+}
+
+// The most a forward of `cols` columns leaves allocated when it returns, from the workspace's start: its token ids,
+// the embedding and the pooled visit outputs, the output's mixed state and BF16 head input, and the logits (run()).
+std::size_t result_bytes(const TextConfig& c, std::int32_t cols, std::int32_t logit_cols) {
+    const std::size_t h = c.hidden_size, t = static_cast<std::size_t>(cols), lc = static_cast<std::size_t>(logit_cols);
+    return padded(t * 4) + (static_cast<std::size_t>(max_live_outputs(c)) + 1) * padded(h * 4 * t) + padded(h * 4 * t) + padded(h * 2 * lc) +
+           padded(std::size_t(c.vocab_size) * 4 * lc) + 16 * kAlign;
+}
+
+// The workspace of every forward the limits allow: a prefill chunk (its last column's logits with last_logits) and
+// the narrow forwards (decode, verification, batched decode), whose attention may split its keys.
+std::size_t workspace_bytes(const TextConfig& c, const ProgramLimits& l, QType expert_format) {
+    const std::int32_t narrow = std::max({1, l.max_rollback, l.slots > 1 ? kMaxBatchColumns : 1});
+    // Every column's logits, except with last_logits past the rollback; a batched decode (forward_batch, up to
+    // kMaxBatchColumns slots) returns all of its columns' whatever last_logits says.
+    const auto logit_cols = [&](std::int32_t cols) {
+        const bool batch = l.slots > 1 && cols <= kMaxBatchColumns;
+        return l.last_logits && !batch && cols > std::max(1, l.max_rollback) ? 1 : cols;
+    };
+    std::size_t most          = 0;
+    for (const std::int32_t cols : {l.max_chunk, std::min(l.max_chunk, narrow), std::min(l.max_chunk, ops::kSplitMaxColumns)}) {
+        const bool split = l.split_attention && cols <= ops::kSplitMaxColumns, saving = cols >= 2 && cols <= l.max_rollback;
+        most = std::max(most, forward_bytes(c, cols, logit_cols(cols), split, saving, l.max_context, l.prefill_tc, expert_format, l.dense));
+        // The lent region sits above every result.
+        if (l.lend_bytes > 0) { most = std::max(most, result_bytes(c, cols, logit_cols(cols)) + padded(l.lend_bytes)); }
+    }
+    return most;
+}
+
+// BF16 when any layer's experts are BF16 banks (their tensor-core route stages more), else the records' format.
+QType widest_expert_format(const Model& model) {
+    QType format = model.expert_bank(0).format;
+    for (std::size_t p = 0; p < model.weights().layers.size(); ++p) {
+        if (model.expert_bank(static_cast<std::uint32_t>(p)).format == QType::BF16) { format = QType::BF16; }
+    }
+    return format;
+}
+
+// The limits, validated before anything is sized from them.
+ProgramLimits checked(ProgramLimits limits) {
+    if (limits.max_chunk < 1 || limits.max_context < limits.max_chunk) {
+        throw std::invalid_argument("inkling2: invalid program limits (max_chunk positive, at most max_context)");
+    }
+    if (limits.max_rollback < 0 || limits.max_rollback > limits.max_chunk) {
+        throw std::invalid_argument("inkling2: max_rollback must be in 0..max_chunk");
+    }
+    if (limits.slots < 1) { throw std::invalid_argument("inkling2: a Program holds at least one slot"); }
+    const bool lowbit = std::any_of(limits.kv_lowbit_k.begin(), limits.kv_lowbit_k.end(), [](std::uint8_t b) { return b != 0; }) ||
+                        std::any_of(limits.kv_lowbit_v.begin(), limits.kv_lowbit_v.end(), [](std::uint8_t b) { return b != 0; });
+    if (lowbit && (!limits.kv_fp16 || limits.slots > 1 || !limits.kv_quant_k.empty())) {
+        throw std::invalid_argument("inkling2: low-bit KV rings need FP16 rings elsewhere and one slot");
+    }
+    if (!limits.kv_quant_k.empty() && !limits.kv_fp16) {
+        throw std::invalid_argument("inkling2: simulated low-bit KV needs FP16 rings");
+    }
+    return limits;
+}
+
+} // namespace
+
+std::size_t kv_ring_bytes(const TextConfig& c, const ProgramLimits& limits) {
+    const std::size_t kv = std::size_t(c.kv_heads) * c.head_dim, value_bytes = limits.kv_fp16 ? 2 : 4;
+    const std::size_t local_cap = c.sliding_window - 1 + static_cast<std::size_t>(local_ring_chunk(limits.max_chunk));
+    std::size_t total = 0;
+    for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
+        const bool global = !c.local[c.physical(v)];
+        const int kb = global && v < limits.kv_lowbit_k.size() ? int(limits.kv_lowbit_k[v]) : 0;
+        const int vb = global && v < limits.kv_lowbit_v.size() ? int(limits.kv_lowbit_v[v]) : 0;
+        const std::size_t capacity = global ? static_cast<std::size_t>(limits.max_context) : local_cap;
+        total += kb != 0 ? padded(c.kv_heads * ops::lowbit_key_bytes(kb) * capacity) + padded(c.kv_heads * ops::lowbit_value_bytes(vb) * capacity)
+                         : 2 * padded(kv * capacity * value_bytes);
+    }
+    return total;
+}
+
+TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t stream)
+    : model_(model), config_(model.config()), limits_(limits), stream_(stream),
+      workspace_(std::max(limits.min_workspace_bytes, workspace_bytes(model.config(), checked(limits), widest_expert_format(model)))) {
+    const TextConfig& c = config_;
+    const std::size_t kv = std::size_t(c.kv_heads) * c.head_dim, taps = c.conv_kernel_size - 1;
+    const std::size_t local_cap = c.sliding_window - 1 + static_cast<std::size_t>(local_ring_chunk(limits.max_chunk));
+    const DType ring = limits.kv_fp16 ? DType::FP16 : DType::FP32; // the KV rings' values
+    // One slot's state (its rings and histories), then the one copy of the rollback state and taps.
+    std::size_t per_slot = 0, shared = 0;
+    std::vector<std::size_t> capacity(c.num_layer_visits);
+    // A visit's low-bit K and V bits (0: FP16 / FP32 as the ring); only global visits take them, both or neither.
+    const auto kbits = [&](std::uint32_t v) { return v < limits.kv_lowbit_k.size() && !c.local[c.physical(v)] ? int(limits.kv_lowbit_k[v]) : 0; };
+    const auto vbits = [&](std::uint32_t v) { return v < limits.kv_lowbit_v.size() && !c.local[c.physical(v)] ? int(limits.kv_lowbit_v[v]) : 0; };
+    const auto lowbit = [&](std::uint32_t v) { return kbits(v) != 0; };
+    for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
+        if ((kbits(v) != 0) != (vbits(v) != 0) || (kbits(v) != 0 && kbits(v) != 4 && kbits(v) != 8) || (vbits(v) != 0 && vbits(v) != 4 && vbits(v) != 8)) {
+            throw std::invalid_argument("inkling2: a low-bit global ring codes K and V in 4 or 8 bits each");
+        }
+    }
+    for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
+        capacity[v] = c.local[c.physical(v)] ? local_cap : static_cast<std::size_t>(limits.max_context);
+        per_slot += 2 * padded(kv * taps * 4) + 2 * padded(std::size_t(c.hidden_size) * taps * 4);
+        if (limits.max_rollback > 0) {
+            const std::size_t saved = taps + static_cast<std::size_t>(limits.max_rollback);
+            shared += 2 * padded(kv * saved * 4) + 2 * padded(std::size_t(c.hidden_size) * saved * 4);
+        }
+    }
+    per_slot += kv_ring_bytes(c, limits);
+    for (const auto tap : limits.tap_visits) {
+        if (tap > c.num_layer_visits) { throw std::invalid_argument("inkling2: a tap visit past the final state"); }
+        shared += padded(std::size_t(c.hidden_size) * static_cast<std::size_t>(limits.max_chunk) * 4);
+    }
+    const auto slots = static_cast<std::size_t>(limits.slots);
+    slot_stride_     = static_cast<std::int64_t>(per_slot);
+    state_memory_    = DeviceBuffer(per_slot * slots + shared);
+    if (limits.split_attention) {
+        split_counters_ = DeviceBuffer(std::size_t(ops::kSplitMaxColumns) * c.heads * 4);
+        split_counters_.fill(0);
+    }
+    auto* base = static_cast<std::byte*>(state_memory_.p);
+    std::size_t offset = 0;
+    const auto carve = [&](std::int32_t rows, std::int32_t cols, DType dtype = DType::FP32) {
+        Tensor t(base + offset, dtype, {rows, cols});
+        offset += padded(t.bytes());
+        return t;
+    };
+    for (std::size_t slot = 0; slot < slots; ++slot) {
+        offset = slot * per_slot; // every slot's tensors in the same order: slot s's at slot_stride_ * s from slot 0's
+        for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
+            VisitState s;
+            if (lowbit(v)) {
+                s.k_cache = carve(i32(c.kv_heads * ops::lowbit_key_bytes(kbits(v))), i32(capacity[v]), DType::U8);
+                s.v_cache = carve(i32(c.kv_heads * ops::lowbit_value_bytes(vbits(v))), i32(capacity[v]), DType::U8);
+            } else {
+                s.k_cache = carve(i32(kv), i32(capacity[v]), ring);
+                s.v_cache = carve(i32(kv), i32(capacity[v]), ring);
+            }
+            s.k_hist    = carve(i32(kv), i32(taps));
+            s.v_hist    = carve(i32(kv), i32(taps));
+            s.attn_hist = carve(i32(c.hidden_size), i32(taps));
+            s.mlp_hist  = carve(i32(c.hidden_size), i32(taps));
+            all_state_.push_back(s);
+        }
+    }
+    offset = slots * per_slot;
+    if (limits.max_rollback > 0) {
+        const std::int32_t saved = i32(taps) + limits.max_rollback;
+        for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
+            VisitState& first = all_state_[v];
+            first.k_saved    = carve(i32(kv), saved);
+            first.v_saved    = carve(i32(kv), saved);
+            first.attn_saved = carve(i32(c.hidden_size), saved);
+            first.mlp_saved  = carve(i32(c.hidden_size), saved);
+            for (std::size_t slot = 1; slot < slots; ++slot) {
+                VisitState& other = all_state_[slot * c.num_layer_visits + v];
+                other.k_saved = first.k_saved, other.v_saved = first.v_saved;
+                other.attn_saved = first.attn_saved, other.mlp_saved = first.mlp_saved;
+            }
+        }
+    }
+    for (std::size_t i = 0; i < limits.tap_visits.size(); ++i) { taps_.push_back(carve(i32(c.hidden_size), limits.max_chunk)); }
+    positions_.assign(slots, 0);
+    for (std::int32_t slot = i32(static_cast<std::uint32_t>(slots)) - 1; slot >= 0; --slot) {
+        select(slot);
+        reset();
+    }
+}
+
+DeviceSpan TextProgram::lent() noexcept {
+    if (limits_.lend_bytes == 0) { return {}; }
+    const std::size_t bytes = padded(limits_.lend_bytes);
+    return {static_cast<std::byte*>(workspace_.base()) + (workspace_.capacity() - bytes) / kAlign * kAlign, bytes};
+}
+
+void TextProgram::select(std::int32_t slot) {
+    if (slot < 0 || slot >= limits_.slots) { throw std::out_of_range("inkling2: no such slot"); }
+    wait_copy();
+    if (!state_.empty()) { positions_[static_cast<std::size_t>(slot_)] = position_; }
+    slot_     = slot;
+    state_    = std::span<VisitState>(all_state_).subspan(static_cast<std::size_t>(slot) * config_.num_layer_visits, config_.num_layer_visits);
+    position_ = positions_[static_cast<std::size_t>(slot)];
+    last_cols_ = 0;
+}
+
+TextProgram::~TextProgram() {
+    // A copy still reading the state (save_async) ends first.
+    // A copy may still run after wait_copy() (a stream wait) cleared copy_pending_: it reads this Program's buffers.
+    if (copy_done_ != nullptr) { (void)cudaEventSynchronize(copy_done_); }
+    for (cudaEvent_t e : ring_copied_) {
+        if (e != nullptr) { cudaEventDestroy(e); }
+    }
+    for (cudaEvent_t e : {state_ready_, copy_done_}) {
+        if (e != nullptr) { cudaEventDestroy(e); }
+    }
+    for (cudaGraphExec_t graph : decode_graph_) {
+        if (graph != nullptr) { cudaGraphExecDestroy(graph); }
+    }
+    for (cudaGraphExec_t graph : batch_graph_) {
+        if (graph != nullptr) { cudaGraphExecDestroy(graph); }
+    }
+}
+
+void TextProgram::set_adapters(AdapterSelection adapters) {
+    if (adapters == adapters_) { return; }
+    for (cudaGraphExec_t& graph : decode_graph_) {
+        if (graph != nullptr) { cudaGraphExecDestroy(graph); }
+        graph = nullptr;
+    }
+    for (cudaGraphExec_t& graph : batch_graph_) {
+        if (graph != nullptr) { cudaGraphExecDestroy(graph); }
+        graph = nullptr;
+    }
+    adapters_ = adapters;
+}
+
+void TextProgram::reset() {
+    wait_copy(); // the forwards from 0 write ring slots the copy may still read
+    for (auto& s : state_) {
+        for (Tensor* t : {&s.k_hist, &s.v_hist, &s.attn_hist, &s.mlp_hist}) {
+            if (cudaMemsetAsync(t->data, 0, t->bytes(), stream_) != cudaSuccess) { throw std::runtime_error("inkling2: cannot clear state"); }
+        }
+    }
+    position_  = 0;
+    last_cols_ = 0;
+}
+
+namespace {
+// Calls f(slot, count) for the ring slots of positions [first, first + n) of a ring of `capacity` (at most two runs).
+template <class F> void ring_runs(std::int64_t first, std::int64_t n, std::int64_t capacity, F&& f) {
+    while (n > 0) {
+        const std::int64_t slot = first % capacity, run = std::min(n, capacity - slot);
+        f(slot, run);
+        first += run, n -= run;
+    }
+}
+} // namespace
+
+std::vector<Tensor> TextProgram::global_cache_rings() const {
+    std::vector<Tensor> rings;
+    for (std::uint32_t v = 0; v < config_.num_layer_visits; ++v) {
+        if (!config_.local[config_.physical(v)]) {
+            rings.push_back(state_[v].k_cache);
+            rings.push_back(state_[v].v_cache);
+        }
+    }
+    return rings;
+}
+
+std::vector<DeviceSpan> TextProgram::cache_image(std::int64_t frontier) const {
+    std::vector<DeviceSpan> image;
+    const auto first = std::max<std::int64_t>(0, frontier - (config_.sliding_window - 1));
+    for (std::uint32_t v = 0; v < config_.num_layer_visits; ++v) {
+        const auto& s = state_[v];
+        for (const Tensor* history : {&s.k_hist, &s.v_hist, &s.attn_hist, &s.mlp_hist}) {
+            image.push_back({history->data, history->bytes()});
+        }
+        if (!config_.local[config_.physical(v)]) { continue; }
+        for (const Tensor* ring : {&s.k_cache, &s.v_cache}) {
+            ring_runs(first, frontier - first, ring->ne[1], [&](auto row, auto count) {
+                image.push_back({static_cast<std::byte*>(ring->data) + row * ring->nb[1],
+                                 static_cast<std::size_t>(count * ring->nb[1])});
+            });
+        }
+    }
+    return image;
+}
+
+void TextProgram::finish_cache_restore(std::int64_t frontier) {
+    position_ = frontier;
+    last_cols_ = 0;
+    last_tapped_ = false;
+}
+
+std::size_t TextProgram::snapshot_bytes() const {
+    std::size_t total = 0;
+    for (std::uint32_t v = 0; v < config_.num_layer_visits; ++v) {
+        const VisitState& s = state_[v];
+        total += s.k_hist.bytes() + s.v_hist.bytes() + s.attn_hist.bytes() + s.mlp_hist.bytes();
+        if (config_.local[config_.physical(v)]) {
+            total += 2 * static_cast<std::size_t>(s.k_cache.nb[1]) * (config_.sliding_window - 1);
+        }
+    }
+    return total;
+}
+
+void TextProgram::save(Snapshot& snapshot) {
+    if (snapshot.memory.size() < snapshot_bytes()) { throw std::invalid_argument("inkling2: the snapshot is too small"); }
+    wait_copy();
+    auto* out = static_cast<std::byte*>(snapshot.memory.data());
+    CopyBatch copies(stream_);
+    const std::int64_t first = std::max<std::int64_t>(0, position_ - (config_.sliding_window - 1));
+    for (std::uint32_t v = 0; v < config_.num_layer_visits; ++v) {
+        const VisitState& s = state_[v];
+        for (const Tensor* t : {&s.k_hist, &s.v_hist, &s.attn_hist, &s.mlp_hist}) {
+            copies.add(out, t->data, t->bytes());
+            out += t->bytes();
+        }
+        if (!config_.local[config_.physical(v)]) { continue; }
+        const std::size_t column = static_cast<std::size_t>(s.k_cache.nb[1]);
+        for (const Tensor* t : {&s.k_cache, &s.v_cache}) {
+            auto* base = out;
+            ring_runs(first, position_ - first, t->ne[1], [&](std::int64_t slot, std::int64_t run) {
+                copies.add(base, static_cast<const std::byte*>(t->data) + static_cast<std::size_t>(slot) * column,
+                           static_cast<std::size_t>(run) * column);
+                base += static_cast<std::size_t>(run) * column;
+            });
+            out += column * (config_.sliding_window - 1);
+        }
+    }
+    copies.flush();
+    snapshot.position = position_;
+}
+
+void TextProgram::save_async(Snapshot& snapshot, cudaStream_t copy) {
+    if (snapshot.memory.size() < snapshot_bytes()) { throw std::invalid_argument("inkling2: the snapshot is too small"); }
+    if (limits_.slots > 1) { throw std::logic_error("inkling2: save_async with several slots"); }
+    // The staging, the events and the copy descriptors are the previous copy's until it has completed, which a stream
+    // wait (wait_copy) does not tell the host: it waits on the copy's event itself (done by now, but for two saves
+    // within one copy's time).
+    if (copy_done_ != nullptr && cudaEventSynchronize(copy_done_) != cudaSuccess) { throw std::runtime_error("inkling2: snapshot copy failed"); }
+    copy_pending_ = false;
+    const auto check = [](cudaError_t e, const char* what) {
+        if (e != cudaSuccess) { throw std::runtime_error(std::string("inkling2: snapshot copy: ") + what + ": " + cudaGetErrorString(e)); }
+    };
+    const std::size_t visits = config_.num_layer_visits;
+    if (copy_done_ == nullptr) {
+        ring_copied_.assign(visits, nullptr);
+        for (std::size_t v = 0; v < visits; ++v) {
+            if (config_.local[config_.physical(static_cast<std::uint32_t>(v))]) { check(cudaEventCreateWithFlags(&ring_copied_[v], cudaEventDisableTiming), "event"); }
+        }
+        check(cudaEventCreateWithFlags(&state_ready_, cudaEventDisableTiming), "event");
+        check(cudaEventCreateWithFlags(&copy_done_, cudaEventDisableTiming), "event");
+    }
+    std::size_t hist_bytes = 0;
+    for (const VisitState& s : state_) { hist_bytes += s.k_hist.bytes() + s.v_hist.bytes() + s.attn_hist.bytes() + s.mlp_hist.bytes(); }
+    if (hist_stage_.bytes < hist_bytes) { hist_stage_ = DeviceBuffer(hist_bytes); }
+    // Built on the host first: the histories' device-to-device staging (they change with every forward; a few MB, one
+    // kernel in stream order), then the copy to the host in save()'s layout, visit by visit, each sliding visit's
+    // rings followed by its event.
+    const std::int64_t first = std::max<std::int64_t>(0, position_ - (config_.sliding_window - 1));
+    std::vector<GatherCopy> copies;
+    std::vector<std::pair<std::size_t, std::size_t>> launches; // [begin, end) of copies, and the visit whose event follows
+    std::vector<std::size_t> launch_visit;
+    const auto add = [&](void* to, const void* from, std::size_t bytes) {
+        const std::size_t row = bytes % 2048 == 0 ? 2048 : bytes; // rows, so that pieces can split a long copy
+        copies.push_back({to, from, row, row, row, bytes / row});
+    };
+    {
+        auto* at = static_cast<std::byte*>(hist_stage_.p);
+        for (const VisitState& s : state_) {
+            for (const Tensor* t : {&s.k_hist, &s.v_hist, &s.attn_hist, &s.mlp_hist}) {
+                add(at, t->data, t->bytes());
+                at += t->bytes();
+            }
+        }
+        launches.emplace_back(0, copies.size());
+        launch_visit.push_back(visits + 1); // the staging: no event
+    }
+    require_identity_mapped(snapshot.memory.data()); // the copy kernel writes it by its host address
+    auto* out          = static_cast<std::byte*>(snapshot.memory.data());
+    const auto* staged = static_cast<const std::byte*>(hist_stage_.p);
+    std::size_t begin  = copies.size();
+    for (std::size_t v = 0; v < visits; ++v) {
+        const VisitState& s = state_[v];
+        const std::size_t h = s.k_hist.bytes() + s.v_hist.bytes() + s.attn_hist.bytes() + s.mlp_hist.bytes();
+        add(out, staged, h);
+        out += h, staged += h;
+        if (ring_copied_[v] == nullptr) { continue; }
+        const std::size_t column = static_cast<std::size_t>(s.k_cache.nb[1]);
+        for (const Tensor* t : {&s.k_cache, &s.v_cache}) {
+            auto* base = out;
+            ring_runs(first, position_ - first, t->ne[1], [&](std::int64_t slot, std::int64_t run) {
+                add(base, static_cast<const std::byte*>(t->data) + static_cast<std::size_t>(slot) * column, static_cast<std::size_t>(run) * column);
+                base += static_cast<std::size_t>(run) * column;
+            });
+            out += column * (config_.sliding_window - 1);
+        }
+        launches.emplace_back(begin, copies.size());
+        launch_visit.push_back(v);
+        begin = copies.size();
+    }
+    if (begin < copies.size()) {
+        launches.emplace_back(begin, copies.size());
+        launch_visit.push_back(visits); // copy_done_ follows
+    }
+    // In pieces of at most 256 KiB (a block takes whole pieces), their list in pinned memory that the kernels read
+    // until they complete.
+    std::vector<GatherCopy> pieces;
+    std::vector<std::pair<std::size_t, std::size_t>> spans;
+    for (const auto& [b, e] : launches) {
+        std::vector<GatherCopy> part(copies.begin() + static_cast<std::ptrdiff_t>(b), copies.begin() + static_cast<std::ptrdiff_t>(e));
+        split_gather_copies(part, 256U << 10);
+        spans.emplace_back(pieces.size(), pieces.size() + part.size());
+        pieces.insert(pieces.end(), part.begin(), part.end());
+    }
+    if (copy_descriptors_.size() < pieces.size() * sizeof(GatherCopy)) { copy_descriptors_ = PinnedHostBuffer(pieces.size() * sizeof(GatherCopy)); }
+    auto* descriptors = static_cast<GatherCopy*>(copy_descriptors_.data());
+    std::copy(pieces.begin(), pieces.end(), descriptors);
+    const auto span_of = [&](std::size_t i) { return std::span<const GatherCopy>(descriptors + spans[i].first, spans[i].second - spans[i].first); };
+    gather_copies(span_of(0), stream_);
+    check(cudaEventRecord(state_ready_, stream_), "record");
+    check(cudaStreamWaitEvent(copy, state_ready_, 0), "wait");
+    // To the host by one paced copy kernel (host_gather.h: neither an unpaced kernel nor the copy engine overlaps a
+    // forward on this link without delaying it about the copy's own time).
+    for (std::size_t i = 1; i < spans.size(); ++i) {
+        gather_copies_paced(span_of(i), GatherPace{}, copy);
+        if (launch_visit[i] < visits) { check(cudaEventRecord(ring_copied_[launch_visit[i]], copy), "record"); }
+    }
+    check(cudaEventRecord(copy_done_, copy), "record");
+    copy_pending_     = true;
+    copy_first_       = first;
+    snapshot.position = position_;
+}
+
+void TextProgram::settle_copy() {
+    if (copy_pending_ && cudaEventQuery(copy_done_) == cudaSuccess) { copy_pending_ = false; }
+}
+
+void TextProgram::wait_copy() {
+    if (!copy_pending_) { return; }
+    if (cudaStreamWaitEvent(stream_, copy_done_, 0) != cudaSuccess) { throw std::runtime_error("inkling2: cannot wait for the snapshot copy"); }
+    copy_pending_ = false;
+}
+
+void TextProgram::restore(const Snapshot& snapshot) {
+    if (snapshot.position < 0 || snapshot.position > limits_.max_context) { throw std::invalid_argument("inkling2: an empty snapshot"); }
+    wait_copy(); // never a half-copied snapshot, nor rings the copy still reads
+    const auto* in = static_cast<const std::byte*>(snapshot.memory.data());
+    CopyBatch copies(stream_);
+    const std::int64_t first = std::max<std::int64_t>(0, snapshot.position - (config_.sliding_window - 1));
+    for (std::uint32_t v = 0; v < config_.num_layer_visits; ++v) {
+        VisitState& s = state_[v];
+        for (Tensor* t : {&s.k_hist, &s.v_hist, &s.attn_hist, &s.mlp_hist}) {
+            copies.add(t->data, in, t->bytes());
+            in += t->bytes();
+        }
+        if (!config_.local[config_.physical(v)]) { continue; }
+        const std::size_t column = static_cast<std::size_t>(s.k_cache.nb[1]);
+        for (Tensor* t : {&s.k_cache, &s.v_cache}) {
+            const auto* base = in;
+            ring_runs(first, snapshot.position - first, t->ne[1], [&](std::int64_t slot, std::int64_t run) {
+                copies.add(static_cast<std::byte*>(t->data) + static_cast<std::size_t>(slot) * column, base,
+                           static_cast<std::size_t>(run) * column);
+                base += static_cast<std::size_t>(run) * column;
+            });
+            in += column * (config_.sliding_window - 1);
+        }
+    }
+    copies.flush();
+    position_  = snapshot.position;
+    last_cols_ = 0;
+}
+
+Tensor TextProgram::tap(std::size_t i) const {
+    if (i >= taps_.size() || last_cols_ < 1 || !last_tapped_) { throw std::out_of_range("inkling2: no such tap"); }
+    return taps_[i].slice(1, 0, last_cols_);
+}
+
+void TextProgram::copy_tap(std::uint32_t visit, const Tensor& value) {
+    if (!taps_on_ || columns_ != nullptr) { return; }
+    for (std::size_t i = 0; i < taps_.size(); ++i) {
+        if (limits_.tap_visits[i] != visit) { continue; }
+        const std::size_t column = std::size_t(config_.hidden_size) * 4;
+        if (cudaMemcpy2DAsync(taps_[i].data, column, value.data, static_cast<std::size_t>(value.nb[1]), column, value.ne[1],
+                              cudaMemcpyDeviceToDevice, stream_) != cudaSuccess) {
+            throw std::runtime_error("inkling2: tap copy failed");
+        }
+    }
+}
+
+void TextProgram::save_input(Tensor& saved, const Tensor& x) {
+    if (!saving_) { return; }
+    const std::size_t column = static_cast<std::size_t>(x.ne[0]) * 4, taps = config_.conv_kernel_size - 1;
+    if (cudaMemcpy2DAsync(static_cast<std::byte*>(saved.data) + taps * column, column, x.data, static_cast<std::size_t>(x.nb[1]),
+                          column, x.ne[1], cudaMemcpyDeviceToDevice, stream_) != cudaSuccess) {
+        throw std::runtime_error("inkling2: cannot save a convolution input");
+    }
+}
+
+void TextProgram::keep(std::int32_t n) {
+    if (n < 1 || n > last_cols_) { throw std::invalid_argument("inkling2: keep() outside 1..the last forward's tokens"); }
+    if (n == last_cols_) { return; }
+    if (last_cols_ > limits_.max_rollback) { throw std::invalid_argument("inkling2: the last forward cannot be cut back"); }
+    // History after the first n inputs: columns n .. n + K - 2 of [old history | inputs].
+    CopyBatch copies(stream_);
+    for (auto& s : state_) {
+        for (auto [hist, saved] : {std::pair{&s.k_hist, &s.k_saved}, std::pair{&s.v_hist, &s.v_saved},
+                                   std::pair{&s.attn_hist, &s.attn_saved}, std::pair{&s.mlp_hist, &s.mlp_saved}}) {
+            const std::size_t column = static_cast<std::size_t>(hist->ne[0]) * 4;
+            copies.add(hist->data, static_cast<const std::byte*>(saved->data) + static_cast<std::size_t>(n) * column, hist->bytes());
+        }
+    }
+    copies.flush();
+    position_ -= last_cols_ - n;
+    last_cols_ = n;
+}
+
+Tensor TextProgram::project_inputs(std::span<const Tensor* const> inputs, std::span<const WeightId> weights,
+                                  std::span<const std::int32_t> rows) {
+    const std::int32_t k = inputs[0]->ne[0], cols = inputs[0]->ne[1];
+    std::array<Tensor, ops::kProjectionMaxWeights> views;
+    std::array<const Tensor*, ops::kProjectionMaxWeights> pointers{};
+    std::int32_t total = 0;
+    for (std::size_t i = 0; i < weights.size(); ++i) {
+        views[i]    = model_.tensor(weights[i], {k, rows[i]});
+        pointers[i] = &views[i];
+        total += rows[i];
+    }
+    Tensor out = workspace_.alloc(DType::FP32, {total, cols});
+    if (limits_.prefill_tc.dense && cols >= kTensorCoreMinColumns) {
+        ops::projection_tc_fp32(inputs, std::span<const Tensor* const>(pointers.data(), weights.size()), out, workspace_, stream_);
+        return out;
+    }
+    ops::projection_fp32_inputs(inputs, std::span<const Tensor* const>(pointers.data(), weights.size()), out, stream_);
+    return out;
+}
+
+Tensor TextProgram::project(const Tensor& x, std::span<const WeightId> weights, std::span<const std::int32_t> rows) {
+    const std::int32_t k = x.ne[0], cols = x.ne[1];
+    std::array<Tensor, ops::kProjectionMaxWeights> views;
+    std::array<const Tensor*, ops::kProjectionMaxWeights> pointers{};
+    std::int32_t total = 0;
+    for (std::size_t i = 0; i < weights.size(); ++i) {
+        views[i]    = model_.tensor(weights[i], {k, rows[i]});
+        pointers[i] = &views[i];
+        total += rows[i];
+    }
+    Tensor out = workspace_.alloc(DType::FP32, {total, cols});
+    // A call runs over the re-encoding when every one of its weights has one (all or none, as the forms are made),
+    // at every width: --dense-q8 takes precedence over the tensor cores, so prefill and decode read the same weights.
+    if (limits_.dense != nullptr && limits_.dense->find(views[0].data) != nullptr) {
+        std::array<ops::Q8Weight, ops::kProjectionMaxWeights> q8;
+        for (std::size_t i = 0; i < weights.size(); ++i) {
+            const ops::Q8Weight* found = limits_.dense->find(views[i].data);
+            if (found == nullptr) { throw std::logic_error("inkling2: a projection call mixes re-encoded and BF16 weights"); }
+            q8[i] = *found;
+        }
+        ops::projection_q8_fp32(x, std::span<const ops::Q8Weight>(q8.data(), weights.size()), out, stream_);
+    } else if (limits_.prefill_tc.dense && cols >= kTensorCoreMinColumns) {
+        const Tensor* input[] = {&x};
+        ops::projection_tc_fp32(input, std::span<const Tensor* const>(pointers.data(), weights.size()), out, workspace_, stream_);
+    } else {
+        ops::projection_fp32(x, std::span<const Tensor* const>(pointers.data(), weights.size()), out, stream_);
+    }
+    return out;
+}
+
+void TextProgram::control(std::span<const ControllerWeights* const> w, std::span<const Tensor* const> c,
+                          std::span<const Tensor* const> m, std::span<Tensor* const> out) {
+    const std::int32_t h = i32(config_.hidden_size), rank = i32(config_.loop_gate_rank);
+    std::array<Tensor, 3 * ops::kLoopControllerMaxJobs> views;
+    std::array<ops::LoopControllerJob, ops::kLoopControllerMaxJobs> jobs;
+    for (std::size_t j = 0; j < w.size(); ++j) {
+        views[3 * j]     = model_.tensor(w[j]->down, {2 * h, rank});
+        views[3 * j + 1] = model_.tensor(w[j]->gain, {rank, h});
+        views[3 * j + 2] = model_.tensor(w[j]->forget, {rank, h});
+        jobs[j] = {c[j], m[j], &views[3 * j], &views[3 * j + 1], &views[3 * j + 2], out[j]};
+    }
+    const std::span<const ops::LoopControllerJob> batch(jobs.data(), w.size());
+    if (blas_wide(c[0]->ne[1])) {
+        ops::loop_controller_blas(batch, config_.rms_norm_eps, workspace_, stream_);
+    } else {
+        ops::loop_controller_fp32(batch, config_.rms_norm_eps, workspace_, stream_);
+    }
+}
+
+Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor>& blocks, std::span<const Tensor* const> loop_sources, Tensor next,
+                          std::int64_t start,
+                          const Trace* trace) {
+    const TextConfig& c   = config_;
+    const std::uint32_t p = c.physical(v);
+    const LayerWeights& w = model_.weights().layers.at(p);
+    VisitState& st        = state_[v];
+    const bool local      = c.local[p];
+    if (ring_wait_ && local && cudaStreamWaitEvent(stream_, ring_copied_[v], 0) != cudaSuccess) {
+        throw std::runtime_error("inkling2: cannot wait for the snapshot copy");
+    }
+    const std::int32_t h = i32(c.hidden_size), cols = cur.ne[1], heads = i32(c.heads), d = i32(c.head_dim),
+                       kv = i32(c.kv_heads * c.head_dim), q = heads * d, rel = heads * i32(c.d_rel), k = i32(c.conv_kernel_size);
+    const float eps = c.rms_norm_eps;
+
+    // The output is the caller's (blocks and the loop bookkeeping keep it); everything else is scoped, each temporary
+    // released once its stage is done: the mixed inputs and controller outputs once normed, the attention half's
+    // temporaries before the MoE half allocates its own (only ffn_inp, a and the MoE's loop message cross over), the
+    // routing's input once routed. Only the addresses depend on this (forward_bytes sizes it).
+    const auto scope        = workspace_.scope();
+    const bool boundary     = p % c.attn_res_block_size == 0; // a block's first layer starts from a alone (3h)
+    const bool has_messages = !loop_sources.empty();
+    Tensor ffn_inp          = workspace_.alloc(DType::FP32, {h, cols});
+    Tensor a                = boundary ? ffn_inp : workspace_.alloc(DType::FP32, {h, cols}); // at a boundary a is ffn_inp
+    // 3a: the loop messages of a later pass's core layer (attn, k, v, mlp), mixed from the previous pass's bank.
+    std::array<Tensor, 4> messages;
+    if (has_messages) { messages[3] = workspace_.alloc(DType::FP32, {h, cols}); }
+    // A selected ablation graft's weights at this visit (adapters.h): a nonzero one removes its direction from the
+    // convolution's output before the residual add, which then runs on its own; zero keeps the fused add.
+    const DeviceAblation* ablation = adapters_.ablation;
+    const float attn_w = ablation != nullptr ? ablation->attn_w.at(v) : 0.0F, mlp_w = ablation != nullptr ? ablation->mlp_w.at(v) : 0.0F;
+    {
+        const auto attention_scope = workspace_.scope();
+
+        // A local visit without loop messages has one input for q, k and v (one MIX query, one norm): normalize it once
+        // and project k and v in one call.
+        const bool one_input = local && !has_messages;
+        Tensor nq = workspace_.alloc(DType::BF16, {h, cols}), nk = nq, nv = nq;
+        if (!one_input) {
+            nk = workspace_.alloc(DType::BF16, {h, cols});
+            nv = workspace_.alloc(DType::BF16, {h, cols});
+        }
+        {
+            const auto inputs_scope = workspace_.scope(); // the messages but the MoE's, the mixed and controlled inputs
+            // 3b-3d: attention inputs by depth attention, loop messages, input norms.
+            Tensor xq = cur, xk = cur, xv = cur;
+            if (p > 0) {
+                std::vector<const Tensor*> sources;
+                for (const Tensor& b : blocks) { sources.push_back(&b); }
+                sources.push_back(&cur);
+                if (local) {
+                    xq = xk = xv = workspace_.alloc(DType::FP32, {h, cols});
+                    Tensor* outs[] = {&xq};
+                    ops::depth_attention_mix(sources, model_.tensor(w.res_query, {h, 1}), eps, workspace_, outs, stream_);
+                } else {
+                    xq = workspace_.alloc(DType::FP32, {h, cols});
+                    xk = workspace_.alloc(DType::FP32, {h, cols});
+                    xv = workspace_.alloc(DType::FP32, {h, cols});
+                    Tensor* outs[] = {&xq, &xk, &xv};
+                    ops::depth_attention_mix(sources, model_.tensor(w.res_query, {h, 3}), eps, workspace_, outs, stream_);
+                }
+            }
+            if (has_messages) {
+                const std::int32_t jc = i32(p - c.loop_core_start);
+                for (const std::size_t m : {0U, 1U, 2U}) { messages[m] = workspace_.alloc(DType::FP32, {h, cols}); }
+                Tensor* attn_mlp[] = {&messages[0], &messages[3]};
+                Tensor* k_v[]      = {&messages[1], &messages[2]};
+                const Tensor loop_q  = model_.tensor(model_.weights().loop_res_query, {h, i32(2 * c.core_layers())});
+                const Tensor loop_kv = model_.tensor(model_.weights().loop_kv_res_query, {h, i32(2 * c.core_layers())});
+                ops::depth_attention_mix(loop_sources, loop_q.slice(1, 2 * jc, 2), eps, workspace_, attn_mlp, stream_);
+                ops::depth_attention_mix(loop_sources, loop_kv.slice(1, 2 * jc, 2), eps, workspace_, k_v, stream_);
+                Tensor cq = workspace_.alloc(DType::FP32, {h, cols}), ck = workspace_.alloc(DType::FP32, {h, cols}),
+                       cv = workspace_.alloc(DType::FP32, {h, cols});
+                const ControllerWeights* cw[] = {&w.loop[0], &w.loop[1], &w.loop[2]};
+                const Tensor* cin[] = {&xq, &xk, &xv};
+                const Tensor* min[] = {&messages[0], &messages[1], &messages[2]};
+                Tensor* cout[] = {&cq, &ck, &cv};
+                control(cw, cin, min, cout);
+                xq = cq;
+                xk = ck;
+                xv = cv;
+            }
+            {
+                const Tensor gq = model_.tensor(local ? w.norm : w.q_norm, {h});
+                const Tensor gk = local ? gq : model_.tensor(w.k_norm, {h}), gv = local ? gq : model_.tensor(w.v_norm, {h});
+                const ops::RmsNormJob norms[] = {{&xq, &gq, &nq}, {&xk, &gk, &nk}, {&xv, &gv, &nv}};
+                ops::rmsnorm_fp32_batch(std::span<const ops::RmsNormJob>(norms, one_input ? 1 : 3), eps, stream_);
+            }
+        }
+
+        // 3e: projections and short convolutions.
+        // One input for q, k and v: k and v ride in the q call (one launch, one longer read; a row's bits depend only on K).
+        const WeightId q_weights[] = {w.q, w.rel, w.gate, w.sink, w.k, w.v};
+        const std::int32_t q_rows[] = {q, rel, q, heads, kv, kv};
+        const std::int32_t dyn_rows = i32(c.kv_heads) * k;
+        // Separate k and v inputs at decode widths: every projection of the visit in one launch too (each row by its own
+        // input, the same bits), unless the weights run over the 8-bit re-encoding.
+        const bool reencoded = limits_.dense != nullptr && limits_.dense->find(model_.tensor(w.q, {h, q}).data) != nullptr;
+        const bool joint     = !one_input && cols <= 8 && !reencoded;
+        Tensor pq;
+        if (joint) {
+            const WeightId all[] = {w.q, w.rel, w.gate, w.sink, w.k, local ? w.v : w.k_conv_proj, w.v, w.v_conv_proj};
+            const std::int32_t all_rows[] = {q, rel, q, heads, kv, local ? kv : dyn_rows, kv, dyn_rows};
+            const Tensor* inputs[] = {&nq, &nq, &nq, &nq, &nk, local ? &nv : &nk, &nv, &nv};
+            pq = project_inputs(std::span<const Tensor* const>(inputs, local ? 6 : 8), std::span<const WeightId>(all, local ? 6 : 8),
+                                std::span<const std::int32_t>(all_rows, local ? 6 : 8));
+        } else {
+            pq = project(nq, std::span<const WeightId>(q_weights, one_input ? 6 : 4), std::span<const std::int32_t>(q_rows, one_input ? 6 : 4));
+        }
+        Tensor q_t = pq.slice(0, 0, q), r_t = pq.slice(0, q, rel), gate = pq.slice(0, q + rel, q), sink = pq.slice(0, 2 * q + rel, heads);
+        const std::int32_t tail = 2 * q + rel + heads; // the first row after the q group
+        Tensor kconv = workspace_.alloc(DType::FP32, {kv, cols}), vconv = workspace_.alloc(DType::FP32, {kv, cols});
+        if (local) {
+            Tensor pk, pv;
+            if (one_input || joint) {
+                pk = pq.slice(0, tail, kv);
+                pv = pq.slice(0, tail + kv, kv);
+            } else {
+                const WeightId kw[] = {w.k}, vw[] = {w.v};
+                const std::int32_t kr[] = {kv};
+                pk = project(nk, kw, kr);
+                pv = project(nv, vw, kr);
+            }
+            const Tensor kt = model_.tensor(w.k_conv, {k, kv}), vt = model_.tensor(w.v_conv, {k, kv});
+            ops::ShortConvJob jobs[2];
+            jobs[0].x = &pk, jobs[0].taps = &kt, jobs[0].history = &st.k_hist, jobs[0].out = &kconv;
+            jobs[1].x = &pv, jobs[1].taps = &vt, jobs[1].history = &st.v_hist, jobs[1].out = &vconv;
+            save_input(st.k_saved, pk);
+            save_input(st.v_saved, pv);
+            ops::short_conv_fp32_batch(jobs, d, stream_, columns_);
+        } else {
+            Tensor pk, pv;
+            if (joint) {
+                pk = pq.slice(0, tail, kv + dyn_rows);
+                pv = pq.slice(0, tail + kv + dyn_rows, kv + dyn_rows);
+            } else {
+                const WeightId kw[] = {w.k, w.k_conv_proj}, vw[] = {w.v, w.v_conv_proj};
+                const std::int32_t kr[] = {kv, dyn_rows};
+                pk = project(nk, kw, kr);
+                pv = project(nv, vw, kr);
+            }
+            const Tensor kd = pk.slice(0, kv, dyn_rows), vd = pv.slice(0, kv, dyn_rows);
+            const Tensor kx = pk.slice(0, 0, kv), vx = pv.slice(0, 0, kv);
+            const Tensor kt = model_.tensor(w.k_conv, {k, kv}), vt = model_.tensor(w.v_conv, {k, kv});
+            ops::ShortConvJob jobs[2];
+            jobs[0].x = &kx, jobs[0].taps = &kt, jobs[0].dynamic = &kd, jobs[0].history = &st.k_hist, jobs[0].out = &kconv;
+            jobs[1].x = &vx, jobs[1].taps = &vt, jobs[1].dynamic = &vd, jobs[1].history = &st.v_hist, jobs[1].out = &vconv;
+            save_input(st.k_saved, kx);
+            save_input(st.v_saved, vx);
+            ops::short_conv_fp32_batch(jobs, d, stream_, columns_);
+        }
+
+        // 3f: clips, value norm, log scaling of the global layers' q and r.
+        const ops::PositionLogScale tau{start, c.log_scaling_n_floor, c.log_scaling_alpha, start_offset_};
+        const Tensor q_clip = model_.tensor(w.q_clip, {d, heads}), rel_clip = model_.tensor(w.rel_clip, {i32(c.d_rel), heads});
+        // A local visit's prefill chunk wider than kLocalAttentionSlice + kTensorCoreMinColumns - 1 appends its keys and
+        // attends in pieces of kLocalAttentionSlice columns (the last one longer, at least kTensorCoreMinColumns), so its
+        // ring holds sliding_window - 1 + local_ring_chunk(max_chunk) positions instead of a whole chunk more. Every piece
+        // starts at a multiple of 32 columns and takes the same route as the whole call: each column's keys and sums are
+        // the ones the whole call gives it (the attention reads its keys and tiles by absolute position).
+        std::vector<std::pair<std::int32_t, std::int32_t>> pieces; // (first column, columns)
+        {
+            std::int32_t first = 0;
+            if (local) {
+                while (cols - first >= kLocalAttentionSlice + kTensorCoreMinColumns) {
+                    pieces.emplace_back(first, kLocalAttentionSlice);
+                    first += kLocalAttentionSlice;
+                }
+            }
+            pieces.emplace_back(first, cols - first);
+        }
+        const auto piece_of = [](const Tensor& t, std::pair<std::int32_t, std::int32_t> piece) {
+            return piece.first == 0 && piece.second == t.ne[1] ? t : t.slice(1, piece.first, piece.second);
+        };
+        {
+            ops::HeadNormJob jobs[4];
+            jobs[0].x = &q_t, jobs[0].head_dim = d, jobs[0].scale = &q_clip, jobs[0].threshold = c.qk_clip;
+            jobs[0].log_scale = local ? nullptr : &tau;
+            jobs[1].x = &r_t, jobs[1].head_dim = i32(c.d_rel), jobs[1].scale = &rel_clip, jobs[1].threshold = c.rel_clip;
+            jobs[1].log_scale = local ? nullptr : &tau;
+            // The k and v norms also append the normalized columns to the visit's ring (the attention then does not); with
+            // pieces, each piece's just before its attention (below).
+            ops::KvAppend k_append{&st.k_cache, start, start_offset_}, v_append{&st.v_cache, start, start_offset_};
+            if (!limits_.kv_quant_k.empty()) { k_append.quant = limits_.kv_quant_k[v], v_append.quant = limits_.kv_quant_v[v]; }
+            if (st.k_cache.dtype == DType::U8) {
+                k_append.quant = limits_.kv_lowbit_k[v] == 4 ? ops::kLowbitKeys4 : ops::kLowbitKeys8;
+                v_append.quant = limits_.kv_lowbit_v[v] == 4 ? ops::kLowbitValues4 : ops::kLowbitValues8;
+                jobs[0].rotate = true; // the queries meet the keys in the rotated basis
+            }
+            jobs[2].x = &kconv, jobs[2].head_dim = d, jobs[2].threshold = c.qk_clip, jobs[2].append = &k_append;
+            jobs[3].x = &vconv, jobs[3].head_dim = d, jobs[3].unit_rms = true, jobs[3].eps = eps, jobs[3].append = &v_append;
+            ops::head_norms_fp32(std::span<const ops::HeadNormJob>(jobs, pieces.size() == 1 ? 4 : 2), stream_, columns_);
+        }
+
+        // 3g: attention, output gate, output projection and its convolution.
+        ops::RelativeBiasAttentionShape shape{heads, i32(c.kv_heads), d, i32(c.d_rel), local ? i32(c.sliding_window) : 0};
+        const Tensor rel_bias = model_.tensor(w.rel_bias, {i32(c.d_rel), i32(c.rel_extent_of(p))});
+        Tensor gated = workspace_.alloc(DType::BF16, {q, cols}); // the attention output times sigmoid(gate)
+        const std::size_t split_bytes =
+            limits_.split_attention && graph_split_ ? ops::relative_bias_attention_split_bytes(shape, cols, st.k_cache.ne[1]) : 0;
+        const Tensor split = split_bytes > 0 ? workspace_.alloc(DType::FP32, {i32(split_bytes / 4)}) : Tensor{};
+        const bool tiled = limits_.prefill_tc.attention && cols >= kTensorCoreMinColumns;
+        if (pieces.size() == 1) {
+            ops::relative_bias_sink_attention(shape, q_t, r_t, sink, nullptr, nullptr, rel_bias, st.k_cache, st.v_cache, start, start_offset_, &gate,
+                                              gated, stream_, split_bytes > 0 ? &split : nullptr,
+                                              split_bytes > 0 ? static_cast<std::int32_t*>(split_counters_.p) : nullptr, tiled, columns_);
+        } else {
+            for (const auto& piece : pieces) {
+                Tensor kp = piece_of(kconv, piece), vp = piece_of(vconv, piece);
+                const std::int64_t at = start + piece.first;
+                ops::KvAppend k_append{&st.k_cache, at, nullptr}, v_append{&st.v_cache, at, nullptr};
+                if (!limits_.kv_quant_k.empty()) { k_append.quant = limits_.kv_quant_k[v], v_append.quant = limits_.kv_quant_v[v]; }
+                ops::HeadNormJob jobs[2];
+                jobs[0].x = &kp, jobs[0].head_dim = d, jobs[0].threshold = c.qk_clip, jobs[0].append = &k_append;
+                jobs[1].x = &vp, jobs[1].head_dim = d, jobs[1].unit_rms = true, jobs[1].eps = eps, jobs[1].append = &v_append;
+                ops::head_norms_fp32(jobs, stream_, nullptr);
+                const Tensor qp = piece_of(q_t, piece), rp = piece_of(r_t, piece), sp = piece_of(sink, piece), gp = piece_of(gate, piece);
+                Tensor op = piece_of(gated, piece);
+                ops::relative_bias_sink_attention(shape, qp, rp, sp, nullptr, nullptr, rel_bias, st.k_cache, st.v_cache, at, nullptr, &gp, op, stream_,
+                                                  nullptr, nullptr, tiled, nullptr);
+            }
+        }
+        const WeightId ow[] = {w.output};
+        const std::int32_t orows[] = {h};
+        Tensor a_in = project(gated, ow, orows);
+        // A selected LoRA on this layer's wo_ud: a_in += scale B (A gated), in FP32 (adapters.h).
+        if (adapters_.lora != nullptr && adapters_.lora->a.at(p) != nullptr) {
+            ops::low_rank_update_fp32(gated, adapters_.lora->a[p], adapters_.lora->b[p], adapters_.lora->rank, adapters_.lora->scale, a_in, stream_);
+        }
+        const Tensor post_taps = model_.tensor(w.post_conv, {k, h});
+
+        // 3h: the convolution with the residual and block boundary: a block's first layer starts from a alone.
+        {
+            if (boundary) { blocks.push_back(cur); }
+            ops::ShortConvJob job;
+            job.x = &a_in, job.taps = &post_taps, job.history = &st.attn_hist;
+            save_input(st.attn_saved, a_in);
+            if (boundary) {
+                job.out = &ffn_inp;
+            } else if (attn_w != 0.0F) {
+                job.out = &a;
+            } else {
+                job.out = &a, job.residual = &cur, job.sum = &ffn_inp;
+            }
+            ops::short_conv_fp32_batch(std::span<const ops::ShortConvJob>(&job, 1), 1, stream_, columns_);
+            if (attn_w != 0.0F) {
+                // At a boundary the ablated output is ffn_inp itself (in place); otherwise ffn_inp = cur + the ablated a.
+                ops::direction_ablate_fp32(boundary ? ffn_inp : a, ablation->attn_dir[v], attn_w, boundary ? nullptr : &cur, ffn_inp, stream_);
+            }
+        }
+    } // the attention half's temporaries
+
+    // 3i-3j: MoE input by depth attention, loop message, norm, routed experts, output convolution.
+    std::vector<const Tensor*> sources;
+    for (const Tensor& b : blocks) { sources.push_back(&b); }
+    sources.push_back(&ffn_inp);
+    // The FFN norm is formed by the routing launch (the same bits as rmsnorm_fp32), into zn.
+    const Tensor ffn_norm = model_.tensor(w.ffn_norm, {h});
+    Tensor zn = workspace_.alloc(DType::FP32, {h, cols});
+    const ops::RouteInputNorm norm{&ffn_norm, eps, &zn};
+    const std::int32_t top_k = i32(c.experts_per_token);
+    Tensor ids = workspace_.alloc(DType::I32, {top_k, cols}), weights = workspace_.alloc(DType::FP32, {top_k, cols});
+    {
+        const auto route_scope = workspace_.scope(); // z (and its controller's output), dead once routed
+        Tensor z = workspace_.alloc(DType::FP32, {h, cols});
+        {
+            Tensor* outs[] = {&z};
+            ops::depth_attention_mix(sources, model_.tensor(w.ffn_res_query, {h, 1}), eps, workspace_, outs, stream_);
+        }
+        if (has_messages) {
+            Tensor zc = workspace_.alloc(DType::FP32, {h, cols});
+            const ControllerWeights* cw[] = {&w.loop[3]};
+            const Tensor* cin[] = {&z};
+            const Tensor* min[] = {&messages[3]};
+            Tensor* cout[] = {&zc};
+            control(cw, cin, min, cout);
+            z = zc;
+        }
+        const auto route = blas_wide(cols) ? ops::moe_route_sigmoid_topk_blas : ops::moe_route_sigmoid_topk;
+        route(z, &norm, model_.tensor(w.router, {h, i32(c.experts)}), model_.tensor(w.router_bias, {i32(c.experts)}), top_k, c.route_scale,
+              workspace_, ids, weights, stream_);
+    }
+    // The experts' outputs are combined by the output convolution's launch (the same FMAs as the experts' own
+    // combine); the combined y is written out only when the convolution inputs are being saved.
+    Tensor entries = workspace_.alloc(DType::FP32, {h, top_k * cols});
+    if (limits_.prefill_tc.experts && cols >= kTensorCoreMinColumns) {
+        const ops::SituExpertBank& bank = model_.expert_bank(p);
+        const std::int32_t split = !blas_wide(cols) ? 0 : bank.format == QType::BF16 ? limits_.prefill_tc.bank_experts : limits_.prefill_tc.blas_experts;
+        ops::moe_situ_experts_tc(bank, zn, ids, nullptr, c.gate_softcap, c.up_softcap, workspace_, entries, stream_, split);
+    } else {
+        ops::moe_situ_experts(model_.expert_bank(p), zn, ids, nullptr, c.gate_softcap, c.up_softcap, workspace_, entries, stream_);
+    }
+    {
+        Tensor y = saving_ ? workspace_.alloc(DType::FP32, {h, cols}) : Tensor();
+        const ops::ConvCombine combine{&entries, &weights, saving_ ? &y : nullptr};
+        const Tensor mlp_taps = model_.tensor(w.mlp_post_conv, {k, h});
+        ops::ShortConvJob job;
+        job.combine = &combine, job.taps = &mlp_taps, job.history = &st.mlp_hist;
+        if (mlp_w != 0.0F) {
+            job.out = &zn; // zn (the experts' input) is dead once they ran: the convolution's output, then ablated
+        } else {
+            job.residual = &ffn_inp, job.sum = &next;
+        }
+        ops::short_conv_fp32_batch(std::span<const ops::ShortConvJob>(&job, 1), 1, stream_, columns_);
+        if (mlp_w != 0.0F) { ops::direction_ablate_fp32(zn, ablation->mlp_dir[v], mlp_w, &ffn_inp, next, stream_); }
+        save_input(st.mlp_saved, y);
+    }
+
+    if (trace != nullptr && *trace) {
+        sync(stream_);
+        (*trace)("attn_out-" + std::to_string(v), a);
+        (*trace)("ffn_inp-" + std::to_string(v), ffn_inp);
+        (*trace)("l_out-" + std::to_string(v), next);
+        (*trace)("route_ids-" + std::to_string(v), ids);
+    }
+    return next;
+}
+
+Tensor TextProgram::forward(std::span<const std::int32_t> tokens, std::span<const InputEmbeddings> embeddings, const Trace* trace) {
+    const TextConfig& c = config_;
+    const std::int32_t cols = static_cast<std::int32_t>(tokens.size()), h = i32(c.hidden_size);
+    if (cols < 1 || cols > limits_.max_chunk) { throw std::invalid_argument("inkling2: chunk size outside 1..max_chunk"); }
+    if (position_ + cols > limits_.max_context) { throw std::invalid_argument("inkling2: the sequence would pass max_context"); }
+    for (const auto token : tokens) {
+        if (token < 0 || static_cast<std::uint32_t>(token) >= c.unpadded_vocab_size) { throw std::invalid_argument("inkling2: token id out of range"); }
+    }
+    std::int32_t next = 0;
+    for (const auto& e : embeddings) {
+        const bool shaped = e.values.data != nullptr && e.values.dtype == DType::FP32 && e.values.ne[0] == h && e.values.ne[1] >= 1 &&
+                            e.values.ne[2] == 1 && e.values.ne[3] == 1 && e.values.is_contiguous();
+        if (!shaped || e.column < next || e.column + e.values.ne[1] > cols) {
+            throw std::invalid_argument("inkling2: input embeddings must be FP32 [hidden, n] in ascending columns of the chunk");
+        }
+        next = e.column + e.values.ne[1];
+    }
+    const bool tracing = trace != nullptr && *trace;
+    // A save_async copy still reading the rings: a forward that writes a slot it reads (position copy_first_ + the
+    // ring's capacity or later) waits for it, an eager one visit by visit, the decode graph all at once.
+    settle_copy();
+    if (copy_pending_) {
+        std::int64_t capacity = 0;
+        for (std::uint32_t v = 0; v < c.num_layer_visits && capacity == 0; ++v) {
+            if (c.local[c.physical(v)]) { capacity = state_[v].k_cache.ne[1]; }
+        }
+        if (capacity > 0 && position_ + cols - 1 >= copy_first_ + capacity) {
+            if (cols == 1) {
+                wait_copy();
+            } else {
+                ring_wait_ = true;
+            }
+        }
+    }
+    // With several slots the one-token forward is a batch of one (the single-sequence graph would hold one slot's
+    // state pointers), unless there are taps to copy: forward_batch copies none, so a tapped forward takes the eager
+    // path below, which copies them for this slot as a single-sequence forward does.
+    const bool copies_taps = taps_on_ && !taps_.empty();
+    if (cols == 1 && embeddings.empty() && !tracing && limits_.decode_graph && stream_ != nullptr && !(limits_.slots > 1 && copies_taps)) {
+        if (limits_.slots > 1) {
+            const std::int32_t slot[] = {slot_};
+            return forward_batch(slot, tokens);
+        }
+        return forward_graph(tokens[0]);
+    }
+    workspace_.reset();
+    Tensor ids = workspace_.alloc(DType::I32, {cols});
+    if (cudaMemcpyAsync(ids.data, tokens.data(), tokens.size_bytes(), cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
+        throw std::runtime_error("inkling2: token upload failed");
+    }
+    saving_ = cols >= 2 && cols <= limits_.max_rollback;
+    if (saving_) {
+        // Each history before the forward, ahead of the inputs save_input() appends.
+        CopyBatch copies(stream_);
+        for (auto& s : state_) {
+            for (auto [hist, saved] : {std::pair{&s.k_hist, &s.k_saved}, std::pair{&s.v_hist, &s.v_saved},
+                                       std::pair{&s.attn_hist, &s.attn_saved}, std::pair{&s.mlp_hist, &s.mlp_saved}}) {
+                copies.add(saved->data, hist->data, hist->bytes());
+            }
+        }
+        copies.flush();
+    }
+    last_cols_ = 0;
+    Tensor logits;
+    inputs_ = embeddings;
+    try {
+        logits = run(ids, position_, trace);
+    } catch (...) {
+        saving_ = ring_wait_ = false;
+        inputs_ = {};
+        throw;
+    }
+    ring_wait_ = false; // the copy stays pending (the histories after the last sliding visit) until its event completes
+    saving_ = false;
+    inputs_ = {};
+    position_ += cols;
+    last_cols_   = cols;
+    last_tapped_ = taps_on_;
+    return logits;
+}
+
+namespace {
+
+// One form of a parse_kv_quant spec: sets the visits it names, leaves the others.
+void apply_kv_form(const TextConfig& c, const std::string& spec, const std::string& form_spec, ProgramLimits& limits) {
+    const auto fail = [&] { throw std::invalid_argument("inkling2: bad low-bit KV spec '" + spec + "'"); };
+    std::vector<std::string> parts;
+    for (std::size_t from = 0;;) {
+        const std::size_t to = form_spec.find(':', from);
+        parts.push_back(form_spec.substr(from, to == std::string::npos ? std::string::npos : to - from));
+        if (to == std::string::npos) { break; }
+        from = to + 1;
+    }
+    const std::string& form = parts[0];
+    const std::size_t vat = form.find('v');
+    if (form.empty() || form[0] != 'k' || vat == std::string::npos) { fail(); }
+    const std::string kf = form.substr(1, vat - 1), vf = form.substr(vat + 1);
+    int kq = -1, vq = -1;
+    if (kf == "16") { kq = 0; } else if (kf == "8") { kq = 0x12; } else if (kf == "4") { kq = 0x11; } else if (kf == "8n") { kq = 0x02; } else if (kf == "4n") { kq = 0x01; }
+    if (vf == "16") { vq = 0; } else if (vf == "8") { vq = 0x02; } else if (vf == "4") { vq = 0x03; } else if (vf == "4l") { vq = 0x11; } else if (vf == "4r") { vq = 0x13; } else if (vf == "8r") { vq = 0x12; }
+    if (kq < 0 || vq < 0) { fail(); }
+    std::vector<std::uint32_t> globals;
+    for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
+        if (!c.local[c.physical(v)]) { globals.push_back(v); }
+    }
+    std::vector<bool> on(c.num_layer_visits, false);
+    bool chose = false, local = false, real = false;
+    for (std::size_t i = 1; i < parts.size(); ++i) {
+        const std::string& o = parts[i];
+        if (o == "local") {
+            local = true;
+        } else if (o.rfind("g=", 0) == 0) {
+            chose = true;
+            std::size_t from = 2;
+            while (from < o.size()) {
+                std::size_t to = o.find(',', from);
+                if (to == std::string::npos) { to = o.size(); }
+                const int g = std::stoi(o.substr(from, to - from));
+                if (g < 0 || g >= static_cast<int>(globals.size())) { fail(); }
+                on[globals[static_cast<std::size_t>(g)]] = true;
+                from = to + 1;
+            }
+        } else if (o == "real") {
+            real = true;
+        } else {
+            fail();
+        }
+    }
+    if (!chose) {
+        for (const auto v : globals) { on[v] = true; }
+    }
+    if (local) {
+        for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) { on[v] = on[v] || c.local[c.physical(v)]; }
+    }
+    int kb = 0, vb = 0;
+    if (real) {
+        kb = kq == ops::kLowbitKeys4 ? 4 : kq == ops::kLowbitKeys8 ? 8 : kq == 0 ? 16 : 0;
+        vb = vq == ops::kLowbitValues4 ? 4 : vq == ops::kLowbitValues8 ? 8 : vq == 0 ? 16 : 0;
+        if (kb == 0 || vb == 0 || (kb == 16) != (vb == 16) || local) { fail(); }
+        if (kb == 16) { kb = vb = 0; }
+    }
+    for (auto* field : {&limits.kv_quant_k, &limits.kv_quant_v}) { field->resize(c.num_layer_visits, 0); }
+    for (auto* field : {&limits.kv_lowbit_k, &limits.kv_lowbit_v}) { field->resize(c.num_layer_visits, 0); }
+    for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
+        if (!on[v]) { continue; }
+        // A visit takes this form alone: a real one clears the simulated coding, and the other way round.
+        limits.kv_quant_k[v]  = real ? 0 : kq, limits.kv_quant_v[v] = real ? 0 : vq;
+        limits.kv_lowbit_k[v] = static_cast<std::uint8_t>(kb), limits.kv_lowbit_v[v] = static_cast<std::uint8_t>(vb);
+    }
+}
+
+} // namespace
+
+void parse_kv_quant(const TextConfig& c, const std::string& spec, ProgramLimits& limits) {
+    for (std::size_t from = 0;;) {
+        const std::size_t plus = spec.find('+', from);
+        apply_kv_form(c, spec, spec.substr(from, plus == std::string::npos ? std::string::npos : plus - from), limits);
+        if (plus == std::string::npos) { break; }
+        from = plus + 1;
+    }
+    const auto none = [](const auto& field) { return std::all_of(field.begin(), field.end(), [](auto x) { return x == 0; }); };
+    if (none(limits.kv_quant_k) && none(limits.kv_quant_v)) { limits.kv_quant_k.clear(), limits.kv_quant_v.clear(); }
+    if (none(limits.kv_lowbit_k) && none(limits.kv_lowbit_v)) { limits.kv_lowbit_k.clear(), limits.kv_lowbit_v.clear(); }
+    const bool simulated = !limits.kv_quant_k.empty(), stored = !limits.kv_lowbit_k.empty();
+    if (simulated && stored) { throw std::invalid_argument("inkling2: bad low-bit KV spec '" + spec + "' (simulated and real forms do not mix)"); }
+}
+
+Tensor TextProgram::forward_graph(std::int32_t token) {
+    struct Step {
+        std::int64_t position;
+        std::int32_t token, pad;
+    };
+    const Step host{position_, token, 0};
+    if (step_.bytes == 0) { step_ = DeviceBuffer(sizeof(Step)); }
+    // From pageable memory: the copy is staged before the call returns, so `host` may go out of scope.
+    if (cudaMemcpyAsync(step_.p, &host, sizeof host, cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
+        throw std::runtime_error("inkling2: step upload failed");
+    }
+    // The graph with the tap copies, or the one without (the same graph when there are no taps); with the split
+    // attention once the new column sees more than kSplitMinKeys keys (the graph's grid is sized for the whole ring).
+    const bool split        = limits_.split_attention && position_ + 1 > ops::kSplitMinKeys;
+    const std::size_t g     = (taps_on_ && !taps_.empty() ? 2 : 0) + (split ? 1 : 0);
+    cudaGraphExec_t& exec   = decode_graph_[g];
+    Tensor& graph_logits    = graph_logits_[g];
+    if (exec == nullptr) {
+        workspace_.reset();
+        const Tensor ids(static_cast<char*>(step_.p) + offsetof(Step, token), DType::I32, {1});
+        if (cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+            throw std::runtime_error("inkling2: cannot capture the decode graph");
+        }
+        start_offset_ = static_cast<const std::int64_t*>(step_.p);
+        graph_split_  = split;
+        // Ends the capture and returns its graph; a graph handle is destroyed whatever the capture's result.
+        const auto end_capture = [&]() -> cudaGraph_t {
+            start_offset_ = nullptr;
+            graph_split_  = true;
+            cudaGraph_t graph = nullptr;
+            const cudaError_t ended = cudaStreamEndCapture(stream_, &graph);
+            if (ended != cudaSuccess) {
+                if (graph != nullptr) { cudaGraphDestroy(graph); }
+                return nullptr;
+            }
+            return graph;
+        };
+        try {
+            graph_logits = run(ids, 0, nullptr);
+        } catch (...) {
+            if (cudaGraph_t graph = end_capture()) { cudaGraphDestroy(graph); }
+            throw;
+        }
+        cudaGraph_t graph = end_capture();
+        if (graph == nullptr) { throw std::runtime_error("inkling2: decode graph capture failed"); }
+        const cudaError_t made = cudaGraphInstantiate(&exec, graph, 0);
+        cudaGraphDestroy(graph);
+        if (made != cudaSuccess) {
+            exec = nullptr;
+            throw std::runtime_error(std::string("inkling2: cannot instantiate the decode graph: ") + cudaGetErrorString(made));
+        }
+    }
+    if (cudaGraphLaunch(exec, stream_) != cudaSuccess) { throw std::runtime_error("inkling2: decode graph launch failed"); }
+    position_ += 1;
+    last_cols_   = 1;
+    last_tapped_ = taps_on_;
+    return graph_logits;
+}
+
+Tensor TextProgram::forward_batch(std::span<const std::int32_t> slots, std::span<const std::int32_t> tokens) {
+    const auto cols = static_cast<std::int32_t>(slots.size());
+    if (cols < 1 || cols > std::min(kMaxBatchColumns, limits_.max_chunk) || tokens.size() != slots.size()) {
+        throw std::invalid_argument("inkling2: forward_batch takes 1 to 8 (slot, token) pairs, at most max_chunk");
+    }
+    wait_copy();
+    struct Step {
+        std::int64_t positions[kMaxBatchColumns];
+        std::int32_t tokens[kMaxBatchColumns];
+        std::int32_t slots[kMaxBatchColumns];
+    };
+    positions_[static_cast<std::size_t>(slot_)] = position_;
+    Step host{};
+    for (std::int32_t i = 0; i < cols; ++i) {
+        const std::int32_t slot = slots[static_cast<std::size_t>(i)], token = tokens[static_cast<std::size_t>(i)];
+        if (slot < 0 || slot >= limits_.slots || std::count(slots.begin(), slots.begin() + i, slot) != 0) {
+            throw std::invalid_argument("inkling2: forward_batch's slots must be distinct slots of the Program");
+        }
+        if (token < 0 || static_cast<std::uint32_t>(token) >= config_.unpadded_vocab_size) { throw std::invalid_argument("inkling2: token id out of range"); }
+        if (positions_[static_cast<std::size_t>(slot)] + 1 > limits_.max_context) {
+            throw std::invalid_argument("inkling2: the sequence would pass max_context");
+        }
+        host.positions[i] = positions_[static_cast<std::size_t>(slot)];
+        host.tokens[i]    = token;
+        host.slots[i]     = slot;
+    }
+    if (batch_step_.bytes == 0) {
+        batch_step_ = DeviceBuffer(sizeof(Step));
+        auto* step  = static_cast<char*>(batch_step_.p);
+        batch_columns_.positions   = reinterpret_cast<const std::int64_t*>(step + offsetof(Step, positions));
+        batch_columns_.slots       = reinterpret_cast<const std::int32_t*>(step + offsetof(Step, slots));
+        batch_columns_.slot_stride = slot_stride_;
+    }
+    // From pageable memory: the copy is staged before the call returns.
+    if (cudaMemcpyAsync(batch_step_.p, &host, sizeof host, cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
+        throw std::runtime_error("inkling2: batch step upload failed");
+    }
+    Tensor logits;
+    if (limits_.decode_graph && stream_ != nullptr) {
+        cudaGraphExec_t& exec = batch_graph_[cols - 1];
+        if (exec == nullptr) {
+            if (cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+                throw std::runtime_error("inkling2: cannot capture the batched decode graph");
+            }
+            cudaGraph_t graph = nullptr;
+            try {
+                batch_logits_[cols - 1] = run_batch(cols);
+            } catch (...) {
+                if (cudaStreamEndCapture(stream_, &graph) == cudaSuccess && graph != nullptr) { cudaGraphDestroy(graph); }
+                throw;
+            }
+            if (cudaStreamEndCapture(stream_, &graph) != cudaSuccess || graph == nullptr) {
+                if (graph != nullptr) { cudaGraphDestroy(graph); }
+                throw std::runtime_error("inkling2: batched decode graph capture failed");
+            }
+            const cudaError_t made = cudaGraphInstantiate(&exec, graph, 0);
+            cudaGraphDestroy(graph);
+            if (made != cudaSuccess) {
+                exec = nullptr;
+                throw std::runtime_error(std::string("inkling2: cannot instantiate the batched decode graph: ") + cudaGetErrorString(made));
+            }
+        }
+        if (cudaGraphLaunch(exec, stream_) != cudaSuccess) { throw std::runtime_error("inkling2: batched decode graph launch failed"); }
+        logits = batch_logits_[cols - 1];
+    } else {
+        logits = run_batch(cols);
+    }
+    for (std::int32_t i = 0; i < cols; ++i) { ++positions_[static_cast<std::size_t>(host.slots[i])]; }
+    position_    = positions_[static_cast<std::size_t>(slot_)];
+    last_cols_   = 0;
+    last_tapped_ = false;
+    return logits;
+}
+
+Tensor TextProgram::run_batch(std::int32_t cols) {
+    // Slot 0's states, at start 0: each Op adds column t's slot offset and reads its position (batch_columns_).
+    const std::span<VisitState> selected = state_;
+    state_   = std::span<VisitState>(all_state_).first(config_.num_layer_visits);
+    columns_ = &batch_columns_;
+    workspace_.reset();
+    const Tensor ids(static_cast<char*>(batch_step_.p) + kMaxBatchColumns * sizeof(std::int64_t), DType::I32, {cols});
+    Tensor logits;
+    try {
+        logits = run(ids, 0, nullptr);
+    } catch (...) {
+        state_ = selected, columns_ = nullptr;
+        throw;
+    }
+    state_ = selected, columns_ = nullptr;
+    return logits;
+}
+
+Tensor TextProgram::run(const Tensor& ids, std::int64_t start, const Trace* trace) {
+    const TextConfig& c = config_;
+    const std::int32_t cols = ids.ne[0], h = i32(c.hidden_size);
+
+    // 1: embedding and its norm.
+    Tensor cur = workspace_.alloc(DType::FP32, {h, cols});
+    ops::embedding_bf16_fp32(ids, model_.tensor(model_.weights().embedding, {h, i32(c.vocab_size)}), cur, stream_);
+    const Tensor embed_norm = model_.tensor(model_.weights().embedding_norm, {h});
+    ops::rmsnorm_fp32(cur, &embed_norm, c.rms_norm_eps, cur, stream_);
+    for (const auto& e : inputs_) {
+        if (cudaMemcpyAsync(static_cast<float*>(cur.data) + static_cast<std::int64_t>(e.column) * h, e.values.data, e.values.bytes(),
+                            cudaMemcpyDeviceToDevice, stream_) != cudaSuccess) {
+            throw std::runtime_error("inkling2: input embedding copy failed");
+        }
+    }
+
+    // 3: the visits, with the loop bookkeeping of 3a. Their outputs take slots of a pool sized by max_live_outputs,
+    // a slot freed once no block, loop state or the current output refers to it (the same values: only addresses).
+    std::vector<Tensor> blocks, prelude_blocks, bank;
+    Tensor prelude_cur, bank_last;
+    std::vector<Tensor> pool(static_cast<std::size_t>(max_live_outputs(c)));
+    for (Tensor& slot : pool) { slot = workspace_.alloc(DType::FP32, {h, cols}); }
+    std::vector<bool> taken(pool.size(), false);
+    const auto take_slot = [&]() -> Tensor {
+        const auto refers = [&](const void* data) {
+            const auto in = [&](const std::vector<Tensor>& list) {
+                return std::any_of(list.begin(), list.end(), [&](const Tensor& t) { return t.data == data; });
+            };
+            return cur.data == data || prelude_cur.data == data || bank_last.data == data || in(blocks) || in(prelude_blocks) || in(bank);
+        };
+        for (std::size_t i = 0; i < pool.size(); ++i) {
+            if (taken[i] && !refers(pool[i].data)) { taken[i] = false; }
+        }
+        for (std::size_t i = 0; i < pool.size(); ++i) {
+            if (!taken[i]) {
+                taken[i] = true;
+                return pool[i];
+            }
+        }
+        throw std::logic_error("inkling2: the visit output pool is exhausted");
+    };
+    for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
+        const std::uint32_t p = c.physical(v), pass = c.pass(v);
+        const bool core = c.is_core(p);
+        if (core && p == c.loop_core_start) {
+            if (pass == 0) {
+                prelude_blocks = blocks;
+                prelude_cur    = cur;
+            } else {
+                bank.assign(blocks.begin() + static_cast<std::ptrdiff_t>(prelude_blocks.size()) + 1, blocks.end());
+                bank_last = cur;
+                blocks    = prelude_blocks;
+                cur       = prelude_cur;
+            }
+        }
+        Tensor next = take_slot();
+        // A later pass's core layer mixes its loop messages from the previous pass's bank (inside visit()).
+        std::vector<const Tensor*> loop_sources;
+        if (core && pass > 0) {
+            for (const Tensor& b : bank) { loop_sources.push_back(&b); }
+            loop_sources.push_back(&bank_last);
+        }
+        copy_tap(v, cur);
+        cur = visit(v, cur, blocks, loop_sources, next, start, trace);
+    }
+
+    // 4: output.
+    std::vector<const Tensor*> sources;
+    for (const Tensor& b : blocks) { sources.push_back(&b); }
+    sources.push_back(&cur);
+    Tensor x = workspace_.alloc(DType::FP32, {h, cols});
+    {
+        Tensor* outs[] = {&x};
+        const Tensor output_query = model_.tensor(model_.weights().output_res_query, {h, 1});
+        ops::depth_attention_mix(sources, output_query, c.rms_norm_eps, workspace_, outs, stream_);
+    }
+    const Tensor out_norm = model_.tensor(model_.weights().output_norm, {h});
+    ops::rmsnorm_fp32(x, &out_norm, c.rms_norm_eps, x, stream_);
+    copy_tap(c.num_layer_visits, x);
+    if (trace != nullptr && *trace) {
+        sync(stream_);
+        (*trace)("result_norm", x);
+    }
+    // last_logits: a prefill chunk's logits are its last column's (projection_fp32's columns do not depend on the width).
+    const bool last_only = limits_.last_logits && cols > std::max(1, limits_.max_rollback) && columns_ == nullptr;
+    const Tensor xs = last_only ? x.slice(1, cols - 1, 1) : x;
+    Tensor xb = workspace_.alloc(DType::BF16, {h, xs.ne[1]});
+    ops::cast_fp32_to_bf16(xs, xb, stream_);
+    const WeightId head[] = {model_.weights().head};
+    const std::int32_t head_rows[] = {i32(c.vocab_size)};
+    Tensor logits = project(xb, head, head_rows);
+    ops::tanh_softcap_fp32(logits, c.final_logit_softcap, logits, stream_);
+    return logits;
+}
+
+} // namespace ninfer::models::inkling2

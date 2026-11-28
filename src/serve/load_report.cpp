@@ -38,6 +38,7 @@ Json load_report(const LoadCapacity& capacity, const LoadSample& sample) {
         capacity.kv_capacity_pages == 0 ? 0
                                         : capacity.kv_capacity_tokens / capacity.kv_capacity_pages;
     const std::uint64_t occupied_tokens =
+        stats.device_main_kv_occupied_tokens ? *stats.device_main_kv_occupied_tokens :
         static_cast<std::uint64_t>(stats.device_main_kv_occupied_pages) * page_tokens;
 
     Json report = {

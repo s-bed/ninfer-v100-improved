@@ -1,6 +1,7 @@
 #include "product/v100_options.h"
 
 #include "serve/serve_options.h"
+#include "serve/http_security.h"
 #include "product/kv_resident_options.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
@@ -144,6 +145,7 @@ std::string serve_usage_text(const char* argv0) {
            "                                by each card's measured bandwidth and free memory)\n" +
            std::string(product::kTensorAttentionHelp) +
            std::string(product::kInvariantAttentionHelp) +
+           "  --mxfp8-experts auto|on|off   Inkling-2 resident MXFP8 expert banks\n"
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
            "  --embedding-residency device|host  token embedding on GPU (default) or in\n"
@@ -382,7 +384,7 @@ std::string serve_usage_text(const char* argv0) {
            "                                speculative decoding backend (default: mtp with 3\n"
            "                                drafts for Flash-Next and Gemma 4 host or disk\n"
            "                                experts whose artifact has the drafter, else none;\n"
-           "                                dspark: DeepSeek-V4.1's DSpark drafter)\n"
+           "                                dspark: DeepSeek-V4.1 or Inkling-2 DSpark drafter)\n"
            "  --draft-tokens N              drafts per round, 1..15 (dspark: up to its block\n"
            "                                of 5, the default)\n"
            "  --draft-min-p P              Flash-Next MTP confidence floor, 0..1 (default 0;\n"
@@ -504,6 +506,7 @@ std::string serve_usage_text(const char* argv0) {
            "                                choices:[]\n"
            "\n"
            "NETWORK & LIMITS\n"
+           "  --allowed-host NAME           accept an additional server host name (repeatable)\n"
            "  --host H                      listen address (default 127.0.0.1)\n"
            "  --port N                      listen port (default 8080)\n"
            "  --stats-port N                also serve /health, /stats, /v1/load and /metrics\n"
@@ -664,6 +667,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         };
         // One `if` per option, each ending in `continue`, not an `else if` chain: MSVC nests each
         // `else if` one block deeper and stops compiling at 128 (C1061).
+        if (arg == "--allowed-host") {
+            const std::string name(require_value("--allowed-host"));
+            if (!valid_allowed_host(name)) { throw std::invalid_argument("--allowed-host requires a host name or address"); }
+            options.allowed_hosts.push_back(name);
+            continue;
+        }
         if (arg == "--host") {
             options.host = require_value("--host");
             continue;
@@ -736,6 +745,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--fast-prefill-kernel") {
             options.fast_prefill_kernel = true;
+            continue;
+        }
+        if (arg == "--mxfp8-experts") {
+            const std::string_view setting = require_value("--mxfp8-experts");
+            if (setting == "on") { options.experts_mxfp8 = ExpertsMxfp8::On; }
+            else if (setting == "off") { options.experts_mxfp8 = ExpertsMxfp8::Off; }
+            else if (setting == "auto") { options.experts_mxfp8 = ExpertsMxfp8::Auto; }
+            else { throw std::invalid_argument("--mxfp8-experts takes auto, on or off"); }
             continue;
         }
         if (arg == "--v100-kernels") {

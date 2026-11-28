@@ -134,7 +134,7 @@ class OrdinaryRunCache;
 
 // The pre-tokenizer of a byte-level tokenizer: Qwen's one split, or Flint's or DeepSeek's three
 // (digits in groups of up to three, CJK runs, then o200k's words or DeepSeek's).
-enum class ByteLevelSplit : std::uint8_t { Qwen, Flint, DeepSeek };
+enum class ByteLevelSplit : std::uint8_t { Qwen, Flint, DeepSeek, Inkling2 };
 
 class Tokenizer {
 public:
@@ -170,6 +170,9 @@ private:
     void load_sentencepiece(const nlohmann::json& root, const nlohmann::json& config,
                             const nlohmann::json& model, TokenizerResources resources);
 
+public:
+    [[nodiscard]] bool inkling2() const noexcept { return split_ == ByteLevelSplit::Inkling2; }
+private:
     bool sentencepiece_ = false;
     // Byte-level: whether ordinary text is NFC-normalized first, and how it splits into words.
     bool nfc_              = true;

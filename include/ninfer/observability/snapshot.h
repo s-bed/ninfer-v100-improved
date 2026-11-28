@@ -208,6 +208,8 @@ struct RuntimeStats {
     std::uint64_t engine_recoveries = 0;
     NgramTableStats ngram_table;
     ExpertResidencyStats experts;
+    // Contiguous rings can report the exact committed frontier, also inside a page.
+    std::optional<std::uint32_t> device_main_kv_occupied_tokens;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

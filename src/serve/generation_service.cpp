@@ -272,6 +272,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.max_concurrency          = options.max_concurrency;
     engine_options.max_pending_requests     = options.max_pending_requests;
     engine_options.pending_timeout_ms       = options.pending_timeout_ms;
+    engine_options.experts_mxfp8 = options.experts_mxfp8;
     engine_options.prefill_chunk            = options.prefill_chunk;
     engine_options.decode_rounds_per_prefill = options.decode_rounds_per_prefill;
     engine_options.fast_prefill_kernel      = options.fast_prefill_kernel;

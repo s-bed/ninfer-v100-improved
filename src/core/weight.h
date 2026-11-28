@@ -52,6 +52,7 @@ enum class QType : std::uint16_t {
     // itself (an STQ matrix's trellis; its sign vectors are FP16).
     FP16   = 31,
     UINT16 = 32,
+    GGML_REC_NVFP4_NVFP4 = 33,
 };
 
 [[nodiscard]] constexpr bool is_gguf(QType format) {
@@ -107,6 +108,7 @@ enum class QuantLayout : std::uint16_t {
     RowInterleaved = 6,
     // Device-only donor QPN permutation; 4 is already RowSplitPanel.
     VoltaQpnPrepacked = 7,
+    GgmlExpertRecord = 8,
 };
 
 // Rows per stored panel. Four 32-byte records is exactly one 128-byte line, which is all the

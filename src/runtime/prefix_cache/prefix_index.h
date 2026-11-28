@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <functional>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -326,7 +327,7 @@ public:
     // is at `base_frontier` and which alone keeps the blocks between them, carrying `hits` of its
     // lineage (§9.3).
     [[nodiscard]] double estimate_priority(std::uint32_t base_frontier, std::uint32_t frontier,
-                                           bool tail, std::uint32_t hits = 0) const noexcept;
+                                           bool tail, std::uint32_t hits = 0, std::uint64_t image_bytes = 0) const noexcept;
     // Highest GDSF priority among the valid retained (not superseded) snapshots in `snapshots`,
     // -infinity when there is none: the claim a lane's block write-through makes for the
     // snapshots it published (begin_host_fill).
@@ -363,6 +364,12 @@ public:
                           SnapshotKind kind, std::uint32_t hits, bool branch_point,
                           bool periodic);
 
+    // A single contiguous device lane can write its image straight to the host tier.
+    // The anchor path must be pinned. The image becomes visible only after write returns.
+    using ImageWriter = std::function<void(std::span<const std::uint32_t>)>;
+    [[nodiscard]] std::optional<SnapshotRef> capture_host_image(NodeRef anchor,
+        std::uint32_t frontier, SnapshotKind kind, std::uint64_t image_bytes, const ImageWriter& write);
+
     // ---- views
     // ------------------------------------------------------------------------------------
     [[nodiscard]] bool valid(NodeRef node) const noexcept;
@@ -375,6 +382,11 @@ public:
     void check_invariants() const;
 
 private:
+    [[nodiscard]] std::optional<SnapshotRef> add_host_snapshot(NodeRef anchor,
+        std::uint32_t frontier, std::span<const TokenId> tail, SnapshotKind kind,
+        std::uint32_t hits, bool branch_point, bool periodic, std::uint64_t image_bytes,
+        const ImageWriter& write);
+
     struct Node {
         std::uint32_t generation = 0;
         bool occupied            = false;
@@ -408,6 +420,7 @@ private:
         std::uint32_t tail_device  = kNoId;
         CopyState tail_device_copy = CopyState::Absent;
         std::uint32_t device_slot  = kNoId;
+        std::uint64_t image_bytes = 0;
         std::vector<std::uint32_t> host_slabs;
         CopyState host                = CopyState::Absent;
         std::uint32_t pins            = 0;

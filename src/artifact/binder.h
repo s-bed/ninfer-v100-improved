@@ -15,7 +15,8 @@ namespace ninfer::artifact {
 // Registered: Host bytes registered separately for DMA, with the same object/view lifetime.
 // Mapped: the object lives only in a page-locked Host block mapped into the primary device's
 // address space; its view addresses that mapping, so device kernels read the bytes in place.
-enum class Residency { Device, Host, Values, Pinned, Registered, Mapped };
+// File: validate the source geometry and leave the payload for a streaming model loader.
+enum class Residency { Device, Host, Values, Pinned, Registered, Mapped, File };
 
 struct ParameterReference {
     std::string name;

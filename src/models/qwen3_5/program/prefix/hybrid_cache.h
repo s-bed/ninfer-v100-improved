@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
-#include "core/host_pages.h"
+#include "runtime/prefix_cache/host_slabs.h"
 #include "core/startup.h"
 #include "models/qwen3_5/program/prefix/hybrid_host_layout.h"
 #include "models/qwen3_5/program/storage/kv_store.h"
@@ -116,7 +116,7 @@ public:
 
     [[nodiscard]] const HybridCacheCounters& counters() const noexcept { return counters_; }
 
-    [[nodiscard]] bool host_tier() const noexcept { return !host_chunks_.empty(); }
+    [[nodiscard]] bool host_tier() const noexcept { return !host_slabs_.empty(); }
 
     [[nodiscard]] const HybridHostLayout& host_layout() const noexcept { return host_layout_; }
 
@@ -314,8 +314,7 @@ private:
     // can fail or stall on Windows (WDDM) where several smaller ones succeed. A slab never
     // crosses chunks, and every copy record carries its chunk as its group, so a strided copy
     // run never spans two chunks (two records of different chunks would otherwise form a run).
-    std::vector<std::unique_ptr<HostPages>> host_chunks_;
-    std::uint32_t slabs_per_chunk_ = 0;
+    runtime::prefix_cache::HostSlabs host_slabs_;
     cudaStream_t restore_stream_   = nullptr;
     std::vector<std::optional<HybridBlockPages>> blocks_;
     std::vector<std::uint32_t> free_blocks_;

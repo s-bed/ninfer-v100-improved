@@ -1,5 +1,7 @@
 add_library(ninfer_core STATIC
   arena.cu
+  copy_batch.cpp
+  host_gather.cu
   device.cu
   device_launch.cpp
   peer_preflight.cpp
