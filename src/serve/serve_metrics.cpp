@@ -137,7 +137,9 @@ std::string ServeMetrics::render(const LoadCapacity& capacity, const LoadSample&
         capacity.kv_capacity_pages == 0
             ? 0.0
             : static_cast<double>(capacity.kv_capacity_tokens) / capacity.kv_capacity_pages;
-    const double kv_tokens = static_cast<double>(stats.device_main_kv_occupied_pages) * page_tokens;
+    const double kv_tokens = stats.device_main_kv_occupied_tokens
+                                 ? static_cast<double>(*stats.device_main_kv_occupied_tokens)
+                                 : static_cast<double>(stats.device_main_kv_occupied_pages) * page_tokens;
     // Tokens and seconds both come from the Engine's per-unit counters, so they cover the same
     // work (in-flight, failed and cancelled requests included) and their ratio is a real rate.
     const auto prompt_tokens    = static_cast<double>(stats.computed_prefill_tokens);

@@ -51,6 +51,17 @@ int main() {
     sample.stats.device_state_occupied_slots   = 5;
     sample.stats.host_state_occupied_slots     = 7;
     sample.stats.host_kv_occupied_bytes        = 1024;
+    // A ring frontier can end between page boundaries. Its pinned pool already exists at startup.
+    auto ring = sample;
+    ring.stats.device_main_kv_occupied_tokens = 6399;
+    ring.stats.hybrid_host_capacity_bytes = 20ULL << 30;
+    const auto ring_stats = Json::parse(make_stats_report(capacity, ring));
+    const auto& cold_hybrid = ring_stats.at("context_cache").at("hybrid");
+    failures += check(ring_stats.at("occupancy").at("device_main_kv_tokens") == 6399 &&
+                          cold_hybrid.at("host_capacity_bytes") == (20ULL << 30) &&
+                          cold_hybrid.at("host_used_bytes") == 0 && cold_hybrid.at("snapshots") == 0,
+                      "cold hybrid capacity and the exact ring frontier must be visible");
+
     sample.stats.computed_prefill_tokens       = std::numeric_limits<std::uint64_t>::max() - 1;
     sample.stats.committed_decode_tokens       = 987654321;
     sample.stats.reused_prompt_tokens          = 5555;

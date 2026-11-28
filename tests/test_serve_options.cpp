@@ -32,6 +32,11 @@ ServeOptions parse(std::vector<std::string> arguments) {
 
 int main() {
     int failures = 0;
+    for (const auto& [flag, policy] : std::vector<std::pair<std::string, ninfer::ExpertsMxfp8>>{
+             {"on", ninfer::ExpertsMxfp8::On}, {"off", ninfer::ExpertsMxfp8::Off}, {"auto", ninfer::ExpertsMxfp8::Auto}}) {
+        const auto options = parse({"ninfer-serve", "model.ninfer", "--mxfp8-experts", flag});
+        failures += check(make_engine_options(options).experts_mxfp8 == policy, "MXFP8 policy did not reach the engine");
+    }
     failures += check(parse({"ninfer-serve", "model.ninfer"}).v100_kernels ==
                           ninfer::V100KernelPolicy::Native,
                       "v100 kernels must default to native");

@@ -588,7 +588,11 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                                 product::format_pretty_bytes(stage.expert_cache_bytes));
     }
 
-    if (cache.enabled) {
+    if (cache.enabled && cache.mode == ContextCacheMode::Hybrid) {
+        logger_->info("hybrid context cache | {} per 64-token host block | {} host capacity",
+                      product::format_pretty_bytes(memory.host_kv_page_group_bytes),
+                      product::format_pretty_bytes(memory.host_kv_capacity_bytes));
+    } else if (cache.enabled) {
         // Report what was actually pinned, not what was requested: on Windows the host KV cache
         // is clamped against free VRAM at startup (program_impl.h), and can land at zero while
         // `cache.host_kv_capacity_bytes` still holds the pre-clamp --host-kv-mib target. The

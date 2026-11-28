@@ -16,6 +16,7 @@
 #include "runtime/engine/model_instance.h"
 #include "runtime/engine/deepseek_v41_core.h"
 #include "runtime/engine/flint_core.h"
+#include "runtime/engine/inkling2_core.h"
 #include "runtime/engine/gemma4_core.h"
 #include "runtime/engine/qwen4_exp_core.h"
 #include "runtime/engine/slot_spill_guard.h"
@@ -191,10 +192,15 @@ public:
         : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
           value(std::move(prepared)) {}
 
+    explicit Impl(models::inkling2::PreparedPrompt prepared)
+        : summary(prepared.summary), prepare(prepared.stats),
+          sampling_mode(prepared.thinking ? SamplingMode::Thinking : SamplingMode::NonThinking),
+          inkling(std::move(prepared)) {}
     PromptSummary summary;
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
     models::qwen3_5::PreparedPrompt value;
+    std::optional<models::inkling2::PreparedPrompt> inkling;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -215,6 +221,7 @@ const PromptPreparationStats& PreparedPrompt::preparation_stats() const noexcept
 }
 
 std::span<const TokenId> PreparedPrompt::token_ids() const noexcept {
+    if (impl_ && impl_->inkling) { return impl_->inkling->tokens; }
     return impl_ != nullptr ? impl_->value.token_ids() : std::span<const TokenId>{};
 }
 
@@ -357,7 +364,8 @@ public:
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
                               std::unique_ptr<HybridGenerationCore>, std::unique_ptr<ScoringCore>,
                               std::unique_ptr<Qwen4ExpCore>, std::unique_ptr<Gemma4Core>,
-                              std::unique_ptr<FlintCore>, std::unique_ptr<DeepSeekV41Core>>;
+                              std::unique_ptr<FlintCore>, std::unique_ptr<DeepSeekV41Core>,
+                              std::unique_ptr<runtime::Inkling2Core>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(with_family_speculation(
@@ -390,6 +398,35 @@ public:
         }
         report_gpu_clock_floor(options, clock_floor);
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
+        if (runtime::artifact_is_inkling2(options.artifact_path)) {
+            if (!options.context_cache.hybrid.persistent_file.empty()) {
+                throw std::invalid_argument("Inkling-2 prefix caching uses RAM only");
+            }
+            if (options.speculative.backend != SpeculativeBackend::None &&
+                options.speculative.backend != SpeculativeBackend::DSpark) {
+                throw std::invalid_argument("Inkling-2 supports DSpark speculation");
+            }
+            if (options.context_cache.mode == ContextCacheMode::Hybrid) {
+                // The single active ring lane saves all restart images in the host slab pool.
+                options.context_cache.device_state_slots = 0;
+                options.context_cache.hybrid.device_snapshot_slots = 0;
+            }
+            auto instance = std::make_unique<runtime::Inkling2Core>(options, device);
+            inkling = instance.get();
+            options.max_context = inkling->max_context();
+            load = inkling->load_summary();
+            load.cuda_sync_mode = device.sync_mode();
+            sampling_defaults = inkling->frontend().sampling_defaults();
+            model_metadata.model_id = load.model_name;
+            model_metadata.vocab_size = inkling->config().unpadded_vocab_size;
+            model_metadata.embedding_size = inkling->config().hidden_size;
+            model_metadata.native_context = inkling->config().max_position_embeddings;
+            core = std::move(instance);
+            return;
+        }
+        if (options.experts_mxfp8 != ExpertsMxfp8::Auto) {
+            throw std::invalid_argument("--mxfp8-experts requires Inkling-2");
+        }
         if (runtime::is_gemma4_artifact(options.artifact_path)) {
             auto constructed    = runtime::construct_gemma4(options, device);
             gemma               = std::move(constructed.instance);
@@ -610,6 +647,7 @@ public:
 
     // The model's frontend and prompt capacity, whichever family it is.
     [[nodiscard]] const models::qwen3_5::Frontend& frontend() const {
+        if (inkling) { throw std::invalid_argument("this operation requires a Qwen-compatible frontend"); }
         return gemma      ? gemma->frontend
                : flint    ? flint->frontend
                : deepseek ? deepseek->frontend
@@ -618,6 +656,7 @@ public:
     }
 
     [[nodiscard]] std::uint32_t capacity() const {
+        if (inkling) { return inkling->max_context(); }
         return gemma      ? gemma->capacity
                : flint    ? flint->capacity
                : deepseek ? deepseek->capacity
@@ -625,6 +664,7 @@ public:
                           : active->capacity;
     }
 
+    runtime::Inkling2Core* inkling = nullptr; // owned by core
     EngineOptions options;
     DeviceContext device;
     // Held by each generation and scoring call (GpuClockFloor::hold).
@@ -758,6 +798,8 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling) { return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+        impl_->inkling->frontend().prepare(std::move(input), control))); }
     auto prepared      = impl_->frontend().prepare(std::move(input), control);
     PromptSummary info = prepared.summary();
     const SamplingMode sampling_mode =
@@ -779,6 +821,11 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids, bool allow
         throw RequestError(RequestErrorKind::ContextLengthExceeded,
                            context_capacity_error(token_ids.size(), impl_->capacity()));
     }
+    if (impl_->inkling) {
+        auto prompt = impl_->inkling->frontend().prepare_tokens(std::move(token_ids));
+        prompt.allow_prefix_identity = allow_prefix_identity;
+        return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(std::move(prompt)));
+    }
     auto prepared = impl_->frontend().prepare_tokens(std::move(token_ids), allow_prefix_identity,
                                                      anchor_prompt_end, speculative_drafting);
     PromptSummary info = prepared.summary();
@@ -792,11 +839,13 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids, bool allow
 
 std::vector<TokenId> Engine::tokenize_text(std::string_view text, bool parse_special) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling) { return impl_->inkling->frontend().tokenize_text(text, parse_special); }
     return impl_->frontend().tokenize_text(text, parse_special);
 }
 
 std::string Engine::token_bytes(TokenId token) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling) { return std::string(impl_->inkling->frontend().token_bytes(token)); }
     return impl_->frontend().token_bytes(token);
 }
 
@@ -843,6 +892,7 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
 
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling) { return impl_->inkling->frontend().count_tokens(std::move(input), control); }
     return impl_->frontend().count_tokens(std::move(input), control);
 }
 
@@ -914,6 +964,10 @@ std::vector<GenerationHandle> Engine::submit_group(std::vector<GenerationSubmiss
         Resolved entry{.options = resolve_request_options(impl_->sampling_defaults,
                                                           submission.prompt.impl_->sampling_mode,
                                                           std::move(submission.options))};
+        if (submission.prompt.impl_->inkling.has_value() != (impl_->inkling != nullptr)) {
+            throw std::invalid_argument("prompt was prepared for a different model family");
+        }
+        if (impl_->inkling) { impl_->inkling->check_request(entry.options); }
         entry.sampling        = entry.options.execution.sampling;
         entry.summary         = submission.prompt.impl_->summary;
         entry.prepare_seconds = submission.prompt.impl_->prepare.seconds;
@@ -954,6 +1008,16 @@ std::vector<GenerationHandle> Engine::submit_group(std::vector<GenerationSubmiss
                 throw std::logic_error("Engine core is unavailable");
             } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
                 throw std::logic_error("Engine generation core is unavailable");
+            } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<runtime::Inkling2Core>>) {
+                if (queued.size() != 1) { throw std::invalid_argument("Inkling-2 accepts one submission at a time"); }
+                const auto index = queued.front();
+                auto& submission = submissions[index];
+                auto& entry = resolved[index];
+                auto job = core->submit(std::move(*submission.prompt.impl_->inkling), entry.summary,
+                                        entry.prepare_seconds, std::move(entry.options), submission.consumer_mode,
+                                        submission.observation, submission.pending_deadline);
+                handles[index] = GenerationHandle(std::make_unique<GenerationHandle::Impl>(
+                    impl_, std::move(job), entry.sampling));
             } else {
                 // Held before the core can start a request, so its prompt runs at the floor.
                 std::vector<std::shared_ptr<void>> keep_alive;
@@ -1069,6 +1133,8 @@ GenerationHandle Engine::submit_branches(std::vector<GenerationBranch> branches,
                 throw std::logic_error("Engine core is unavailable");
             } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
                 throw std::logic_error("Engine generation core is unavailable");
+            } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<runtime::Inkling2Core>>) {
+                throw std::invalid_argument("Inkling-2 does not support branch readout");
             } else {
                 using Core = typename CoreState::element_type;
                 std::vector<typename Core::GroupMember> group;
@@ -1090,6 +1156,7 @@ GenerationHandle Engine::submit_branches(std::vector<GenerationBranch> branches,
 bool Engine::runs_branches() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (impl_->options.purpose != EnginePurpose::Generation) { return false; }
+    if (impl_->inkling) { return false; }
     if (impl_->flash || impl_->gemma || impl_->flint || impl_->deepseek) { return true; }
     return impl_->active->program->runs_branched_reads();
 }
@@ -1131,7 +1198,7 @@ std::uint32_t Engine::concurrent_output_budget(const PreparedPrompt& prompt) con
         throw std::logic_error("concurrent_output_budget requires a Generation Engine");
     }
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
-    if (impl_->flash || impl_->gemma || impl_->flint || impl_->deepseek) {
+    if (impl_->inkling || impl_->flash || impl_->gemma || impl_->flint || impl_->deepseek) {
         // One sequence at a time: the whole window past the prompt.
         const std::uint32_t prompt_tokens = prompt.impl_->summary.prompt_tokens;
         return prompt_tokens >= impl_->capacity() ? 0U : impl_->capacity() - prompt_tokens + 1U;
@@ -1220,6 +1287,7 @@ std::vector<SlotState> Engine::slot_states() const {
 
 MediaCacheSummary Engine::media_cache_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling) { return {}; }
     return impl_->frontend().media_cache_summary();
 }
 

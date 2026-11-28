@@ -1,0 +1,4 @@
+ninfer_add_test(ninfer_inkling2_frontend_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_frontend.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_runtime_support ninfer_artifact ninfer_media_decode ninfer_core)
+set_tests_properties(ninfer_inkling2_frontend_test PROPERTIES SKIP_RETURN_CODE 77)

@@ -30,6 +30,7 @@ add_library(ninfer_serve STATIC
   console_stats.cpp
   operational_log.cpp
   request_log.cpp
+  http_security.cpp
   http_server.cpp
   mcp_proxy.cpp
   load_report.cpp

@@ -30,6 +30,7 @@ struct ServeOptions {
     std::string build_version;
     std::string artifact_path;
     std::filesystem::path chat_template_path;
+    std::vector<std::string> allowed_hosts;
     std::string host = "127.0.0.1";
     int port         = 8080;
     // --stats-port: also serve /health, /stats, /v1/load and /metrics on this port with one
@@ -52,6 +53,7 @@ struct ServeOptions {
     // at C1 on an RTX 3090, and a 6.5K-token one past 100 s; a 30 s deadline expired those
     // callers before they were ever admitted.
     std::uint32_t pending_timeout_ms   = 600000;
+    ExpertsMxfp8 experts_mxfp8 = ExpertsMxfp8::Auto;
     std::uint32_t prefill_chunk        = 0; // 0: the Engine's automatic chunk
     std::uint32_t decode_rounds_per_prefill = 0;
     bool fast_prefill_kernel           = false;

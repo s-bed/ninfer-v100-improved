@@ -1,0 +1,1907 @@
+#include "runtime/engine/diagnostics.h"
+// Written for NInfer-3090. See inkling2_core.h.
+
+#include "runtime/engine/inkling2_core.h"
+#include "runtime/engine/inkling2_hybrid_cache.h"
+#include "runtime/engine/host_memory.h"
+#include "runtime/prefix_cache/tap_planner.h"
+#include "runtime/engine/inkling2_prefill_plan.h"
+
+#include "artifact/framing.h"
+#include "artifact/reader.h"
+#include "core/arena.h"
+
+#include "core/host_memory.h"
+#include "core/startup.h"
+#include "models/inkling2/program/adapters.h"
+#include "models/inkling2/program/dspark_program.h"
+#include "ninfer/ops/dspark_fp32.h"
+#include "ninfer/ops/sampling.h"
+#include "models/inkling2/program/text_program.h"
+#include "models/inkling2/program/vision_program.h"
+#include "text/structured_output.h"
+
+#include <cstdlib>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <exception>
+#include <future>
+#include <limits>
+#include <numeric>
+#include <random>
+#include <stdexcept>
+#include <unordered_map>
+#include <utility>
+#include <variant>
+#include <vector>
+
+namespace ninfer::runtime {
+namespace {
+
+namespace ink = models::inkling2;
+using Clock   = std::chrono::steady_clock;
+using inkling2::prefill_call_width;
+// Inkling's deployed V100 route uses cuBLAS for wide prompt chunks.
+#if defined(NINFER_TIER_VOLTA)
+constexpr bool inkling_prefill_cublas = true;
+#else
+constexpr bool inkling_prefill_cublas = false;
+#endif
+using inkling2::prefill_snapshot_at;
+
+double seconds_between(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double>(b - a).count(); }
+
+void check_cuda(cudaError_t status, const char* what) {
+    if (status != cudaSuccess) { throw std::runtime_error(std::string("inkling2 core: ") + what + ": " + cudaGetErrorString(status)); }
+}
+
+// Plain decode steps' taps held for the drafter's next extend.
+constexpr std::int32_t kHeld = 256;
+// The prefill chunks tried at startup, widest first (the tensor-core prefill gains with the width), and the device
+// memory left free after the programs for what the first requests allocate (cuBLAS's handle, say).
+constexpr std::int32_t kChunks[] = {2048, 1024, 512, 256};
+constexpr std::size_t kStartupSpare = 256U << 20;
+// With --prefill-cublas, an NVFP4 expert with at least this many entries in a prefill forward runs on cuBLAS over its
+// decoded rows (ProgramLimits::TensorCoreParts::blas_experts): measured best on a V100 of 256 / 384 / 512 / 768 / 1024
+// at chunks 2048 and 4096 (docs/maintainer/inkling2-model.md, "Tensor-core prefill").
+constexpr std::int32_t kBlasExpertsMin = 512;
+// The same split for the BF16 banks' experts (layers 20-23, either form; ProgramLimits::TensorCoreParts::bank_experts):
+// fewer entries run on the tensor-core kernels over the rows, the others on cuBLAS.
+constexpr std::int32_t kBankExpertsMin = 512;
+// With several slots, a context that does not fit is lowered in steps of this many positions per slot.
+constexpr std::int32_t kFitStep = 256;
+
+// The drafter's extend of n taps' columns, in pieces of at most its max_chunk.
+void extend_drafter(ink::DSparkProgram& drafter, std::span<const Tensor> taps, std::int32_t n) {
+    for (std::int32_t s = 0; s < n; s += drafter.max_chunk()) {
+        const std::int32_t len = std::min(drafter.max_chunk(), n - s);
+        std::vector<Tensor> piece;
+        piece.reserve(taps.size());
+        for (const Tensor& t : taps) { piece.push_back(t.slice(1, s, len)); }
+        drafter.extend(piece, len);
+    }
+}
+// <|end_message|><|message_model|><|content_text|>: what a thinking budget injects to close the reasoning.
+constexpr std::uint32_t kCloseTokens = 3;
+// <|message_model|><|content_thinking|>: the model opens its own turn (the template has no generation prompt).
+constexpr std::uint32_t kOpenTokens = 2;
+
+
+
+// One token from the last column's logits (OpenAI presence and frequency penalties over the generated tokens, then
+// temperature, top-k, min-p and top-p). Temperature 0 is argmax, the lowest id among equals.
+// One key per prompt position for prefix reuse: the token id, or for an image's placeholder a hash of the image
+// (its pixels and grid) and the placeholder's index in it, with the top bit set so it never equals a token id.
+std::vector<std::uint64_t> prompt_keys(const ink::PreparedPrompt& prompt) {
+    std::vector<std::uint64_t> keys(prompt.tokens.begin(), prompt.tokens.end());
+    for (const ink::PromptImage& image : prompt.images) {
+        std::uint64_t h = 1469598103934665603ULL; // FNV-1a
+        const auto mix  = [&](const void* data, std::size_t bytes) {
+            for (std::size_t i = 0; i < bytes; ++i) { h = (h ^ static_cast<const unsigned char*>(data)[i]) * 1099511628211ULL; }
+        };
+        const std::int32_t dims[4] = {image.image.width, image.image.height, image.image.grid_w, image.image.grid_h};
+        mix(dims, sizeof dims);
+        mix(image.image.pixels.data(), image.image.pixels.size() * sizeof(float));
+        for (std::int32_t j = 0; j < image.image.tokens(); ++j) {
+            keys[static_cast<std::size_t>(image.column + j)] = (h + 0x9E3779B97F4A7C15ULL * static_cast<std::uint64_t>(j)) | (1ULL << 63);
+        }
+    }
+    return keys;
+}
+
+// The sampler's one uniform draw per token, in [0, 1): sample() scales it by the kept mass, and DSpark's sampled
+// rounds read the same draws ahead off a copy of the generator. One explicit function, so the two consume the generator
+// identically on every standard library (std::uniform_real_distribution's algorithm is not specified).
+double sampler_uniform(std::mt19937_64& rng) { return std::generate_canonical<double, std::numeric_limits<double>::digits>(rng); }
+
+TokenId sample(std::vector<float>& logits, const ResolvedSamplingParameters& p,
+               const std::unordered_map<TokenId, std::uint32_t>& counts, std::mt19937_64& rng) {
+    if (p.presence_penalty != 0.0F || p.frequency_penalty != 0.0F) {
+        for (const auto& [id, n] : counts) {
+            logits[static_cast<std::size_t>(id)] -= p.presence_penalty + p.frequency_penalty * static_cast<float>(n);
+        }
+    }
+    const auto better = [&](std::int32_t a, std::int32_t b) {
+        const float x = logits[static_cast<std::size_t>(a)], y = logits[static_cast<std::size_t>(b)];
+        if (std::isnan(y)) { return !std::isnan(x) || a < b; }
+        return x > y || (x == y && a < b);
+    };
+    // A diverged forward (an all-NaN row, or an infinite maximum) is a numerical failure, not a token, as the
+    // sampling Ops report it (ops::kSamplerNonFiniteToken): the selected token's own logit must be finite.
+    const auto finite_or_fail = [&](std::int32_t id) {
+        if (!std::isfinite(logits[static_cast<std::size_t>(id)])) {
+            throw std::runtime_error( "inkling2: the logits are not finite");
+        }
+        return id;
+    };
+    if (p.temperature <= 0.0F) {
+        std::int32_t best = 0;
+        for (std::int32_t v = 1; v < static_cast<std::int32_t>(logits.size()); ++v) {
+            if (better(v, best)) { best = v; }
+        }
+        return finite_or_fail(best);
+    }
+    const std::size_t k = static_cast<std::size_t>(std::clamp<std::int32_t>(p.top_k, 1, static_cast<std::int32_t>(logits.size())));
+    std::vector<std::int32_t> ids(logits.size());
+    std::iota(ids.begin(), ids.end(), 0);
+    std::partial_sort(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(k), ids.end(), better);
+    ids.resize(k);
+    (void)finite_or_fail(ids[0]);
+    // NaN candidates sort last; they are never drawn (an infinite top already failed above, -inf weighs 0).
+    while (std::isnan(logits[static_cast<std::size_t>(ids.back())])) { ids.pop_back(); }
+    const std::size_t kept_k = ids.size();
+    std::vector<double> prob(kept_k);
+    const double top = logits[static_cast<std::size_t>(ids[0])];
+    double sum       = 0.0;
+    for (std::size_t i = 0; i < kept_k; ++i) {
+        prob[i] = std::exp((logits[static_cast<std::size_t>(ids[i])] - top) / p.temperature);
+        sum += prob[i];
+    }
+    for (double& q : prob) { q /= sum; }
+    std::size_t keep = kept_k;
+    if (p.min_p > 0.0F) {
+        while (keep > 1 && prob[keep - 1] < p.min_p * prob[0]) { --keep; }
+    }
+    if (p.top_p < 1.0F) {
+        double mass = 0.0;
+        for (std::size_t i = 0; i < keep; ++i) {
+            mass += prob[i];
+            if (mass >= p.top_p) {
+                keep = i + 1;
+                break;
+            }
+        }
+    }
+    const double total = std::accumulate(prob.begin(), prob.begin() + static_cast<std::ptrdiff_t>(keep), 0.0);
+    double u           = sampler_uniform(rng) * total;
+    for (std::size_t i = 0; i < keep; ++i) {
+        if ((u -= prob[i]) < 0.0) { return ids[i]; }
+    }
+    return ids[keep - 1];
+}
+
+// A constrained request's column: every token its constraint does not allow next weighs nothing (-inf), so sample()
+// (greedy and sampled alike, one uniform a token as before) picks among the allowed. No allowed token is a dead end.
+void restrict_to_constraint(ink::ConstrainedOutput* constraint, std::vector<float>& logits) {
+    if (constraint != nullptr && !constraint->restrict(logits)) {
+        throw std::runtime_error( "grammar has no valid next token");
+    }
+}
+
+} // namespace
+
+struct Inkling2Core::Programs {
+    ink::TextProgram text;
+    std::unique_ptr<ink::VisionEncoder> vision;
+    // --spec dspark: the drafter, and plain steps' taps held for its next extend (FP32 [hidden, kHeld] each).
+    std::unique_ptr<ink::DSparkProgram> drafter;
+    std::vector<DeviceBuffer> held_memory;
+    std::vector<Tensor> held;
+    DeviceBuffer argmax{64 * 4}; // I32 [<= 64]: a forward's greedy tokens, one per column
+    // Prefix reuse (context_cache.enabled): the state at the last prompt's last whole chunk, and the keys
+    // (prompt_keys) of the positions before it.
+    std::unique_ptr<Inkling2HybridCache> hybrid;
+    ink::TextProgram::Snapshot snapshot;
+    std::vector<std::uint64_t> snapshot_keys;
+    ink::DSparkProgram::Snapshot draft_snapshot; // the drafter's, with --spec dspark
+    // max_concurrency > 1: one snapshot per slot instead (slot_snapshots[s] is slot s's, its keys beside it): a
+    // snapshot's global caches are its slot's own, so a prompt resumes only in the slot that saved it.
+    std::vector<ink::TextProgram::Snapshot> slot_snapshots;
+    std::vector<std::vector<std::uint64_t>> slot_snapshot_keys;
+
+    Programs(const ink::Model& model, ink::ProgramLimits limits, cudaStream_t stream)
+        : text(model, std::move(limits), stream) {}
+};
+
+// The text Program at chunk_ and, as configured, the drafter, its held taps, the vision tower and the snapshots.
+void Inkling2Core::build_programs(ink::ProgramLimits limits, const ink::VisionConfig* vision,
+                                  bool dspark) {
+    limits.max_chunk = chunk_;
+    // The tower encodes in the text Program's workspace, before the prompt's forwards: it holds the larger of the two.
+    if (vision != nullptr) { limits.min_workspace_bytes = ink::VisionEncoder::workspace_bytes(*model_); }
+    // Its extends take at most its sliding window; a wider chunk's taps go in pieces (extend_drafter).
+    const std::int32_t draft_chunk = std::min(chunk_, static_cast<std::int32_t>(model_->dspark_config() != nullptr ? model_->dspark_config()->sliding_window : 1));
+    // The drafter runs between the text Program's forwards, so its workspace is the text workspace's lent top: never
+    // where a forward's results are (TextProgram::lent()), and free while the drafter runs.
+    if (dspark) { limits.lend_bytes = ink::DSparkProgram::workspace_bytes(*model_, draft_chunk); }
+    programs_ = std::make_unique<Programs>(*model_, limits, stream_);
+    if (dspark) {
+        const std::uint32_t window = drafter_window_;
+        if (window != 0 && window < model_->dspark_config()->sliding_window) {
+            throw std::invalid_argument("--dspark-window: 0 (the whole context) or at least the drafter's sliding window (" +
+                                        std::to_string(model_->dspark_config()->sliding_window) + ")");
+        }
+        programs_->drafter = std::make_unique<ink::DSparkProgram>(*model_, limits.max_context, draft_chunk, stream_,
+                                                                  nullptr, limits.kv_fp16,
+                                                                  static_cast<std::int32_t>(window), drafter_head_copy_, programs_->text.lent());
+        const std::int32_t hidden = static_cast<std::int32_t>(model_->config().hidden_size);
+        for (std::size_t i = 0; i < limits.tap_visits.size(); ++i) {
+            programs_->held_memory.emplace_back(static_cast<std::size_t>(hidden) * kHeld * 4);
+            programs_->held.emplace_back(programs_->held_memory.back().p, DType::FP32, std::initializer_list<std::int32_t>{hidden, kHeld});
+        }
+    }
+    if (vision != nullptr) { programs_->vision = std::make_unique<ink::VisionEncoder>(*model_, stream_); }
+    // The legacy slot cache keeps its last image in a dedicated pinned buffer. The hybrid
+    // cache allocates its shared slab pool once the final device layout has been selected.
+    if (options_.context_cache.enabled && options_.context_cache.mode != ContextCacheMode::Hybrid) {
+        const std::size_t text_bytes = programs_->text.snapshot_bytes();
+        const std::size_t draft_bytes = programs_->drafter && slots_ == 1 ? programs_->drafter->snapshot_bytes() : 0;
+        const std::size_t pinned = static_cast<std::size_t>(slots_) * text_bytes + draft_bytes;
+        snapshot_host_bytes_ = pinned;
+        if (slots_ > 1) {
+            programs_->slot_snapshots.resize(static_cast<std::size_t>(slots_));
+            programs_->slot_snapshot_keys.resize(static_cast<std::size_t>(slots_));
+            for (auto& snap : programs_->slot_snapshots) { snap.memory = PinnedHostBuffer(text_bytes); }
+        } else {
+            programs_->snapshot.memory = PinnedHostBuffer(text_bytes);
+            if (draft_bytes > 0) { programs_->draft_snapshot.memory = PinnedHostBuffer(draft_bytes); }
+        }
+    }
+}
+
+struct Inkling2Core::Job {
+    std::uint64_t id = 0;
+    ink::PreparedPrompt prompt;
+    PromptSummary summary;
+    double prepare_seconds = 0.0;
+    ResolvedRequestOptions options;
+    // The output constraint (response_format, grammar, choice, regex): which token may come next. Null without one.
+    std::unique_ptr<ink::ConstrainedOutput> constraint;
+    OutputConsumerMode mode = OutputConsumerMode::Aggregate;
+    GenerationObservationOptions observation;
+    Clock::time_point submitted, deadline;
+    const char* unit = "admission"; // where run() is: admission, prefill or decode (EngineFaultEvent::unit)
+
+    using Event = std::variant<GenerationStart, PromptProgress, GenerationTimingObservation, OutputDelta>;
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::deque<Event> events;
+    bool done = false;
+    GenerationResult result;
+    std::exception_ptr error;
+    std::atomic<bool> cancelled{false};
+
+    void post(Event event) {
+        {
+            std::lock_guard lock(mutex);
+            events.push_back(std::move(event));
+        }
+        changed.notify_all();
+    }
+};
+
+GenerationResult Inkling2Core::Submission::wait(OutputSink* sink, const CancellationView& cancellation) {
+    if (!job_) { throw std::logic_error("inkling2 submission already waited"); }
+    if ((job_->mode == OutputConsumerMode::Streaming) != (sink != nullptr)) {
+        // The handle keeps the job, so dropping it still cancels the request.
+        throw std::invalid_argument("GenerationHandle wait sink does not match its submitted consumer mode");
+    }
+    const std::shared_ptr<Job> job = std::move(job_);
+    for (;;) {
+        if (cancellation.requested()) { job->cancelled = true; }
+        std::deque<Job::Event> events;
+        bool done = false;
+        {
+            std::unique_lock lock(job->mutex);
+            job->changed.wait_for(lock, std::chrono::milliseconds(10), [&] { return job->done || !job->events.empty(); });
+            events.swap(job->events);
+            done = job->done;
+        }
+        // A consumer callback that throws ends the request: the worker stops at its next token.
+        try {
+        for (Job::Event& event : events) {
+            std::visit(
+                [&](auto& e) {
+                    using E = std::decay_t<decltype(e)>;
+                    if (sink != nullptr) {
+                        if constexpr (std::is_same_v<E, GenerationStart>) { sink->start(std::move(e)); }
+                        if constexpr (std::is_same_v<E, PromptProgress>) { sink->progress(e); }
+                        if constexpr (std::is_same_v<E, GenerationTimingObservation>) { sink->timing(e); }
+                        if constexpr (std::is_same_v<E, OutputDelta>) { sink->publish(std::move(e)); }
+                    }
+                },
+                event);
+        }
+        } catch (...) {
+            job->cancelled = true;
+            throw;
+        }
+        if (done) {
+            if (job->error) { std::rethrow_exception(job->error); }
+            return std::move(job->result);
+        }
+    }
+}
+
+std::optional<std::uint32_t> Inkling2Core::Submission::effective_thinking_budget() const noexcept {
+    return job_ ? job_->options.execution.thinking.effective_budget : std::nullopt;
+}
+
+Inkling2Core::Submission::~Submission() {
+    // Dropped without wait(): the job is abandoned (skipped if still queued, stopped at its next step if running).
+    if (job_) { job_->cancelled = true; }
+}
+
+Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) : options_(options), device_(device) {
+    const auto note = [&](const std::string& message) {
+        publish_diagnostic(options_.diagnostic_observer, DiagnosticLevel::Info, "%s", message.c_str());
+    };
+    if (options_.purpose != EnginePurpose::Generation) { throw std::invalid_argument("Inkling-2 serves generation only"); }
+    if (options_.devices.size() > 1) { throw std::invalid_argument("Inkling-2 runs on one device"); }
+    const auto start = Clock::now();
+    // max_concurrency N > 1: N slots of the text Program decoded together (Inkling2Core::worker_batched), no drafter.
+    if (options_.max_concurrency < 1 || options_.max_concurrency > static_cast<std::uint32_t>(ink::kMaxBatchColumns)) {
+        throw std::invalid_argument("Inkling-2 takes --max-concurrency 1 to " + std::to_string(ink::kMaxBatchColumns));
+    }
+    slots_             = static_cast<std::int32_t>(options_.max_concurrency);
+    if (slots_ != 1 && options_.context_cache.enabled && options_.context_cache.mode == ContextCacheMode::Hybrid) {
+        throw std::invalid_argument("Inkling hybrid cache requires one device lane");
+    }
+    requested_context_ = options_.max_context;
+    StartupPhaseScope inspect(options_.startup_observer, StartupPhase::ArtifactInspect);
+    const artifact::Reader reader(options_.artifact_path);
+    if (options_.enable_vision && !reader.directory().components.contains("vision")) {
+        throw std::invalid_argument("--vision: this Inkling-2 artifact has no vision tower (convert it with --mmproj)");
+    }
+    // The adapters are read (and any unsupported one refused) before the weights load; uploaded after it.
+    if (!options_.grafts.empty()) { throw std::invalid_argument("Inkling-2 grafts are unsupported"); }
+    inspect.complete();
+    // Only the components the server uses are uploaded: the tower with --vision, the drafter with --spec dspark.
+    // (load_model reports the weights' materialize phase itself.)
+    model_ = ink::load_model(reader, device_,
+                             {.vision         = options_.enable_vision,
+                              .dspark         = options_.speculative.backend == SpeculativeBackend::DSpark && slots_ == 1,
+                              .vision_overlay = options_.enable_vision && options_.vision_residency == VisionResidency::Overlay,
+                              .experts_mxfp8  = options_.experts_mxfp8},
+                             &options_.startup_observer);
+    const ink::VisionConfig* vision = options_.enable_vision ? model_->vision_config() : nullptr;
+    {
+        StartupPhaseScope phase(options_.startup_observer, StartupPhase::FrontendInitialize);
+        ink::FrontendOptions frontend_options{.max_context = options_.max_context, .vision = vision};
+        frontend_ = std::make_unique<ink::Frontend>(model_->resources(), frontend_options);
+        // Every id of the logits (unpadded_vocab_size) with its text; control tokens and ids past the tokenizer's
+        // carry none, so no grammar admits them (the frame in ConstrainedOutput places the control tokens).
+        constraints_ = std::make_unique<ink::ConstraintCompiler>(
+            [frontend = frontend_.get(), vocab = model_->config().unpadded_vocab_size] {
+                std::vector<std::string> out(static_cast<std::size_t>(vocab));
+                for (std::size_t id = 0; id < out.size(); ++id) {
+                    const auto t = static_cast<TokenId>(id);
+                    if (frontend->is_valid_token(t) && !frontend->is_special(t)) { out[id] = std::string(frontend->token_bytes(t)); }
+                }
+                return out;
+            });
+        phase.complete();
+    }
+    check_cuda(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream");
+    if (const cudaError_t made = cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking); made != cudaSuccess) {
+        release_stream();
+        check_cuda(made, "copy stream");
+    }
+    // From here a failure releases the programs and then the stream (the destructor does not run).
+    try {
+        StartupPhaseScope phase(options_.startup_observer, StartupPhase::ProgramInitialize);
+        ink::ProgramLimits limits;
+        limits.max_context = static_cast<std::int32_t>(options_.max_context);
+        limits.last_logits = true; // prefill reads only the last column (decode below)
+        limits.split_attention = true;
+        limits.kv_fp16         = true; // FP16 by default
+        // Opt-in, lossy: --kv-dtype int8 | rk8v4 | rk4v4 codes the global visits' rings (K and V bits 8/8, 8/4, 4/4).
+        {
+            const int kb = options_.kv_cache == KvCacheStorage::RotatedLloyd4KeyInt4Value ? 4
+                         : options_.kv_cache == KvCacheStorage::Int8Group64 || options_.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ? 8 : 0;
+            const int vb = options_.kv_cache == KvCacheStorage::Int8Group64 ? 8 : 4;
+            if (kb != 0) {
+                if (slots_ > 1) { throw std::invalid_argument("--kv-dtype int8|rk8v4|rk4v4 (Inkling-2's low-bit global rings) takes --max-concurrency 1"); }
+                const ink::TextConfig& tc = model_->config();
+                limits.kv_lowbit_k.assign(tc.num_layer_visits, 0);
+                limits.kv_lowbit_v.assign(tc.num_layer_visits, 0);
+                for (std::uint32_t v = 0; v < tc.num_layer_visits; ++v) {
+                    if (!tc.local[tc.physical(v)]) { limits.kv_lowbit_k[v] = static_cast<std::uint8_t>(kb), limits.kv_lowbit_v[v] = static_cast<std::uint8_t>(vb); }
+                }
+            }
+        }
+        // Measuring knob (the low-bit KV trial, docs/maintainer/inkling2-model.md): a parse_kv_quant spec, simulated or real.
+        if (const char* kvq = std::getenv("NINFER_INKLING2_KVQ"); kvq != nullptr && *kvq != '\0') {
+            ink::parse_kv_quant(model_->config(), kvq, limits);
+            note(std::string("experimental | NINFER_INKLING2_KVQ ") + kvq + " (lossy, measuring only)");
+        }
+        limits.prefill_tc      = ink::ProgramLimits::TensorCoreParts::all();
+        limits.prefill_tc.blas = inkling_prefill_cublas; // the controllers and router scores on cuBLAS FP32 GEMMs
+        limits.prefill_tc.blas_experts = inkling_prefill_cublas ? kBlasExpertsMin : 0;
+        // Measuring knob for the hot-expert threshold (docs/maintainer/inkling2-model.md, "Tensor-core prefill").
+        if (const char* n = std::getenv("NINFER_INKLING2_BLAS_EXPERTS"); n != nullptr && *n != '\0' && inkling_prefill_cublas) {
+            limits.prefill_tc.blas_experts = std::atoi(n);
+            note(std::string("experimental | NINFER_INKLING2_BLAS_EXPERTS ") + n + " (measuring only)");
+        }
+        limits.prefill_tc.bank_experts = inkling_prefill_cublas ? kBankExpertsMin : 0;
+        if (const char* n = std::getenv("NINFER_INKLING2_BANK_EXPERTS"); n != nullptr && *n != '\0' && inkling_prefill_cublas) {
+            limits.prefill_tc.bank_experts = std::atoi(n);
+            note(std::string("experimental | NINFER_INKLING2_BANK_EXPERTS ") + n + " (measuring only)");
+        }
+        limits.slots = slots_;
+        // Batched decode runs every request plain: with several slots there is no drafter.
+        const bool dspark  = options_.speculative.backend == SpeculativeBackend::DSpark && slots_ == 1;
+        if (dspark) {
+            const ink::DSparkConfig* dc = model_->dspark_config();
+            if (dc == nullptr) { throw std::invalid_argument("--spec dspark: this Inkling-2 artifact has no DSpark drafter"); }
+            if (options_.speculative.draft_tokens < 1 || options_.speculative.draft_tokens >= dc->block_size) {
+                throw std::invalid_argument("--spec dspark takes --draft-tokens 1 to " + std::to_string(dc->block_size - 1));
+            }
+            limits.tap_visits   = dc->target_visits;
+            limits.max_rollback = static_cast<std::int32_t>(dc->block_size);
+        }
+        std::vector<std::int32_t> chunks;
+        const auto make_chunks = [&] {
+            chunks.clear();
+            if (options_.prefill_chunk != 0) {
+                chunks.push_back(static_cast<std::int32_t>(std::min<std::uint32_t>(options_.prefill_chunk, options_.max_context)));
+            } else {
+                for (const std::int32_t c : kChunks) {
+                    if (static_cast<std::uint32_t>(c) <= options_.max_context || c == kChunks[std::size(kChunks) - 1]) {
+                        chunks.push_back(std::min<std::int32_t>(c, static_cast<std::int32_t>(options_.max_context)));
+                    }
+                }
+            }
+        };
+        // Each chunk first with the drafter at its best, then giving up what costs it least: its Q8 copy of the head
+        // (492 MB; the drafts read the target's BF16 head, a slower draft), then (--dspark-window auto) the whole
+        // context for the last 32768 or 16384 positions (fewer drafts may be accepted). Never the output.
+        struct Attempt {
+            std::int32_t chunk;
+            bool head_copy;
+            std::uint32_t window;
+        };
+        std::vector<Attempt> attempts;
+        const auto make_attempts = [&] {
+            attempts.clear();
+            for (const std::int32_t c : chunks) {
+                attempts.push_back({c, true, 0U});
+                if (!dspark) { continue; }
+                attempts.push_back({c, false, 0U});
+                for (const std::uint32_t w : {32768U, 16384U}) {
+                    if (w < options_.max_context) { attempts.push_back({c, false, w}); }
+                }
+            }
+        };
+        make_chunks();
+        make_attempts();
+        std::size_t total_after_weights = 0;
+        check_cuda(cudaMemGetInfo(&free_after_weights_, &total_after_weights), "memory after loading weights");
+        const auto build_resident = [&](bool with_drafter, bool spare) {
+            std::size_t free_bytes = 0, total_bytes = 0;
+            check_cuda(cudaDeviceSynchronize(), "device synchronize"); // earlier attempts' releases land first
+            build_programs(limits, vision, with_drafter);
+            check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "memory info");
+            if (spare && free_bytes < kStartupSpare) {
+                throw std::runtime_error("Inkling startup headroom short by " +
+                                         std::to_string(kStartupSpare - free_bytes) + " bytes");
+            }
+        };
+        // Several slots: the widest chunk at max_context per slot, else the narrowest chunk at the largest context per
+        // slot (a multiple of kFitStep) that fits, found by halving: the request ceiling follows it. One slot with
+        // --fit-context: the same search with the drafter at its cheapest (the last attempt), then the attempts at the
+        // context found.
+        const auto fits = [&](std::int32_t chunk, std::uint32_t context) {
+            chunk_            = std::min<std::int32_t>(chunk, static_cast<std::int32_t>(context));
+            limits.max_context = static_cast<std::int32_t>(context);
+            if (dspark) {
+                drafter_head_copy_ = false;
+                drafter_window_    = 16384U < context ? 16384U : 0U;
+            }
+            try {
+                build_resident(dspark, true);
+                return true;
+            } catch (const std::invalid_argument&) {
+                throw;
+            } catch (const std::exception&) {
+                programs_.reset();
+                (void)cudaGetLastError();
+                return false;
+            }
+        };
+        if (slots_ > 1) {
+            bool built = false;
+            for (const std::int32_t c : chunks) {
+                if (fits(c, options_.max_context)) {
+                    built = true;
+                    break;
+                }
+            }
+            const std::string who = slots_ > 1 ? "--max-concurrency " + std::to_string(slots_) + ": " : std::string();
+            constexpr std::uint32_t step = kFitStep;
+            if (!built) {
+                // In `step` units: lo fits (0: none known), hi does not, or is past max_context. hi rounds up, so with a
+                // max_context off the step the largest multiple under it is still a candidate (only max_context itself
+                // was tried above).
+                std::uint32_t lo = 0, hi = (options_.max_context + step - 1) / step;
+                while (hi > lo + 1) {
+                    const std::uint32_t mid = lo + (hi - lo) / 2;
+                    if (fits(chunks.back(), mid * step)) {
+                        programs_.reset();
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                while (lo > 0 && !fits(chunks.back(), lo * step)) { --lo; }
+                if (lo == 0) { throw std::runtime_error("inkling2: " + who + "cannot fit even one context step per slot"); }
+                options_.max_context = lo * step;
+            }
+            frontend_->set_max_context(options_.max_context);
+            attempts.clear();
+        }
+        for (std::size_t attempt = 0; attempt < attempts.size(); ++attempt) {
+            const bool last = attempt + 1 == attempts.size();
+            chunk_             = attempts[attempt].chunk;
+            drafter_head_copy_ = attempts[attempt].head_copy;
+            drafter_window_    = attempts[attempt].window;
+            try {
+                build_resident(dspark, !last);
+                break;
+            } catch (const std::invalid_argument&) {
+                throw;
+            } catch (const std::exception&) {
+                if (last) { throw; }
+                programs_.reset();
+                (void)cudaGetLastError(); // a failed allocation's error, not sticky
+            }
+        }
+        if (options_.context_cache.enabled && options_.context_cache.mode == ContextCacheMode::Hybrid) {
+            options_.context_cache = resolve_auto_host_cache_now(options_.context_cache, 0);
+            const auto budget = options_.context_cache.host_cache_budget_bytes.value_or(kDefaultHybridHostCacheBytes);
+            if (budget) {
+                programs_->hybrid = std::make_unique<Inkling2HybridCache>(programs_->text,
+                    programs_->drafter.get(), budget, options_.max_context, stream_);
+                programs_->hybrid->report(totals_);
+            }
+        }
+        phase.complete();
+    } catch (...) {
+        release_stream();
+        throw;
+    }
+    const auto& stats         = model_->storage_stats();
+    load_.architecture        = "inkling2";
+    load_.model_name          = "Inkling-2-Mini";
+    load_.weight_formats      = {"bf16", "ggml_q8_0", "ggml_rec_nvfp4_nvfp4", "fp32"};
+    if (model_->mxfp8_expert_layers() > 0) {
+        load_.weight_formats.push_back("mxfp8 (BF16 experts re-encoded at load, exact)");
+        note("experts | " + std::to_string(model_->mxfp8_expert_layers()) + " BF16 layers held as MXFP8 (exact, " +
+                              std::to_string(model_->mxfp8_expert_bytes() >> 20) + " MiB" +
+                              (options_.experts_mxfp8 == ExpertsMxfp8::On ? ", --mxfp8-experts on"
+                                                                          : ": the BF16 weights would leave under 4 GiB free; --mxfp8-experts off keeps BF16") +
+                              ")");
+    }
+    load_.prefill_signature   = inkling_prefill_cublas ? "inkling2-tc-cublas" : "inkling2-tc";
+    std::size_t device_free = 0, device_total = 0;
+    check_cuda(cudaMemGetInfo(&device_free, &device_total), "memory info");
+    free_after_startup_ = device_free;
+    note("prefill | chunk " + std::to_string(chunk_) + ((options_.prefill_chunk == 0) ? " (widest that fits)" : " (--prefill-chunk)") +
+                          " | workspace " + std::to_string(programs_->text.workspace().capacity() >> 20) + " MiB" +
+                          (programs_->drafter ? std::string(drafter_head_copy_ ? " | drafter head Q8 copy" : " | drafter head: the target's BF16") +
+                                                    " | drafter window " + (drafter_window_ == 0 ? std::string("whole context") : std::to_string(drafter_window_))
+                                              : std::string()) +
+                          " | " + (inkling_prefill_cublas ? "tensor cores, controllers and router on cuBLAS"
+                                                         : "tensor cores") +
+                          (options_.kv_cache == KvCacheStorage::Int8Group64 ? " | global KV rings int8 (K8 V8, lossy, opt-in)"
+                           : options_.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ? " | global KV rings rk8v4 (K8 V4, lossy, opt-in)"
+                           : options_.kv_cache == KvCacheStorage::RotatedLloyd4KeyInt4Value ? " | global KV rings rk4v4 (K4 V4, lossy, opt-in)"
+                           : "") +
+                          " | device free " + std::to_string(device_free >> 20) + " MiB");
+    if (snapshot_host_bytes_ > 0) {
+        note("prefix reuse | " + std::to_string(slots_) + (slots_ > 1 ? " snapshots" : " snapshot") + " in pinned host memory | " +
+                              std::to_string((snapshot_host_bytes_ + (1U << 20) - 1) >> 20) + " MiB");
+    }
+    if (slots_ == 1 && options_.max_context < requested_context_) {
+        note("context | " + std::to_string(options_.max_context) + " positions (fitted to the device; asked " +
+                              std::to_string(requested_context_) + ")");
+    }
+    if (slots_ > 1) {
+        note("batched decode | " + std::to_string(slots_) + " slots of " + std::to_string(options_.max_context) +
+                              " positions each" +
+                              (options_.max_context < requested_context_
+                                   ? " (fitted to the device; asked " + std::to_string(requested_context_) + ")"
+                                   : std::string()) +
+                              (options_.speculative.backend == SpeculativeBackend::DSpark ? " | DSpark off: every request decodes plain"
+                                                                                           : std::string()));
+    }
+    load_.load_seconds        = seconds_between(start, Clock::now());
+    // The MXFP8 re-encode reads and uploads the BF16 expert banks itself, outside the materializer: both count.
+    const auto& reencode       = model_->mxfp8_load_stats();
+    load_.upload_seconds       = stats.upload_seconds + reencode.seconds;
+    load_.artifact_bytes_read  = stats.read_bytes + reencode.read_bytes;
+    load_.host_to_device_bytes = stats.h2d_bytes + reencode.h2d_bytes;
+    load_.peak_staging_bytes   = std::max<std::uint64_t>(stats.peak_staging_bytes, reencode.staging_bytes);
+    load_.device_object_count  = stats.device_object_count;
+    load_.host_object_count    = stats.host_object_count;
+    // The worker binds the device before it takes requests; a failure there fails the construction.
+    std::promise<void> started;
+    auto bound = started.get_future();
+    thread_    = std::thread([this, &started] {
+        try {
+            device_.bind_to_current_thread();
+        } catch (...) {
+            started.set_exception(std::current_exception());
+            return;
+        }
+        started.set_value();
+        worker();
+    });
+    try {
+        bound.get();
+    } catch (...) {
+        thread_.join();
+        release_stream();
+        throw;
+    }
+}
+
+void Inkling2Core::release_stream() noexcept {
+    // A snapshot copy in flight ends before its source and its pinned host memory are freed.
+    if (copy_stream_ != nullptr) { (void)cudaStreamSynchronize(copy_stream_); }
+    programs_.reset();
+    for (cudaStream_t* s : {&copy_stream_, &stream_}) {
+        if (*s != nullptr) {
+            cudaStreamDestroy(*s);
+            *s = nullptr;
+        }
+    }
+}
+
+Inkling2Core::~Inkling2Core() { stop(); release_stream(); }
+
+void Inkling2Core::stop() noexcept {
+    {
+        std::lock_guard lock(mutex_);
+        stop_ = true;
+    }
+    wake_.notify_all();
+    if (thread_.joinable()) { thread_.join(); }
+}
+
+void Inkling2Core::check_request(const ResolvedRequestOptions& options) const {
+    for (const TokenId id : options.stop.token_ids) {
+        if (!frontend_->is_valid_token(id)) {
+            throw std::invalid_argument("stop token " + std::to_string(id) + " is not a token of Inkling-2");
+        }
+    }
+    if ((options.execution.structured_output.kind != StructuredOutputKind::None) &&
+        (!options.stop.token_ids.empty() || !options.stop.strings.empty() || !options.stop.include_model_defaults ||
+         options.stop.publish_stop_token || options.output.raw || options.output.preserve_special_tokens)) {
+        // As the Qwen models require: the constrained answer ends at the model's own end, as text.
+        throw std::invalid_argument(
+                           "constraints require default EOS, text output, no custom stops, and one output language");
+    }
+    if (options.output.raw || options.stop.publish_stop_token) {
+        throw std::invalid_argument("Inkling-2 publishes decoded text only: no raw output or published stop token");
+    }
+    if (options.execution.thinking.loop != ReasoningLoopAction::Off) {
+        throw std::invalid_argument("Inkling-2 has no reasoning-loop guard: run without --reasoning-loop");
+    }
+}
+
+Inkling2Core::Submission Inkling2Core::submit(ink::PreparedPrompt prompt, PromptSummary summary, double prepare_seconds,
+                                              ResolvedRequestOptions options, OutputConsumerMode consumer_mode,
+                                              GenerationObservationOptions observation, Clock::time_point pending_deadline) {
+    check_request(options);
+    const auto submitted = Clock::now();
+    if (pending_deadline == Clock::time_point{}) {
+        pending_deadline = submitted + std::chrono::milliseconds(options_.pending_timeout_ms);
+    }
+    if (submitted >= pending_deadline) {
+        throw RequestError(RequestErrorKind::QueueTimeout, "inference request expired before submission");
+    }
+    // A thinking budget counts reasoning tokens after the model's kOpenTokens turn opening, closes the reasoning
+    // with kCloseTokens control tokens, and the answer needs at least one more: the budget takes effect only where
+    // all of those fit in the output limit (the effective budget).
+    if (const auto budget = options.execution.thinking.budget) {
+        constexpr std::uint32_t frame = kOpenTokens + kCloseTokens + 1;
+        const std::uint32_t limit     = options.execution.requested_output_tokens;
+        options.execution.thinking.effective_budget =
+            limit > frame ? std::optional(std::min(*budget, limit - frame)) : std::nullopt;
+    }
+    std::unique_ptr<ink::ConstrainedOutput> constraint;
+    if ((options.execution.structured_output.kind != StructuredOutputKind::None)) {
+        const auto started = Clock::now();
+        constraint         = constraints_->compile(options.execution.structured_output);
+        const double took  = seconds_between(started, Clock::now());
+        prepare_seconds += took;
+    }
+    auto job             = std::make_shared<Job>();
+    job->constraint      = std::move(constraint);
+    job->id              = next_id_++;
+    job->prompt          = std::move(prompt);
+    job->summary         = summary;
+    job->prepare_seconds = prepare_seconds;
+    job->options         = std::move(options);
+    job->mode            = consumer_mode;
+    job->observation     = std::move(observation);
+    job->submitted       = submitted;
+    job->deadline        = pending_deadline;
+    {
+        std::lock_guard lock(mutex_);
+        if (failed_) { throw RequestError(RequestErrorKind::Unavailable, "the Inkling-2 Engine has failed"); }
+        // max_concurrency running requests and max_pending_requests waiting, as the Engine core admits.
+        if (queue_.size() + running_ >= std::size_t{options_.max_pending_requests} + static_cast<std::size_t>(slots_)) {
+            throw RequestError(RequestErrorKind::Overloaded, "the Inkling-2 queue is full");
+        }
+        queue_.push_back(job);
+    }
+    wake_.notify_all();
+    return Submission(std::move(job));
+}
+
+void Inkling2Core::fail_queued_locked(const char* why) {
+    for (const auto& waiting : queue_) {
+        {
+            std::lock_guard job_lock(waiting->mutex);
+            waiting->error = std::make_exception_ptr(RequestError(RequestErrorKind::Unavailable, why));
+            waiting->done  = true;
+        }
+        waiting->changed.notify_all();
+    }
+    queue_.clear();
+}
+
+void Inkling2Core::worker() {
+    if (slots_ > 1) {
+        worker_batched();
+        return;
+    }
+    for (;;) {
+        std::shared_ptr<Job> job;
+        {
+            std::unique_lock lock(mutex_);
+            wake_.wait(lock, [&] { return stop_ || !queue_.empty(); });
+            if (stop_ || failed_) {
+                // The Engine is going, or the device failed: what still waits is not run.
+                fail_queued_locked(stop_ ? "the Inkling-2 Engine is shutting down" : "the Inkling-2 Engine has failed");
+                if (stop_) { return; }
+                continue;
+            }
+            job = std::move(queue_.front());
+            queue_.pop_front();
+            running_ = 1;
+        }
+        std::exception_ptr error;
+        try {
+            run(*job);
+        } catch (...) { error = std::current_exception(); }
+        end_job(*job, error, 0);
+    }
+}
+
+void Inkling2Core::end_job(Job& job, std::exception_ptr error, std::uint32_t lane) {
+    if (error) {
+        job.error = error;
+        // A CUDA failure leaves the device state unknown: no later request runs, queued ones fail now.
+        if (cudaGetLastError() != cudaSuccess || cudaStreamQuery(stream_) == cudaErrorIllegalAddress) {
+            std::lock_guard lock(mutex_);
+            failed_ = true;
+            fail_queued_locked("the Inkling-2 Engine has failed");
+        }
+    }
+    {
+        std::lock_guard lock(job.mutex);
+        job.done = true;
+    }
+    job.changed.notify_all();
+    {
+        std::lock_guard lock(mutex_);
+        --running_;
+    }
+}
+
+void Inkling2Core::run(Job& job) {
+    const auto began      = Clock::now();
+    GenerationResult& out = job.result;
+    out.prompt            = job.summary;
+    out.timings.prepare_seconds        = job.prepare_seconds;
+    out.thinking.requested_budget      = job.options.execution.thinking.budget;
+    out.thinking.effective_budget      = job.options.execution.thinking.effective_budget;
+    out.engine_timing.queue_wait_seconds = seconds_between(job.submitted, began);
+    // However run() leaves, the lane is idle again.
+    struct IdleLane {
+        Inkling2Core& core;
+        ~IdleLane() {
+            std::lock_guard lock(core.stats_mutex_);
+            if (auto* cache = core.programs_->hybrid.get()) {
+                cache->finish_request();
+                cache->report(core.totals_);
+            }
+            core.lanes_[0]             = {};
+            core.lane_first_token_[0] = {};
+        }
+    } idle_lane{*this};
+    if (job.deadline != Clock::time_point{} && began > job.deadline) {
+        {
+            std::lock_guard lock(stats_mutex_);
+            ++totals_.waiting_expired_requests;
+            totals_.waiting_abandoned_seconds += out.engine_timing.queue_wait_seconds;
+        }
+        throw RequestError(RequestErrorKind::QueueTimeout, "the request waited past its deadline");
+    }
+    const bool streaming = job.mode == OutputConsumerMode::Streaming;
+    const auto& prompt   = job.prompt;
+    const auto& text_cfg = model_->config();
+    const std::int32_t n = static_cast<std::int32_t>(prompt.tokens.size());
+    // Prefix reuse: the snapshot's prompt positions are this prompt's first ones (tokens and images alike), and at
+    // least one position remains to compute the first token's logits from.
+    auto& snapshot          = programs_->snapshot;
+    const auto keys         = prompt_keys(prompt);
+    // Requests speculate (DSpark), greedy and sampled alike: the drafter follows the prompt only for them, so they resume
+    // only from a snapshot that kept the drafter's state too.
+    const bool track_draft = programs_->drafter != nullptr;
+    const bool speculate = track_draft && job.options.execution.speculative_drafting;
+    auto* hybrid = programs_->hybrid.get();
+    const bool reuse = job.options.execution.allow_prefix_reuse && prompt.allow_prefix_identity;
+    const std::int32_t resume = [&] {
+        if (hybrid) { return static_cast<std::int32_t>(hybrid->resume(prompt.tokens, keys, reuse)); }
+        if (!options_.context_cache.enabled || !reuse || snapshot.position <= 0 ||
+            snapshot.position >= n || (speculate && programs_->draft_snapshot.position != snapshot.position)) {
+            return 0;
+        }
+        const auto length = static_cast<std::size_t>(snapshot.position);
+        return std::equal(keys.begin(), keys.begin() + static_cast<std::ptrdiff_t>(length), programs_->snapshot_keys.begin())
+                   ? static_cast<std::int32_t>(snapshot.position)
+                   : 0;
+    }();
+    out.reused_prompt_tokens = static_cast<std::uint32_t>(resume);
+    // A stream starts exactly once, also when it was cancelled while queued.
+    if (streaming) { job.post(GenerationStart{.prompt = job.summary, .reused_prompt_tokens = static_cast<std::uint32_t>(resume)}); }
+    if (job.cancelled) {
+        std::lock_guard lock(stats_mutex_);
+        ++totals_.waiting_cancelled_requests;
+        totals_.waiting_abandoned_seconds += out.engine_timing.queue_wait_seconds;
+        out.finish_reason = FinishReason::Cancelled;
+        return;
+    }
+    // Bound: the prompt counts once, reused tokens included, as RuntimeStats counts it.
+    {
+        std::lock_guard lock(stats_mutex_);
+        totals_.device_main_kv_occupied_tokens = static_cast<std::uint32_t>(resume);
+        totals_.reused_prompt_tokens += static_cast<std::uint64_t>(resume);
+        if (resume == 0) { ++totals_.root_selections; }
+        if (hybrid) { hybrid->report(totals_); }
+        lanes_[0] = {.state                = RuntimeLaneStats::State::Prefill,
+                 .request_id           = job.id,
+                 .prompt_tokens        = n,
+                 .reused_prompt_tokens = resume,
+                 .context_tokens       = resume};
+    }
+
+    // Images: each encoding copied out, since a chunk may need the end of one and the start of the next.
+    job.unit = "prefill"; // the image encodes and the prompt's forwards
+    const auto vision_start = Clock::now();
+    std::vector<DeviceBuffer> encoded;
+    for (const ink::PromptImage& image : prompt.images) {
+        if (image.column + image.image.tokens() <= resume) { // wholly in the reused prefix
+            encoded.emplace_back();
+            continue;
+        }
+        const Tensor emb = programs_->vision->encode(image.image, programs_->text.workspace());
+        encoded.emplace_back(emb.bytes());
+        check_cuda(cudaMemcpyAsync(encoded.back().p, emb.data, emb.bytes(), cudaMemcpyDeviceToDevice, stream_), "image copy");
+    }
+    if (std::any_of(encoded.begin(), encoded.end(), [](const DeviceBuffer& b) { return b.p != nullptr; })) {
+        check_cuda(cudaStreamSynchronize(stream_), "vision");
+        out.timings.vision_seconds = seconds_between(vision_start, Clock::now());
+    }
+
+    // Prefill in chunks from position 0, or from the reused snapshot's position (a whole number of chunks, so the
+    // forwards are the ones a prefill from 0 runs from there, bit for bit: see inkling2_prefill_plan.h).
+    auto& program  = programs_->text;
+    // Only a request that drafts reads the taps: a sampled one runs its forwards without the copies.
+    program.set_taps(track_draft);
+    auto* drafter  = programs_->drafter.get();
+    const auto taps_of = [&] {
+        std::vector<Tensor> taps;
+        for (std::size_t i = 0; i < programs_->held.size(); ++i) { taps.push_back(program.tap(i)); }
+        return taps;
+    };
+    if (resume > 0) {
+        if (!hybrid) {
+            program.restore(snapshot);
+            if (track_draft) { drafter->restore(programs_->draft_snapshot); }
+        }
+    } else {
+        program.reset();
+        if (track_draft) { drafter->reset(); }
+        snapshot.position = -1; // its global caches are about to be overwritten
+    }
+    // The state after the last whole chunk that leaves a position to compute, kept for the next prompt. Every cut is a
+    // multiple of chunk_, so a prompt's forwards are the same whether it resumes or not (reuse is chunk-grained).
+    const std::int32_t keep_at = snapshot.memory.data() != nullptr ? prefill_snapshot_at(n, chunk_) : 0;
+    // Only save at deterministic forward boundaries. Chunk-dependent tensor core routes must
+    // execute the identical sequence of calls in cold and resumed requests.
+    std::vector<std::uint32_t> taps;
+    if (hybrid && reuse && n > 1) {
+        namespace pc = prefix_cache;
+        const auto& tuning = options_.context_cache.hybrid;
+        const pc::TapPlannerConfig config{tuning.max_new_taps.value_or(8),
+            tuning.tap_ladder_tokens.value_or(std::max(4096, 2 * chunk_)),
+            tuning.tap_min_gap_tokens.value_or(std::max(1024, chunk_))};
+        std::vector<pc::TapExclusion> exclusions;
+        for (const auto& item : prompt.images) {
+            exclusions.push_back(pc::media_exclusion(item.column, item.column + item.image.tokens()));
+        }
+        const auto offer = [&](std::uint32_t at) {
+            if (taps.size() < config.max_new_taps && at > static_cast<std::uint32_t>(resume) &&
+                at < static_cast<std::uint32_t>(n) && at % pc::kBlockTokens == 0 &&
+                !pc::inside_exclusion(at, exclusions) &&
+                std::find(taps.begin(), taps.end(), at) == taps.end()) {
+                taps.push_back(at);
+            }
+        };
+        // Keep the last eligible chunk for a repeat and the first block for a short branch.
+        offer(prefill_snapshot_at(n, chunk_));
+        offer(pc::kBlockTokens);
+        for (const auto& tap : pc::plan_taps(n, resume, {}, {}, exclusions, config)) {
+            offer(tap.position / chunk_ * chunk_);
+        }
+        std::sort(taps.begin(), taps.end());
+    }
+    const auto prefill_start = Clock::now();
+    const std::size_t hidden = text_cfg.hidden_size;
+    Tensor logits;
+    for (std::int32_t s = resume, len = 0; s < n; s += len) {
+        if (job.cancelled) {
+            std::lock_guard lock(stats_mutex_);
+            ++totals_.cancelled_prefills;
+            totals_.cancelled_prefill_computed_tokens += static_cast<std::uint64_t>(s - resume);
+            totals_.prefill_seconds_total += seconds_between(prefill_start, Clock::now());
+            out.finish_reason = FinishReason::Cancelled;
+            return;
+        }
+        len = prefill_call_width(s, n, chunk_);
+        if (hybrid && s == 0) { len = std::min(len, static_cast<std::int32_t>(prefix_cache::kBlockTokens)); }
+        std::vector<ink::InputEmbeddings> inputs;
+        for (std::size_t i = 0; i < prompt.images.size(); ++i) {
+            const std::int32_t first = prompt.images[i].column, count = prompt.images[i].image.tokens();
+            const std::int32_t lo = std::max(s, first), hi = std::min(s + len, first + count);
+            if (lo >= hi) { continue; }
+            const Tensor all(encoded[i].p, DType::FP32, {static_cast<std::int32_t>(hidden), count});
+            inputs.push_back({lo - s, all.slice(1, lo - first, hi - lo)});
+        }
+        logits = program.forward(std::span(prompt.tokens).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(len)), inputs);
+        if (track_draft) { extend_drafter(*drafter, taps_of(), len); }
+        if (hybrid && !job.cancelled && std::binary_search(taps.begin(), taps.end(), s + len)) {
+            hybrid->capture(prompt.tokens, s + len);
+        }
+        if (s + len == keep_at && keep_at > resume) {
+            // To the host beside the rest of the prompt and the first decode steps (copy_stream_): the text Program's
+            // forwards wait only where they would write ring slots the copy still reads, visit by visit, and the
+            // drafter's extends for its rings. The copy that the next forward needs first goes first: the text rings
+            // when that forward is wide enough to reach them (a chunk past the rings' spare slots), else the drafter's.
+            const bool rings_first = n - keep_at >= ink::local_ring_chunk(chunk_) + 1;
+            const auto save_drafter = [&] {
+                // The drafter followed the prompt only when this request speculates.
+                if (speculate) {
+                    drafter->save_async(programs_->draft_snapshot, copy_stream_);
+                } else if (drafter != nullptr) {
+                    programs_->draft_snapshot.position = -1;
+                }
+            };
+            if (!rings_first) { save_drafter(); }
+            program.save_async(snapshot, copy_stream_);
+            if (rings_first) { save_drafter(); }
+            programs_->snapshot_keys.assign(keys.begin(), keys.begin() + keep_at);
+        }
+        {
+            std::lock_guard lock(stats_mutex_);
+            if (hybrid) { hybrid->report(totals_); }
+            totals_.device_main_kv_occupied_tokens = s + len;
+            totals_.computed_prefill_tokens += static_cast<std::uint64_t>(len);
+            lanes_[0].computed_prompt_tokens = s + len - resume;
+            lanes_[0].context_tokens         = s + len;
+        }
+        if (job.observation.prompt_progress && streaming) {
+            check_cuda(cudaStreamSynchronize(stream_), "prefill");
+            job.post(PromptProgress{.total_prompt_tokens     = static_cast<std::uint32_t>(n),
+                                    .reused_prompt_tokens    = static_cast<std::uint32_t>(resume),
+                                    .processed_prompt_tokens = static_cast<std::uint32_t>(s + len),
+                                    .elapsed_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                                 Clock::now() - prefill_start).count())});
+        }
+    }
+
+    // Decode.
+    job.unit = "decode";
+    const auto& exec  = job.options.execution;
+    const auto& stop  = job.options.stop;
+    std::vector<TokenId> stop_ids = stop.token_ids;
+    if (stop.include_model_defaults) { stop_ids.push_back(ink::token::kEndSampling); }
+    ink::OutputDecoder decoder(*frontend_, stop.strings, !prompt.tools || !prompt.tools->empty(), prompt.tools);
+    std::mt19937_64 rng(exec.sampling.seed);
+    std::unordered_map<TokenId, std::uint32_t> counts;
+    std::vector<float> host(text_cfg.unpadded_vocab_size);
+    std::deque<TokenId> forced; // a thinking budget's close: end the reasoning, open the answer
+    const auto decode_start = Clock::now();
+    Clock::time_point first_token{};
+    Clock::time_point decode_mark{}; // where the decode time counted so far ends
+    std::uint32_t thinking_tokens = 0;
+    const auto emit = [&](std::vector<OutputDelta> deltas) {
+        if (!streaming) { return; }
+        for (OutputDelta& d : deltas) { job.post(std::move(d)); }
+    };
+    // DSpark: a round drafts n tokens after the anchor and verifies [anchor, drafts] in one forward; each draft the
+    // target's own choice agrees with is consumed without a forward, the first that differs ends the round (keep() cuts
+    // the target back). Every token still goes through the loop below one at a time, from the target's logits, so the
+    // output is plain decoding's: greedy's, or for a sampled request the tokens plain sampling draws under the same
+    // seed (one uniform per sampled token, in order, whichever forward computed its column). A sampled round's drafts
+    // are the drafter's own draws under the uniforms the target will draw next (coupled: a draft is the target's token
+    // wherever the two distributions agree). A round runs only while it pays: its measured cost against (1 + accepted
+    // drafts) plain steps; otherwise plain steps run, with a probe round after 8, 16, .. 64. --draft-min-p cuts a
+    // round's drafts before the first the drafter gives less than that probability; --dspark-adaptive picks each
+    // round's draft count (DraftWidth).
+    const auto n_drafts  = static_cast<std::int32_t>(options_.speculative.draft_tokens);
+    const float draft_min_p = options_.speculative.draft_min_p;
+    const bool sampled = exec.sampling.temperature > 0.0F;
+    const ops::DraftPick pick{.temperature = exec.sampling.temperature, .top_k = exec.sampling.top_k, .top_p = exec.sampling.top_p,
+                              .min_p = exec.sampling.min_p};
+    std::vector<double> uniforms;
+    std::vector<float> draft_probs;
+    bool forward_unmeasured = false; // a step that drafted and then ran plain (every draft under --draft-min-p)
+    std::vector<TokenId> drafted; // the last forward's inputs at columns 1 ..
+    std::vector<std::int32_t> argmax_host; // the last forward's greedy tokens from column argmax_from, when not stale
+    std::int32_t argmax_from = 0;
+    bool argmax_stale = true;
+    std::int32_t col     = static_cast<std::int32_t>(logits.ne[1]) - 1; // the column the next token is read from
+    bool in_round        = false;
+    std::int32_t round_drafts = 0; // the drafts the current round forwards (fewer than n_drafts near the output limit)
+    std::int32_t held_n  = 0;
+    double accept_ema = 1.0, round_seconds = 0.0, plain_seconds = 0.0;
+    int since_probe = 0, probe_interval = 8;
+    Clock::time_point forward_at{};
+    bool forward_was_round = false;
+    // Every request of a --spec dspark Engine reports the backend; a sampled one runs plain, with no rounds.
+    if (programs_->drafter != nullptr) {
+        out.speculative.backend      = SpeculativeBackend::DSpark;
+        out.speculative.enabled      = true;
+        out.speculative.draft_window = static_cast<std::uint32_t>(n_drafts);
+        out.speculative.accepted_per_position.assign(static_cast<std::size_t>(n_drafts), 0);
+    }
+    // Positions whose inputs the loop has consumed (a round's unread columns are not yet the sequence's).
+    const auto committed = [&] {
+        return program.position() - (in_round ? static_cast<std::int64_t>(logits.ne[1]) - 1 - col : 0);
+    };
+    const auto flush_held = [&] {
+        if (held_n > 0) {
+            drafter->extend(programs_->held, held_n);
+            held_n = 0;
+        }
+    };
+    const auto count_round = [&] {
+        ++out.speculative.rounds;
+        out.speculative.drafted_tokens += static_cast<std::uint64_t>(round_drafts);
+        out.speculative.accepted_tokens += static_cast<std::uint64_t>(col);
+        for (std::int32_t i = 0; i < col; ++i) { ++out.speculative.accepted_per_position[static_cast<std::size_t>(i)]; }
+        std::lock_guard lock(stats_mutex_);
+        lanes_[0].drafted_tokens += static_cast<std::uint64_t>(round_drafts);
+        lanes_[0].accepted_tokens += static_cast<std::uint64_t>(col);
+    };
+    const auto close_round = [&] {
+        const std::int32_t kept = col + 1; // the anchor and the drafts consumed
+        program.keep(kept);
+        extend_drafter(*drafter, taps_of(), kept);
+        count_round();
+        accept_ema = 0.8 * accept_ema + 0.2 * col;
+        in_round   = false;
+    };
+    // The next forward, of `next` (and drafts after it when a round pays). An `injected` control (a thinking budget's
+    // close) is never a draft's match: it ends the round there and goes through a plain step of the target.
+    const auto advance = [&](TokenId next, bool injected) {
+        if (!injected && in_round && col + 1 < logits.ne[1] && drafted[static_cast<std::size_t>(col)] == next) {
+            ++col; // the column whose input is `next` is computed
+            return;
+        }
+        if (in_round) { close_round(); }
+        const auto now = Clock::now();
+        if (forward_at != Clock::time_point{} && !forward_unmeasured) {
+            double& cost = forward_was_round ? round_seconds : plain_seconds;
+            const double elapsed = seconds_between(forward_at, now);
+            cost = cost == 0.0 ? elapsed : 0.8 * cost + 0.2 * elapsed;
+        }
+        forward_unmeasured = false;
+        // The first step runs plain and the next as a round, so both costs are measured before they are compared.
+        bool pays = plain_seconds != 0.0 && (round_seconds == 0.0 || (1.0 + accept_ema) * plain_seconds >= round_seconds);
+        // A round's n drafts yield n + 1 tokens, so it drafts no more than the output budget left after `next` can
+        // take: a round whose drafts could not be emitted would pay the draft and verify cost for nothing.
+        const auto budget_left = static_cast<std::int64_t>(exec.requested_output_tokens) - static_cast<std::int64_t>(out.generated_token_ids.size());
+        auto drafts = static_cast<std::int32_t>(std::min<std::int64_t>(n_drafts, budget_left - 1));
+        bool round = speculate && !injected && forced.empty() && drafts >= 1 &&
+                     program.position() + 1 + drafts <= static_cast<std::int64_t>(options_.max_context);
+        if (round && plain_seconds == 0.0) { round = false; }
+        if (round && !pays) {
+            round = ++since_probe >= probe_interval;
+            if (round) { // a probe: the next one comes after twice as many plain steps (8, 16, 32, 64)
+                since_probe    = 0;
+                probe_interval = std::min(2 * probe_interval, 64);
+            }
+        }
+        if (round && pays) { since_probe = 0, probe_interval = 8; }
+        forward_at        = now;
+        forward_was_round = round;
+        {
+            std::lock_guard lock(stats_mutex_);
+            ++totals_.decode_rounds; // a DSpark round or a plain step: one forward
+            ++totals_.decode_row_rounds; // a batch of one
+        }
+        if (round) {
+            flush_held();
+            if (sampled) {
+                // The uniforms the target's sampler draws for the next `drafts` tokens (sampler_uniform, one a token),
+                // read off a copy of its generator: the live one advances only as tokens are emitted.
+                std::mt19937_64 ahead = rng;
+                uniforms.resize(static_cast<std::size_t>(drafts));
+                for (double& u : uniforms) { u = sampler_uniform(ahead); }
+            }
+            drafted = drafter->draft(next, drafts, sampled ? &pick : nullptr, uniforms, draft_min_p > 0.0F ? &draft_probs : nullptr);
+            if (draft_min_p > 0.0F) {
+                std::size_t keep = 0;
+                while (keep < drafted.size() && draft_probs[keep] >= draft_min_p) { ++keep; }
+                drafted.resize(keep);
+            }
+            round_drafts = static_cast<std::int32_t>(drafted.size());
+            if (round_drafts == 0) {
+                // Every draft under --draft-min-p: a plain step (a fallback step), whose time (with the draft's) times
+                // neither.
+                round              = false;
+                forward_was_round  = false;
+                forward_unmeasured = true;
+            }
+        }
+        if (round) {
+            std::vector<std::int32_t> in{next};
+            in.insert(in.end(), drafted.begin(), drafted.end());
+            logits   = program.forward(in);
+            argmax_stale = true;
+            in_round = true;
+        } else {
+            const std::int32_t one[1] = {next};
+            logits = program.forward(one);
+            argmax_stale = true;
+            if (speculate) { // a sampled request never drafts, so the drafter needs none of its taps
+                if (held_n == kHeld) { flush_held(); }
+                for (std::size_t i = 0; i < programs_->held.size(); ++i) {
+                    const Tensor tap = program.tap(i);
+                    check_cuda(cudaMemcpyAsync(static_cast<float*>(programs_->held[i].data) + static_cast<std::size_t>(held_n) * tap.ne[0],
+                                               tap.data, static_cast<std::size_t>(tap.ne[0]) * 4, cudaMemcpyDeviceToDevice, stream_),
+                               "tap hold");
+                }
+                ++held_n;
+                ++out.speculative.fallback_steps;
+                std::lock_guard lock(stats_mutex_);
+            }
+        }
+        col = 0;
+    };
+    // Greedy without penalties reads its tokens off the device (ops::argmax_fp32 is sample()'s argmax: the lowest id
+    // among the maxima, NaN never winning) instead of downloading each column's logits.
+    // A constrained request masks each column's logits on the host first (ConstrainedOutput::restrict).
+    const bool argmax_on_device = exec.sampling.temperature <= 0.0F && exec.sampling.presence_penalty == 0.0F &&
+                                  exec.sampling.frequency_penalty == 0.0F && !job.constraint;
+    out.finish_reason = FinishReason::OutputLimit;
+    for (;;) {
+        if (job.cancelled) {
+            out.finish_reason = FinishReason::Cancelled;
+            break;
+        }
+        TokenId next = 0;
+        bool injected = false;
+        if (!forced.empty()) {
+            next     = forced.front();
+            injected = true;
+            forced.pop_front();
+        } else {
+            if (argmax_on_device) {
+                // Every column's greedy token in one launch, downloaded once per forward.
+                // Columns col.. only: a prefill chunk's earlier columns are never read.
+                if (argmax_stale) {
+                    argmax_from = col;
+                    const auto cols = static_cast<std::int32_t>(logits.ne[1]) - col;
+                    Tensor ids(programs_->argmax.p, DType::I32, {cols});
+                    ops::argmax_fp32(logits.slice(1, col, cols), static_cast<std::int32_t>(text_cfg.unpadded_vocab_size), ids, stream_,
+                                     ops::kSamplerNonFiniteToken);
+                    argmax_host.resize(static_cast<std::size_t>(cols));
+                    check_cuda(cudaMemcpyAsync(argmax_host.data(), ids.data, argmax_host.size() * 4, cudaMemcpyDeviceToHost, stream_), "argmax");
+                    check_cuda(cudaStreamSynchronize(stream_), "argmax");
+                    argmax_stale = false;
+                }
+                next = argmax_host[static_cast<std::size_t>(col - argmax_from)];
+                if (next == ops::kSamplerNonFiniteToken) {
+                    throw std::runtime_error( "inkling2: the logits are not finite");
+                }
+            } else {
+                const Tensor last = logits.slice(1, col, 1);
+                check_cuda(cudaMemcpyAsync(host.data(), last.data, host.size() * 4, cudaMemcpyDeviceToHost, stream_), "logits");
+                check_cuda(cudaStreamSynchronize(stream_), "logits");
+                restrict_to_constraint(job.constraint.get(), host);
+                next = sample(host, exec.sampling, counts, rng);
+            }
+        }
+        if (first_token == Clock::time_point{}) {
+            first_token = Clock::now();
+            decode_mark = first_token;
+            {
+                std::lock_guard lock(stats_mutex_);
+                totals_.prefill_seconds_total += seconds_between(prefill_start, first_token);
+                lanes_[0].state       = RuntimeLaneStats::State::Decoding;
+                lane_first_token_[0] = first_token;
+            }
+            out.timings.prefill_seconds     = seconds_between(prefill_start, first_token);
+            out.timings.first_token_seconds = seconds_between(job.submitted, first_token) + job.prepare_seconds;
+        }
+        const bool is_stop = !injected && std::find(stop_ids.begin(), stop_ids.end(), next) != stop_ids.end();
+        if (job.constraint) { job.constraint->accept(next); }
+        out.generated_token_ids.push_back(next);
+        ++counts[next];
+        {
+            // Every committed token, injected controls included; those after the first are decode's.
+            const auto now = Clock::now();
+            std::lock_guard lock(stats_mutex_);
+            ++lanes_[0].generated_tokens;
+            ++lanes_[0].context_tokens;
+            totals_.device_main_kv_occupied_tokens = committed();
+            if (out.generated_token_ids.size() > 1) {
+                ++totals_.committed_decode_tokens;
+                totals_.decode_seconds_total += seconds_between(decode_mark, now);
+                decode_mark = now;
+                const double since_first = seconds_between(first_token, now);
+                lanes_[0].decode_tokens_per_second =
+                    since_first > 0.0 ? static_cast<double>(lanes_[0].generated_tokens - 1) / since_first : 0.0;
+            }
+        }
+        if (is_stop) {
+            out.finish_reason = FinishReason::StopToken;
+            break;
+        }
+        const bool reasoning_before = decoder.in_reasoning();
+        auto step = decoder.push(next);
+        emit(std::move(step.deltas));
+        if (reasoning_before && !injected) { ++thinking_tokens; }
+        if (step.stop) {
+            out.finish_reason       = FinishReason::StopString;
+            out.matched_stop_string = decoder.matched_stop();
+            break;
+        }
+        // The close also comes early when only it and one answer token still fit (a longer opening than kOpenTokens).
+        const bool no_room = out.generated_token_ids.size() + kCloseTokens + 1 >= exec.requested_output_tokens;
+        if (exec.thinking.effective_budget && decoder.in_reasoning() && forced.empty() && !out.thinking.applied &&
+            (thinking_tokens >= *exec.thinking.effective_budget || no_room) &&
+            // Forwarding this token and the close must fit; the answer token after them is only sampled.
+            committed() + 1 + kCloseTokens <= static_cast<std::int64_t>(options_.max_context)) {
+            forced                    = {ink::token::kEndMessage, ink::token::kMessageModel, ink::token::kContentText};
+            out.thinking.applied      = true;
+            out.thinking.injected_tokens += kCloseTokens;
+        }
+        if (job.observation.live_timings && streaming) {
+            const auto now = Clock::now();
+            job.post(GenerationTimingObservation{
+                .generated_tokens      = static_cast<std::uint32_t>(out.generated_token_ids.size()),
+                .prompt_elapsed_ns     = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(first_token - prefill_start).count()),
+                .generation_elapsed_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - first_token).count())});
+        }
+        if (out.generated_token_ids.size() >= exec.requested_output_tokens) { break; }
+        // Forwarding `next` needs one more position; a full context still yields the token sampled from it.
+        if (committed() + 1 > static_cast<std::int64_t>(options_.max_context)) {
+            out.finish_reason = FinishReason::ContextCapacity;
+            break;
+        }
+        advance(next, injected);
+    }
+    if (in_round) {
+        // The request ended inside a round: its drafts consumed so far count. Every exit but cancellation comes after
+        // emitting a token and before advance(), so a last token equal to its column's draft is one more accepted.
+        if (out.finish_reason != FinishReason::Cancelled && !out.generated_token_ids.empty() && col + 1 < logits.ne[1] &&
+            drafted[static_cast<std::size_t>(col)] == out.generated_token_ids.back()) {
+            ++col;
+        }
+        count_round();
+    }
+    emit(decoder.finish());
+    if (decoder.matched_stop() && out.finish_reason != FinishReason::StopString) {
+        // A stop string inside an unfinished call's text, which finish() publishes as content.
+        out.finish_reason       = FinishReason::StopString;
+        out.matched_stop_string = decoder.matched_stop();
+    }
+    out.content                 = decoder.content();
+    out.reasoning               = decoder.reasoning();
+    out.tool_calls              = decoder.tool_calls();
+    out.tool_call_parse         = decoder.tool_call_parse();
+    out.reasoning_tokens        = decoder.reasoning_tokens();
+    out.thinking.model_thinking_tokens = thinking_tokens;
+    const auto end              = Clock::now();
+    out.timings.decode_seconds  = first_token == Clock::time_point{} ? 0.0 : seconds_between(first_token, end);
+    out.timings.prompt_wall_seconds     = first_token == Clock::time_point{} ? 0.0 : seconds_between(vision_start, first_token);
+    out.timings.generation_wall_seconds = out.timings.decode_seconds;
+    out.timings.total_seconds   = seconds_between(job.submitted, end) + job.prepare_seconds;
+}
+
+// ---- Batched decode (max_concurrency > 1) ----
+//
+// The worker keeps up to slots_ requests, each in its own slot of the text Program. Every iteration it prefills one
+// chunk of one request that is still prefilling (round robin; prompts prefill alone, as run() does), then decodes
+// every request that has a token to forward as one column of TextProgram::forward_batch, whose columns have the bits
+// of a one-token forward in their slot. Each request's tokens are chosen and committed (stops, the thinking budget,
+// limits) as run() does them; there is no drafter. Prefix reuse keeps one snapshot per slot: a prompt resumes only
+// from the snapshot of the slot it is given, whose global caches below it are that slot's own.
+
+struct Inkling2Core::Active {
+    std::shared_ptr<Job> job;
+    std::int32_t slot = 0;
+    Clock::time_point began, vision_start, prefill_start;
+    std::vector<std::uint64_t> keys;      // prompt_keys
+    std::vector<DeviceBuffer> encoded;    // the images' embeddings
+    std::int32_t n = 0, resume = 0, keep_at = 0, at = 0; // prompt length, reused positions, the snapshot's, the next
+    bool decoding = false;                // the prompt is prefilled and `next` is the token to forward
+    std::unique_ptr<ink::OutputDecoder> decoder;
+    std::vector<TokenId> stop_ids;
+    std::mt19937_64 rng;
+    std::unordered_map<TokenId, std::uint32_t> counts;
+    std::deque<TokenId> forced; // a thinking budget's close
+    std::vector<float> host;    // a sampled request's logits column
+    Clock::time_point first_token{}, decode_mark{};
+    std::uint32_t thinking_tokens = 0;
+    bool argmax_on_device = false;
+    TokenId next = 0;
+};
+
+bool Inkling2Core::start(Active& a) {
+    Job& job              = *a.job;
+    a.began               = Clock::now();
+    GenerationResult& out = job.result;
+    out.prompt            = job.summary;
+    out.timings.prepare_seconds          = job.prepare_seconds;
+    out.thinking.requested_budget        = job.options.execution.thinking.budget;
+    out.thinking.effective_budget        = job.options.execution.thinking.effective_budget;
+    out.engine_timing.queue_wait_seconds = seconds_between(job.submitted, a.began);
+    if (job.deadline != Clock::time_point{} && a.began > job.deadline) {
+        {
+            std::lock_guard lock(stats_mutex_);
+            ++totals_.waiting_expired_requests;
+            totals_.waiting_abandoned_seconds += out.engine_timing.queue_wait_seconds;
+        }
+        throw RequestError(RequestErrorKind::QueueTimeout, "the request waited past its deadline");
+    }
+    const bool streaming = job.mode == OutputConsumerMode::Streaming;
+    const auto& prompt   = job.prompt;
+    a.n                  = static_cast<std::int32_t>(prompt.tokens.size());
+    a.keys               = prompt_keys(prompt);
+    auto* snapshot = programs_->slot_snapshots.empty() ? nullptr : &programs_->slot_snapshots[static_cast<std::size_t>(a.slot)];
+    if (snapshot != nullptr && job.options.execution.allow_prefix_reuse && snapshot->position > 0 && snapshot->position < a.n) {
+        const auto length = static_cast<std::size_t>(snapshot->position);
+        const auto& kept  = programs_->slot_snapshot_keys[static_cast<std::size_t>(a.slot)];
+        if (kept.size() == length && std::equal(a.keys.begin(), a.keys.begin() + static_cast<std::ptrdiff_t>(length), kept.begin())) {
+            a.resume = static_cast<std::int32_t>(snapshot->position);
+        }
+    }
+    out.reused_prompt_tokens = static_cast<std::uint32_t>(a.resume);
+    if (streaming) { job.post(GenerationStart{.prompt = job.summary, .reused_prompt_tokens = static_cast<std::uint32_t>(a.resume)}); }
+    if (job.cancelled) {
+        std::lock_guard lock(stats_mutex_);
+        ++totals_.waiting_cancelled_requests;
+        totals_.waiting_abandoned_seconds += out.engine_timing.queue_wait_seconds;
+        out.finish_reason = FinishReason::Cancelled;
+        return false;
+    }
+    {
+        std::lock_guard lock(stats_mutex_);
+        totals_.reused_prompt_tokens += static_cast<std::uint64_t>(a.resume);
+        if (a.resume > 0) { ++totals_.root_selections; }
+        lanes_[static_cast<std::size_t>(a.slot)] = {.state                = RuntimeLaneStats::State::Prefill,
+                                                    .request_id           = job.id,
+                                                    .prompt_tokens        = a.n,
+                                                    .reused_prompt_tokens = a.resume,
+                                                    .context_tokens       = a.resume};
+    }
+    job.unit       = "prefill";
+    a.vision_start = Clock::now();
+    for (const ink::PromptImage& image : prompt.images) {
+        if (image.column + image.image.tokens() <= a.resume) {
+            a.encoded.emplace_back();
+            continue;
+        }
+        const Tensor emb = programs_->vision->encode(image.image, programs_->text.workspace());
+        a.encoded.emplace_back(emb.bytes());
+        check_cuda(cudaMemcpyAsync(a.encoded.back().p, emb.data, emb.bytes(), cudaMemcpyDeviceToDevice, stream_), "image copy");
+    }
+    if (std::any_of(a.encoded.begin(), a.encoded.end(), [](const DeviceBuffer& b) { return b.p != nullptr; })) {
+        check_cuda(cudaStreamSynchronize(stream_), "vision");
+        out.timings.vision_seconds = seconds_between(a.vision_start, Clock::now());
+    }
+    auto& program = programs_->text;
+    program.select(a.slot);
+    program.set_taps(false);
+    if (a.resume > 0) {
+        program.restore(*snapshot);
+    } else {
+        program.reset();
+        if (snapshot != nullptr) { snapshot->position = -1; } // its global caches are about to be overwritten
+    }
+    // The same chunk-multiple cuts as the single-request path (inkling2_prefill_plan.h): resumed forwards are the cold ones.
+    a.keep_at       = snapshot != nullptr ? prefill_snapshot_at(a.n, chunk_) : 0;
+    a.at            = a.resume;
+    a.prefill_start = Clock::now();
+    return true;
+}
+
+bool Inkling2Core::prefill_step(Active& a) {
+    Job& job              = *a.job;
+    GenerationResult& out = job.result;
+    if (job.cancelled) {
+        std::lock_guard lock(stats_mutex_);
+        ++totals_.cancelled_prefills;
+        totals_.cancelled_prefill_computed_tokens += static_cast<std::uint64_t>(a.at - a.resume);
+        totals_.prefill_seconds_total += seconds_between(a.prefill_start, Clock::now());
+        out.finish_reason = FinishReason::Cancelled;
+        return false;
+    }
+    const auto& prompt = job.prompt;
+    auto& program      = programs_->text;
+    program.select(a.slot);
+    const std::int32_t s = a.at, len = prefill_call_width(s, a.n, chunk_);
+    const auto hidden    = static_cast<std::int32_t>(model_->config().hidden_size);
+    std::vector<ink::InputEmbeddings> inputs;
+    for (std::size_t i = 0; i < prompt.images.size(); ++i) {
+        const std::int32_t first = prompt.images[i].column, count = prompt.images[i].image.tokens();
+        const std::int32_t lo = std::max(s, first), hi = std::min(s + len, first + count);
+        if (lo >= hi) { continue; }
+        const Tensor all(a.encoded[i].p, DType::FP32, {hidden, count});
+        inputs.push_back({lo - s, all.slice(1, lo - first, hi - lo)});
+    }
+    const Tensor logits = program.forward(std::span(prompt.tokens).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(len)), inputs);
+    if (s + len == a.keep_at && a.keep_at > a.resume) {
+        program.save(programs_->slot_snapshots[static_cast<std::size_t>(a.slot)]);
+        programs_->slot_snapshot_keys[static_cast<std::size_t>(a.slot)].assign(a.keys.begin(), a.keys.begin() + a.keep_at);
+    }
+    a.at = s + len;
+    {
+        std::lock_guard lock(stats_mutex_);
+        totals_.computed_prefill_tokens += static_cast<std::uint64_t>(len);
+        lanes_[static_cast<std::size_t>(a.slot)].computed_prompt_tokens = a.at - a.resume;
+        lanes_[static_cast<std::size_t>(a.slot)].context_tokens         = a.at;
+    }
+    const bool streaming = job.mode == OutputConsumerMode::Streaming;
+    if (job.observation.prompt_progress && streaming) {
+        check_cuda(cudaStreamSynchronize(stream_), "prefill");
+        job.post(PromptProgress{.total_prompt_tokens     = static_cast<std::uint32_t>(a.n),
+                                .reused_prompt_tokens    = static_cast<std::uint32_t>(a.resume),
+                                .processed_prompt_tokens = static_cast<std::uint32_t>(a.at),
+                                .elapsed_ns = static_cast<std::uint64_t>(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - a.prefill_start).count())});
+    }
+    if (a.at < a.n) { return true; }
+
+    // The prompt is in: the decode state, then the first token from the last column.
+    job.unit          = "decode";
+    const auto& exec  = job.options.execution;
+    const auto& stop  = job.options.stop;
+    a.stop_ids        = stop.token_ids;
+    if (stop.include_model_defaults) { a.stop_ids.push_back(ink::token::kEndSampling); }
+    a.decoder = std::make_unique<ink::OutputDecoder>(*frontend_, stop.strings, !prompt.tools || !prompt.tools->empty(), prompt.tools);
+    a.rng.seed(exec.sampling.seed);
+    a.argmax_on_device = exec.sampling.temperature <= 0.0F && exec.sampling.presence_penalty == 0.0F && exec.sampling.frequency_penalty == 0.0F &&
+                         !job.constraint;
+    out.finish_reason  = FinishReason::OutputLimit;
+    TokenId next = 0;
+    const Tensor last = logits.slice(1, logits.ne[1] - 1, 1);
+    const auto vocab  = static_cast<std::int32_t>(model_->config().unpadded_vocab_size);
+    if (a.argmax_on_device) {
+        Tensor ids(programs_->argmax.p, DType::I32, {1});
+        ops::argmax_fp32(last, vocab, ids, stream_, ops::kSamplerNonFiniteToken);
+        check_cuda(cudaMemcpyAsync(&next, ids.data, 4, cudaMemcpyDeviceToHost, stream_), "argmax");
+        check_cuda(cudaStreamSynchronize(stream_), "argmax");
+        if (next == ops::kSamplerNonFiniteToken) { throw std::runtime_error( "inkling2: the logits are not finite"); }
+    } else {
+        a.host.resize(static_cast<std::size_t>(vocab));
+        check_cuda(cudaMemcpyAsync(a.host.data(), last.data, a.host.size() * 4, cudaMemcpyDeviceToHost, stream_), "logits");
+        check_cuda(cudaStreamSynchronize(stream_), "logits");
+        restrict_to_constraint(job.constraint.get(), a.host);
+        next = sample(a.host, exec.sampling, a.counts, a.rng);
+    }
+    // A cancellation during the last forward or its logits ends the request before its first token commits.
+    if (job.cancelled) {
+        std::lock_guard lock(stats_mutex_);
+        ++totals_.cancelled_prefills;
+        totals_.cancelled_prefill_computed_tokens += static_cast<std::uint64_t>(a.at - a.resume);
+        totals_.prefill_seconds_total += seconds_between(a.prefill_start, Clock::now());
+        out.finish_reason = FinishReason::Cancelled;
+        return false;
+    }
+    if (!commit(a, next, false)) { return false; }
+    a.decoding = true;
+    return true;
+}
+
+bool Inkling2Core::commit(Active& a, TokenId next, bool injected) {
+    Job& job              = *a.job;
+    GenerationResult& out = job.result;
+    const auto& exec      = job.options.execution;
+    const bool streaming  = job.mode == OutputConsumerMode::Streaming;
+    auto& lane            = lanes_[static_cast<std::size_t>(a.slot)];
+    if (a.first_token == Clock::time_point{}) {
+        a.first_token = Clock::now();
+        a.decode_mark = a.first_token;
+        {
+            std::lock_guard lock(stats_mutex_);
+            totals_.prefill_seconds_total += seconds_between(a.prefill_start, a.first_token);
+            lane.state                                          = RuntimeLaneStats::State::Decoding;
+            lane_first_token_[static_cast<std::size_t>(a.slot)] = a.first_token;
+        }
+        out.timings.prefill_seconds     = seconds_between(a.prefill_start, a.first_token);
+        out.timings.first_token_seconds = seconds_between(job.submitted, a.first_token) + job.prepare_seconds;
+    }
+    const bool is_stop = !injected && std::find(a.stop_ids.begin(), a.stop_ids.end(), next) != a.stop_ids.end();
+    if (job.constraint) { job.constraint->accept(next); }
+    out.generated_token_ids.push_back(next);
+    ++a.counts[next];
+    {
+        const auto now = Clock::now();
+        std::lock_guard lock(stats_mutex_);
+        ++lane.generated_tokens;
+        ++lane.context_tokens;
+        if (out.generated_token_ids.size() > 1) {
+            ++totals_.committed_decode_tokens;
+            totals_.decode_seconds_total += seconds_between(a.decode_mark, now);
+            a.decode_mark = now;
+            const double since_first = seconds_between(a.first_token, now);
+            lane.decode_tokens_per_second = since_first > 0.0 ? static_cast<double>(lane.generated_tokens - 1) / since_first : 0.0;
+        }
+    }
+    if (is_stop) {
+        out.finish_reason = FinishReason::StopToken;
+        return false;
+    }
+    const bool reasoning_before    = a.decoder->in_reasoning();
+    auto step                      = a.decoder->push(next);
+    if (streaming) {
+        for (OutputDelta& d : step.deltas) { job.post(std::move(d)); }
+    }
+    if (reasoning_before && !injected) { ++a.thinking_tokens; }
+    if (step.stop) {
+        out.finish_reason       = FinishReason::StopString;
+        out.matched_stop_string = a.decoder->matched_stop();
+        return false;
+    }
+    const std::int64_t committed = programs_->text.position_of(a.slot); // every chosen token but `next` is forwarded
+    const bool no_room = out.generated_token_ids.size() + kCloseTokens + 1 >= exec.requested_output_tokens;
+    if (exec.thinking.effective_budget && a.decoder->in_reasoning() && a.forced.empty() && !out.thinking.applied &&
+        (a.thinking_tokens >= *exec.thinking.effective_budget || no_room) &&
+        committed + 1 + kCloseTokens <= static_cast<std::int64_t>(options_.max_context)) {
+        a.forced             = {ink::token::kEndMessage, ink::token::kMessageModel, ink::token::kContentText};
+        out.thinking.applied = true;
+        out.thinking.injected_tokens += kCloseTokens;
+    }
+    if (job.observation.live_timings && streaming) {
+        const auto now = Clock::now();
+        job.post(GenerationTimingObservation{
+            .generated_tokens  = static_cast<std::uint32_t>(out.generated_token_ids.size()),
+            .prompt_elapsed_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(a.first_token - a.prefill_start).count()),
+            .generation_elapsed_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - a.first_token).count())});
+    }
+    if (out.generated_token_ids.size() >= exec.requested_output_tokens) { return false; }
+    if (committed + 1 > static_cast<std::int64_t>(options_.max_context)) {
+        out.finish_reason = FinishReason::ContextCapacity;
+        return false;
+    }
+    a.next = next;
+    return true;
+}
+
+void Inkling2Core::finish(Active& a) {
+    Job& job              = *a.job;
+    GenerationResult& out = job.result;
+    if (a.decoder) {
+        auto deltas = a.decoder->finish();
+        if (job.mode == OutputConsumerMode::Streaming) {
+            for (OutputDelta& d : deltas) { job.post(std::move(d)); }
+        }
+        if (a.decoder->matched_stop() && out.finish_reason != FinishReason::StopString) {
+            out.finish_reason       = FinishReason::StopString;
+            out.matched_stop_string = a.decoder->matched_stop();
+        }
+        out.content                        = a.decoder->content();
+        out.reasoning                      = a.decoder->reasoning();
+        out.tool_calls                     = a.decoder->tool_calls();
+        out.tool_call_parse                = a.decoder->tool_call_parse();
+        out.reasoning_tokens               = a.decoder->reasoning_tokens();
+        out.thinking.model_thinking_tokens = a.thinking_tokens;
+    }
+    const auto end                      = Clock::now();
+    out.timings.decode_seconds          = a.first_token == Clock::time_point{} ? 0.0 : seconds_between(a.first_token, end);
+    out.timings.prompt_wall_seconds     = a.first_token == Clock::time_point{} ? 0.0 : seconds_between(a.vision_start, a.first_token);
+    out.timings.generation_wall_seconds = out.timings.decode_seconds;
+    out.timings.total_seconds           = seconds_between(job.submitted, end) + job.prepare_seconds;
+}
+
+void Inkling2Core::worker_batched() {
+    std::vector<std::unique_ptr<Active>> active; // in admission order
+    std::vector<bool> used(static_cast<std::size_t>(slots_), false);
+    std::vector<std::uint64_t> freed_at(static_cast<std::size_t>(slots_), 0); // when each slot was last released
+    std::uint64_t releases = 0;
+    std::size_t prefill_turn = 0;
+    const auto vocab = static_cast<std::int32_t>(model_->config().unpadded_vocab_size);
+    // Ends a request (its result complete, or failed) and frees its slot; whether it ended failed.
+    const auto release = [&](std::size_t i, std::exception_ptr error) {
+        std::unique_ptr<Active> a = std::move(active[i]);
+        active.erase(active.begin() + static_cast<std::ptrdiff_t>(i));
+        if (!error) {
+            try {
+                finish(*a);
+            } catch (...) { error = std::current_exception(); }
+        }
+        {
+            std::lock_guard lock(stats_mutex_);
+            lanes_[static_cast<std::size_t>(a->slot)]             = {};
+            lane_first_token_[static_cast<std::size_t>(a->slot)] = {};
+        }
+        used[static_cast<std::size_t>(a->slot)]     = false;
+        freed_at[static_cast<std::size_t>(a->slot)] = ++releases;
+        const bool failed = error != nullptr;
+        end_job(*a->job, std::move(error), static_cast<std::uint32_t>(a->slot));
+        return failed;
+    };
+    // release, then: a failure end_job latched (a CUDA fault leaves the device state unknown, failed_) stops the round
+    // before any further device work. Latched reaches the catch below, which fails every request this worker holds.
+    struct Latched {};
+    const auto end = [&](std::size_t i, std::exception_ptr error) {
+        if (release(i, std::move(error))) {
+            std::lock_guard lock(mutex_);
+            if (failed_) { throw Latched{}; }
+        }
+    };
+    // The free slot for a prompt: the one whose snapshot it resumes from (the longest), else an empty one, else the
+    // one released longest ago (its snapshot is the oldest).
+    const auto choose_slot = [&](const Job& job) {
+        std::int32_t best = -1;
+        std::int64_t best_length = 0;
+        const bool reuse = !programs_->slot_snapshots.empty() && job.options.execution.allow_prefix_reuse;
+        const auto keys = reuse ? prompt_keys(job.prompt) : std::vector<std::uint64_t>{};
+        for (std::int32_t s = 0; reuse && s < slots_; ++s) {
+            const auto& snap = programs_->slot_snapshots[static_cast<std::size_t>(s)];
+            const auto& kept = programs_->slot_snapshot_keys[static_cast<std::size_t>(s)];
+            if (used[static_cast<std::size_t>(s)] || snap.position <= 0 || snap.position >= static_cast<std::int64_t>(keys.size()) ||
+                kept.size() != static_cast<std::size_t>(snap.position) || snap.position <= best_length) {
+                continue;
+            }
+            if (std::equal(kept.begin(), kept.end(), keys.begin())) { best = s, best_length = snap.position; }
+        }
+        if (best >= 0) { return best; }
+        for (std::int32_t s = 0; s < slots_; ++s) {
+            const bool empty = programs_->slot_snapshots.empty() || programs_->slot_snapshots[static_cast<std::size_t>(s)].position <= 0;
+            if (!used[static_cast<std::size_t>(s)] && empty) { return s; }
+        }
+        for (std::int32_t s = 0; s < slots_; ++s) {
+            if (!used[static_cast<std::size_t>(s)] && (best < 0 || freed_at[static_cast<std::size_t>(s)] < freed_at[static_cast<std::size_t>(best)])) { best = s; }
+        }
+        return best;
+    };
+    active.reserve(static_cast<std::size_t>(slots_)); // an admission's push_back never allocates (see the catch below)
+    for (;;) {
+        std::vector<std::shared_ptr<Job>> taken;
+        // Each request has its own boundary below; this one catches a host failure outside them (an allocation in the
+        // scheduling, say). It fails every request this worker holds through end_job, so no handle is left unfinished,
+        // and the worker goes on with what comes next.
+        try {
+            bool stopping = false, failed = false;
+            {
+                std::unique_lock lock(mutex_);
+                wake_.wait(lock, [&] { return stop_ || !queue_.empty() || !active.empty(); });
+                if (stop_ || failed_) {
+                    fail_queued_locked(stop_ ? "the Inkling-2 Engine is shutting down" : "the Inkling-2 Engine has failed");
+                    stopping = stop_, failed = true;
+                }
+                while (!failed && !queue_.empty() && active.size() + taken.size() < static_cast<std::size_t>(slots_)) {
+                    taken.push_back(std::move(queue_.front()));
+                    queue_.pop_front();
+                    ++running_;
+                }
+            }
+            if (failed) {
+                // What runs is not finished: the Engine is going, or the device failed.
+                while (!active.empty()) {
+                    (void)release(active.size() - 1, std::make_exception_ptr(RequestError(
+                                               RequestErrorKind::Unavailable, stopping ? "the Inkling-2 Engine is shutting down" : "the Inkling-2 Engine has failed")));
+                }
+                if (stopping) { return; }
+                continue;
+            }
+            for (auto& job : taken) {
+                const std::int32_t slot = choose_slot(*job);
+                auto a                  = std::make_unique<Active>();
+                a->job                  = std::move(job);
+                a->slot                 = slot;
+                used[static_cast<std::size_t>(a->slot)] = true;
+                active.push_back(std::move(a));
+                Active& added = *active.back();
+                try {
+                    if (!start(added)) { end(active.size() - 1, nullptr); }
+                } catch (...) { end(active.size() - 1, std::current_exception()); }
+            }
+
+            // One prefill chunk.
+            std::vector<std::size_t> prefilling;
+            for (std::size_t i = 0; i < active.size(); ++i) {
+                if (!active[i]->decoding) { prefilling.push_back(i); }
+            }
+            if (!prefilling.empty()) {
+                const std::size_t i = prefilling[prefill_turn++ % prefilling.size()];
+                try {
+                    if (!prefill_step(*active[i])) { end(i, nullptr); }
+                } catch (...) { end(i, std::current_exception()); }
+            }
+
+            // One decode step over every request with a token to forward.
+            for (std::size_t i = active.size(); i-- > 0;) {
+                if (active[i]->decoding && active[i]->job->cancelled) {
+                    active[i]->job->result.finish_reason = FinishReason::Cancelled;
+                    end(i, nullptr);
+                }
+            }
+            std::vector<std::int32_t> slots, tokens;
+            std::vector<Active*> columns;
+            for (auto& a : active) {
+                if (!a->decoding) { continue; }
+                columns.push_back(a.get());
+                slots.push_back(a->slot);
+                tokens.push_back(a->next);
+            }
+            if (columns.empty()) { continue; }
+            Tensor logits;
+            std::vector<std::int32_t> greedy(columns.size(), 0);
+            try {
+                logits = programs_->text.forward_batch(slots, tokens);
+                {
+                    std::lock_guard lock(stats_mutex_);
+                    ++totals_.decode_rounds;
+                    totals_.decode_row_rounds += columns.size();
+                }
+                // Every column's greedy token in one launch and one download (the sampled columns' are not read).
+                Tensor ids(programs_->argmax.p, DType::I32, {static_cast<std::int32_t>(columns.size())});
+                ops::argmax_fp32(logits, vocab, ids, stream_, ops::kSamplerNonFiniteToken);
+                check_cuda(cudaMemcpyAsync(greedy.data(), ids.data, greedy.size() * 4, cudaMemcpyDeviceToHost, stream_), "argmax");
+                check_cuda(cudaStreamSynchronize(stream_), "argmax");
+            } catch (...) {
+                const std::exception_ptr error = std::current_exception();
+                for (Active* a : columns) {
+                    const auto at = std::find_if(active.begin(), active.end(), [&](const auto& p) { return p.get() == a; });
+                    end(static_cast<std::size_t>(at - active.begin()), error);
+                }
+                continue;
+            }
+            for (std::size_t c = 0; c < columns.size(); ++c) {
+                Active& a = *columns[c];
+                bool more = false;
+                std::exception_ptr error;
+                try {
+                    TokenId next  = 0;
+                    bool injected = false;
+                    if (!a.forced.empty()) {
+                        next     = a.forced.front();
+                        injected = true;
+                        a.forced.pop_front();
+                    } else if (a.argmax_on_device) {
+                        next = greedy[c];
+                        if (next == ops::kSamplerNonFiniteToken) { throw std::runtime_error( "inkling2: the logits are not finite"); }
+                    } else {
+                        a.host.resize(static_cast<std::size_t>(vocab));
+                        const Tensor col = logits.slice(1, static_cast<std::int32_t>(c), 1);
+                        check_cuda(cudaMemcpyAsync(a.host.data(), col.data, a.host.size() * 4, cudaMemcpyDeviceToHost, stream_), "logits");
+                        check_cuda(cudaStreamSynchronize(stream_), "logits");
+                        restrict_to_constraint(a.job->constraint.get(), a.host);
+                        next = sample(a.host, a.job->options.execution.sampling, a.counts, a.rng);
+                    }
+                    // A cancellation during the forward or another column's sampling ends this row before its token
+                    // commits, as the single-request path's check after its forward does; the other columns go on.
+                    if (a.job->cancelled) {
+                        a.job->result.finish_reason = FinishReason::Cancelled;
+                    } else {
+                        more = commit(a, next, injected);
+                    }
+                } catch (...) { error = std::current_exception(); }
+                if (!more) {
+                    const auto at = std::find_if(active.begin(), active.end(), [&](const auto& p) { return p.get() == &a; });
+                    end(static_cast<std::size_t>(at - active.begin()), error);
+                }
+            }
+        } catch (...) {
+            std::exception_ptr error = std::current_exception();
+            try {
+                std::rethrow_exception(error);
+            } catch (const Latched&) {
+                error = std::make_exception_ptr(RequestError(RequestErrorKind::Unavailable, "the Inkling-2 Engine has failed"));
+            } catch (...) {}
+            for (auto& job : taken) {
+                if (job) { end_job(*job, error, 0); }
+            }
+            while (!active.empty()) { (void)release(active.size() - 1, error); }
+        }
+    }
+}
+
+bool artifact_is_inkling2(const std::filesystem::path& artifact) noexcept {
+    try {
+        const artifact::Reader reader(artifact);
+        return models::inkling2::is_inkling2(reader);
+    } catch (...) { return false; }
+}
+
+MemorySummary Inkling2Core::memory_summary() const {
+    MemorySummary m;
+    if (programs_->hybrid) {
+        std::lock_guard lock(stats_mutex_);
+        m.host_cache_budget_bytes = options_.context_cache.host_cache_budget_bytes.value_or(kDefaultHybridHostCacheBytes);
+        m.host_kv_capacity_bytes = totals_.hybrid_host_capacity_bytes;
+        m.host_kv_occupied_bytes = totals_.hybrid_host_used_bytes;
+        m.host_kv_page_group_bytes = programs_->hybrid->block_bytes();
+        m.kv_capacity_page_groups = (options_.max_context + prefix_cache::kBlockTokens - 1) / prefix_cache::kBlockTokens;
+    }
+    m.kv_capacity_max_page_groups = m.kv_capacity_page_groups;
+    m.available_after_startup_bytes = free_after_startup_;
+    m.runtime_reservation_bytes = free_after_weights_ > free_after_startup_ ? free_after_weights_ - free_after_startup_ : 0;
+    m.workspace.capacity_bytes = programs_->text.workspace().capacity();
+    m.kv_cache              = options_.kv_cache;
+    m.device                = options_.device;
+    m.max_context           = options_.max_context;
+    m.kv_capacity           = options_.max_context * static_cast<std::uint32_t>(slots_); // slots_ rings of max_context
+    // The weights on the device: the artifact's device backing (its allocations, alignment included; h2d_bytes is
+    // the payload transferred), the MXFP8 expert banks and the BF16 banks' row exponents made at load.
+    const std::size_t weights = static_cast<std::size_t>(model_->storage_stats().device_capacity_bytes) +
+                                static_cast<std::size_t>(model_->mxfp8_expert_bytes()) + static_cast<std::size_t>(model_->bank_exponent_bytes());
+    m.weights = {.capacity_bytes = weights, .used_bytes = weights, .peak_used_bytes = weights};
+    m.available_after_weights_bytes = free_after_weights_;
+    return m;
+}
+
+RuntimeStats Inkling2Core::runtime_stats() const {
+    RuntimeStats s;
+    const auto now = Clock::now();
+    std::lock_guard lock(mutex_); // the queue, then the counters and the lane (stats_mutex_ comes after mutex_)
+    std::lock_guard stats_lock(stats_mutex_);
+    s = totals_;
+    s.device_main_kv_occupied_pages = (s.device_main_kv_occupied_tokens.value_or(0) + prefix_cache::kBlockTokens - 1) / prefix_cache::kBlockTokens;
+    s.host_kv_occupied_bytes = s.hybrid_host_used_bytes;
+    for (std::int32_t i = 0; i < slots_; ++i) {
+        const auto state = lanes_[static_cast<std::size_t>(i)].state;
+        s.running_requests += state != RuntimeLaneStats::State::Idle ? 1U : 0U;
+        s.prefilling_requests += state == RuntimeLaneStats::State::Prefill ? 1U : 0U;
+        s.decode_ready_requests += state == RuntimeLaneStats::State::Decoding ? 1U : 0U;
+    }
+    s.waiting_requests      = static_cast<std::uint32_t>(queue_.size());
+    for (const auto& waiting : queue_) {
+        if (s.queue_entries == s.queue.size()) { break; }
+        s.queue[s.queue_entries++] = {waiting->id, seconds_between(waiting->submitted, now)};
+    }
+    return s;
+}
+
+ResidencyStatus Inkling2Core::suspend(std::optional<bool>) {
+    throw std::invalid_argument("model suspend is not available for Inkling-2");
+}
+
+ResidencyStatus Inkling2Core::resume() { throw std::invalid_argument("model suspend is not available for Inkling-2"); }
+
+} // namespace ninfer::runtime

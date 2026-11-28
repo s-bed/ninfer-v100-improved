@@ -298,7 +298,9 @@ bool matches_bearer_credential(std::string_view authorization, std::string_view 
 
 HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger,
                        std::shared_ptr<product::TerminalPanel> panel)
-    : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
+    : options_(std::move(options)),
+      host_policy_(options_.allowed_hosts.empty() ? std::nullopt : std::optional(make_server_host_policy(options_.host, options_.port, options_.allowed_hosts))),
+      openai_responses_store_(options_.response_store_max_records,
                                                             options_.response_store_max_bytes),
       operational_log_(logger),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger),
@@ -460,9 +462,60 @@ void HttpServer::stop_stats_reporter() {
     stats_thread_.join();
 }
 
+static bool reject_untrusted_request(const HostPolicy& policy, const ServeOptions& options,
+                              const httplib::Request& request, httplib::Response& response) {
+    // A refused header may hold any bytes; the JSON error body takes printable ASCII only.
+    const auto quoted = [](std::string_view value) {
+        constexpr std::size_t kMaxQuoted = 200;
+        std::string out;
+        for (const char c : value.substr(0, kMaxQuoted)) {
+            out.push_back(c >= 0x20 && c < 0x7f ? c : '?');
+        }
+        return "'" + out + (value.size() > kMaxQuoted ? "...'" : "'");
+    };
+    const std::string host   = request.get_header_value("Host");
+    const std::string origin = request.get_header_value("Origin");
+    ApiError error;
+    error.status = 403;
+    error.type   = "invalid_request_error";
+    const bool has_key = !options.api_key.empty();
+    if (!has_key && !host_allowed(policy, host)) {
+        // A name this server was not told about: DNS rebinding, or a name to add. With a key the
+        // check is skipped: a rebound page cannot send the key, and any name a client uses works.
+        error.code    = "host_not_allowed";
+        error.message = "Host " + quoted(host) +
+                        " is not a name this server answers to; start it with --allowed-host "
+                        "NAME to accept another name (a server with --api-key accepts any)";
+    } else if (!origin_allowed(policy, origin, host, has_key, options.enable_cors)) {
+        // A browser page from another site, and nothing else (a key, --cors) to decide access.
+        error.code    = "origin_not_allowed";
+        error.message = "Origin " + quoted(origin) +
+                        " is another site; a server without --api-key accepts browser requests "
+                        "only from its own origin (set --api-key or --cors to allow others)";
+    } else if (!fetch_site_allowed(request.get_header_value("Sec-Fetch-Site"), has_key,
+                                   options.enable_cors)) {
+        // A link, image or no-cors fetch from another site, which may carry no Origin.
+        error.code    = "cross_site_request";
+        error.message = "a request another site started is refused by a server without --api-key "
+                        "(set --api-key or --cors to allow it)";
+    } else {
+        return false;
+    }
+
+    if (is_anthropic_path(request.path)) {
+        write_anthropic_error(response, error, new_anthropic_request_id());
+    } else {
+        write_openai_error(response, error);
+    }
+    return true;
+}
+
 httplib::Server::HandlerResponse HttpServer::pre_route(const httplib::Request& req,
                                                        httplib::Response& res) const {
     ensure_openai_request_id(req, res);
+    if (host_policy_ && reject_untrusted_request(*host_policy_, options_, req, res)) {
+        return httplib::Server::HandlerResponse::Handled;
+    }
     // Every response, the loading 503 and authentication failures included, so a caller can tell
     // which build answered without a credential.
     if (!options_.build_version.empty()) {

@@ -11,6 +11,7 @@
 namespace ninfer {
 
 // ninfer/model_enums.h
+enum class ExpertsMxfp8 : std::uint8_t;
 enum class EnginePurpose : std::uint8_t;
 enum class KvCapacityMode : std::uint8_t;
 enum class ProposalHead : std::uint8_t;

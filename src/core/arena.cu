@@ -17,6 +17,17 @@ std::string cuda_error_message(const char* prefix, cudaError_t err) {
     return std::string(prefix) + ": " + cudaGetErrorName(err) + ": " + cudaGetErrorString(err);
 }
 
+std::string allocation_error(cudaError_t error, std::size_t bytes) {
+    std::string message = cuda_error_message("cudaMalloc failed", error) +
+                          " requesting " + std::to_string(bytes) + " bytes";
+    std::size_t free = 0, total = 0;
+    if (error == cudaErrorMemoryAllocation && cudaMemGetInfo(&free, &total) == cudaSuccess) {
+        message += " with " + std::to_string(free) + " bytes free of " + std::to_string(total);
+        if (bytes > free) { message += " (short by at least " + std::to_string(bytes - free) + " bytes)"; }
+    }
+    return message;
+}
+
 void log_cuda_error(const char* op, cudaError_t err) noexcept {
     if (err != cudaSuccess) {
         std::fprintf(stderr, "CUDA cleanup failed during %s: %s: %s\n", op, cudaGetErrorName(err),
@@ -81,7 +92,7 @@ DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     void* ptr             = nullptr;
     const cudaError_t err = cudaMalloc(&ptr, bytes);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
+        throw std::runtime_error(allocation_error(err, bytes));
     }
     p = ptr;
 }
@@ -207,7 +218,7 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
     void* ptr             = nullptr;
     const cudaError_t err = cudaMalloc(&ptr, capacity_bytes);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
+        throw std::runtime_error(allocation_error(err, capacity_bytes));
     }
     // Under the evictable budget, commit the pages now so WDDM makes room at startup; the wait
     // orders the fill before uploads on the non-blocking load stream.

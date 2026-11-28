@@ -113,6 +113,17 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     out.layout        = layout;
     out.shape.assign(shape.begin(), shape.end());
     out.elements = weight_element_count(shape);
+    if (layout == QuantLayout::GgmlExpertRecord) {
+        if (format != QType::GGML_REC_NVFP4_NVFP4 || shape.size() != 3 ||
+            shape[1] % 64 != 0 || shape[2] % 64 != 0) {
+            throw std::invalid_argument("invalid Inkling NVFP4 expert record dimensions");
+        }
+        // Each of gate, up and down is a matrix of ggml NVFP4 blocks.
+        const auto part = mul(mul(shape[1], shape[2] / 64), 36);
+        out.record_stride = mul(aligned(part, 256), 3);
+        out.bytes = out.code_bytes = mul(shape[0], out.record_stride);
+        return out;
+    }
     if (layout == QuantLayout::Contiguous) {
         out.bytes = out.code_bytes = mul(out.elements, word_bytes(format));
         if (shape.size() == 2) {

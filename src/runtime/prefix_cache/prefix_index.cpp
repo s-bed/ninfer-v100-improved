@@ -187,7 +187,7 @@ MatchResult PrefixCacheIndex::match(std::span<const TokenId> tokens,
         candidate.image_on_device  = snapshot.device_slot != kNoId;
         candidate.restore_bytes =
             static_cast<std::uint64_t>(candidate.host_only_blocks) * config_.block_bytes +
-            (candidate.image_on_device ? 0ULL : config_.image_bytes) +
+            (candidate.image_on_device ? 0ULL : snapshot.image_bytes) +
             (candidate.tail && !candidate.tail_on_device ? config_.block_bytes : 0ULL);
         result.candidates.push_back(candidate);
     };
@@ -988,15 +988,16 @@ std::optional<std::uint32_t> PrefixCacheIndex::acquire_device_slot(double claim)
 }
 
 double PrefixCacheIndex::estimate_priority(std::uint32_t base_frontier, std::uint32_t frontier,
-                                           bool tail, std::uint32_t hits) const noexcept {
+                                           bool tail, std::uint32_t hits, std::uint64_t image_bytes) const noexcept {
     // priority() of a snapshot that has not been published yet: its lineage's hits, and the
     // blocks between its nearest retained snapshot and itself are its own.
     if (frontier <= base_frontier) { return inflation_; }
+    if (image_bytes == 0) { image_bytes = config_.image_bytes; }
     const double saved = config_.cost.prefill_seconds(base_frontier, frontier - base_frontier) -
-                         config_.cost.restore_seconds(config_.image_bytes);
+                         config_.cost.restore_seconds(image_bytes);
     const std::uint64_t exclusive_blocks = frontier / kBlockTokens - base_frontier / kBlockTokens;
     const double size =
-        static_cast<double>(config_.image_bytes) +
+        static_cast<double>(image_bytes) +
         static_cast<double>(tail ? config_.block_bytes : 0ULL) +
         static_cast<double>(exclusive_blocks) * static_cast<double>(config_.block_bytes);
     return inflation_ +
@@ -1068,6 +1069,7 @@ PublishResult PrefixCacheIndex::publish_snapshot(NodeRef anchor, std::uint32_t f
     free_snapshots_.pop_back();
     clock_ += config_.image_slabs;
     Snapshot& snapshot = snapshots_[index];
+    snapshot.image_bytes = config_.image_bytes;
     snapshot.occupied  = true;
     snapshot.anchor    = anchor_index;
     snapshot.frontier  = frontier;
@@ -1122,10 +1124,10 @@ void PrefixCacheIndex::update_priority(std::uint32_t index) {
     }
     const double saved =
         config_.cost.prefill_seconds(ancestor_frontier, snapshot.frontier - ancestor_frontier) -
-        config_.cost.restore_seconds(config_.image_bytes);
+        config_.cost.restore_seconds(snapshot.image_bytes);
     const double cost = std::max(0.0, saved);
     const double size =
-        static_cast<double>(config_.image_bytes) +
+        static_cast<double>(snapshot.image_bytes) +
         static_cast<double>(snapshot.tail_len != 0 ? config_.block_bytes : 0ULL) +
         static_cast<double>(exclusive_blocks) * static_cast<double>(config_.block_bytes);
     snapshot.value = cost / std::max(size, 1.0);
@@ -1542,6 +1544,23 @@ std::optional<SnapshotRef>
 PrefixCacheIndex::restore_host_snapshot(NodeRef anchor, std::uint32_t frontier,
                                         std::span<const TokenId> tail, SnapshotKind kind,
                                         std::uint32_t hits, bool branch_point, bool periodic) {
+    return add_host_snapshot(anchor, frontier, tail, kind, hits, branch_point, periodic, config_.image_bytes, {});
+}
+
+std::optional<SnapshotRef> PrefixCacheIndex::capture_host_image(NodeRef anchor,
+    std::uint32_t frontier, SnapshotKind kind, std::uint64_t image_bytes, const ImageWriter& write) {
+    if (!write || !anchor.valid() || require(anchor).pins == 0) {
+        invariant("host capture requires a pinned anchor and image writer");
+    }
+    if (image_bytes == 0 || image_bytes > config_.image_bytes || config_.block_bytes == 0) {
+        throw std::invalid_argument("host capture exceeds the model state image geometry");
+    }
+    return add_host_snapshot(anchor, frontier, {}, kind, 0, false, false, image_bytes, write);
+}
+
+std::optional<SnapshotRef> PrefixCacheIndex::add_host_snapshot(NodeRef anchor,
+    std::uint32_t frontier, std::span<const TokenId> tail, SnapshotKind kind,
+    std::uint32_t hits, bool branch_point, bool periodic, std::uint64_t image_bytes, const ImageWriter& write) {
     if (!config_.host_blocks || tail.size() >= kBlockTokens) {
         throw std::invalid_argument("prefix cache restored snapshot is inconsistent");
     }
@@ -1561,14 +1580,42 @@ PrefixCacheIndex::restore_host_snapshot(NodeRef anchor, std::uint32_t frontier,
         }
     }
     std::vector<std::uint32_t> slabs;
-    const std::uint32_t count = config_.image_slabs + (tail.empty() ? 0U : 1U);
-    if (free_snapshots_.empty() || !take_free_slabs(count, slabs)) {
+    const auto image_slabs = write ? static_cast<std::uint32_t>(1 + (image_bytes - 1) / config_.block_bytes)
+                                   : config_.image_slabs;
+    const std::uint32_t count = image_slabs + (tail.empty() ? 0U : 1U);
+    if (free_snapshots_.empty()) { return std::nullopt; }
+    std::uint32_t retained_frontier = 0;
+    if (write) {
+        for (auto node = anchor_index; node != kNoId && retained_frontier == 0; node = nodes_[node].parent) {
+            for (auto ref : nodes_[node].snapshots) {
+                const auto& candidate = snapshots_[ref];
+                if (!candidate.superseded && candidate.tail_len == 0) {
+                    retained_frontier = candidate.frontier;
+                    break;
+                }
+            }
+        }
+    }
+    const bool allocated = write
+        ? allocate_slabs(count, slabs, kNoId, kNoId, estimate_priority(
+              retained_frontier, frontier, false, hits, image_bytes))
+        : take_free_slabs(count, slabs);
+    if (!allocated) {
         for (const std::uint32_t slab : slabs) { free_slab(slab); }
         return std::nullopt;
+    }
+    if (write) {
+        try { write(slabs); }
+        catch (...) {
+            for (auto slab : slabs) { free_slab(slab); }
+            throw;
+        }
     }
     const std::uint32_t index = free_snapshots_.back();
     free_snapshots_.pop_back();
     Snapshot& snapshot = snapshots_[index];
+    if (write) { clock_ += image_slabs; }
+    snapshot.image_bytes = image_bytes;
     snapshot.occupied  = true;
     snapshot.anchor    = anchor_index;
     snapshot.frontier  = frontier;
